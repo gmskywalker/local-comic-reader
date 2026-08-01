@@ -1,0 +1,11 @@
+# Generated temporary folders
+.tmp/
+*.log
+
+# Local-only manga content
+漫画内容/
+整理完成/
+
+# Windows
+Thumbs.db
+Desktop.ini
