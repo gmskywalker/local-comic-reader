@@ -22,6 +22,15 @@ $script:ImageExtensions = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.
 $script:DefaultOutputFolderName = 'CBZ导出'
 $script:SettingsRegistryPath = 'Software\LocalComicTools\ComicExporter'
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:ExporterProgressCallback = $null
+$script:ExporterIsRunning = $false
+
+function Update-ExporterProgress {
+    param([string]$Message)
+    if ($null -ne $script:ExporterProgressCallback -and -not [string]::IsNullOrWhiteSpace($Message)) {
+        & $script:ExporterProgressCallback $Message
+    }
+}
 
 function ConvertTo-SettingBoolean {
     param([object]$Value, [bool]$DefaultValue)
@@ -706,7 +715,9 @@ function New-CbzArchive {
         [string]$DestinationPath,
         [System.IO.FileInfo[]]$Images,
         [System.IO.FileInfo]$Cover = $null,
-        [int]$Digits = 6
+        [int]$Digits = 6,
+        [string]$ProgressPrefix = '',
+        [hashtable]$ImageProgressMap = $null
     )
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -723,6 +734,7 @@ function New-CbzArchive {
             try {
                 $page = 0
                 if ($null -ne $Cover) {
+                    Update-ExporterProgress -Message ($ProgressPrefix + '｜正在写入封面')
                     $coverName = ('{0}-cover{1}' -f ('0' * $Digits), $Cover.Extension.ToLowerInvariant())
                     $entry = $archive.CreateEntry($coverName, [IO.Compression.CompressionLevel]::Optimal)
                     $source = [IO.File]::OpenRead($Cover.FullName)
@@ -730,9 +742,19 @@ function New-CbzArchive {
                     try { $source.CopyTo($target) } finally { $target.Dispose(); $source.Dispose() }
                     $expected[$coverName] = $Cover.Length
                 }
-                foreach ($image in @($Images)) {
-                    if ($null -ne $Cover -and $image.FullName -ieq $Cover.FullName) { continue }
+                $bodyImages = @($Images | Where-Object { $null -eq $Cover -or $_.FullName -ine $Cover.FullName })
+                for ($imageIndex = 0; $imageIndex -lt $bodyImages.Count; $imageIndex++) {
+                    $image = $bodyImages[$imageIndex]
                     $page++
+                    $currentPrefix = $ProgressPrefix
+                    if ($null -ne $ImageProgressMap -and $ImageProgressMap.ContainsKey($image.FullName)) {
+                        $detail = $ImageProgressMap[$image.FullName]
+                        $currentPrefix += ('｜第 {0}/{1} 话：{2}｜本话图片 {3}/{4}' -f $detail.ChapterIndex, $detail.ChapterCount, $detail.ChapterLabel, $detail.ImageIndex, $detail.ImageCount)
+                    }
+                    else {
+                        $currentPrefix += ('｜图片 {0}/{1}' -f ($imageIndex + 1), $bodyImages.Count)
+                    }
+                    Update-ExporterProgress -Message $currentPrefix
                     $entryName = $page.ToString(('D' + $Digits)) + $image.Extension.ToLowerInvariant()
                     $entry = $archive.CreateEntry($entryName, [IO.Compression.CompressionLevel]::Optimal)
                     $source = [IO.File]::OpenRead($image.FullName)
@@ -745,6 +767,7 @@ function New-CbzArchive {
         }
         finally { $stream.Dispose() }
 
+        Update-ExporterProgress -Message ($ProgressPrefix + '｜正在复核 CBZ')
         $check = [IO.Compression.ZipFile]::OpenRead($temporaryPath)
         try {
             $actualEntries = @($check.Entries | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) })
@@ -888,7 +911,8 @@ function New-PdfStripDocument {
     param(
         [string]$DestinationPath,
         [System.IO.FileInfo[]]$Images,
-        [System.IO.FileInfo]$Cover = $null
+        [System.IO.FileInfo]$Cover = $null,
+        [string]$ProgressPrefix = ''
     )
     $destinationDirectory = [IO.Path]::GetDirectoryName($DestinationPath)
     if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
@@ -905,7 +929,9 @@ function New-PdfStripDocument {
     $baseWidth = [double]612
     $logicalHeights = New-Object 'System.Collections.Generic.List[double]'
     $totalHeight = [double]0
-    foreach ($image in $orderedImages) {
+    for ($index = 0; $index -lt $orderedImages.Count; $index++) {
+        $image = $orderedImages[$index]
+        Update-ExporterProgress -Message ($ProgressPrefix + ('｜正在读取图片尺寸 {0}/{1}' -f ($index + 1), $orderedImages.Count))
         $size = Get-PdfImagePixelSize -ImageFile $image
         $height = $baseWidth * ([double]$size.Height / [double]$size.Width)
         $logicalHeights.Add($height)
@@ -941,6 +967,7 @@ function New-PdfStripDocument {
         $contentBuilder = New-Object Text.StringBuilder
         $cursor = $pageHeight
         for ($index = 0; $index -lt $orderedImages.Count; $index++) {
+            Update-ExporterProgress -Message ($ProgressPrefix + ('｜正在写入图片 {0}/{1}' -f ($index + 1), $orderedImages.Count))
             $payload = ConvertTo-PdfJpegPayload -ImageFile $orderedImages[$index]
             $imageObject = 4 + $index
             $offsets[$imageObject] = $stream.Position
@@ -971,6 +998,7 @@ function New-PdfStripDocument {
         $stream.Dispose()
         $stream = $null
 
+        Update-ExporterProgress -Message ($ProgressPrefix + '｜正在复核 PDF')
         $checkStream = [IO.File]::OpenRead($temporaryPath)
         try {
             if ($checkStream.Length -lt 32) { throw 'PDF 长页复核失败：文件过小。' }
@@ -1051,7 +1079,8 @@ function New-EpubArchive {
     param(
         [string]$DestinationPath,
         [object]$Plan,
-        [System.IO.FileInfo]$Cover = $null
+        [System.IO.FileInfo]$Cover = $null,
+        [string]$ProgressPrefix = ''
     )
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1101,6 +1130,7 @@ img.cover-image { display: block; width: 100%; height: auto; margin: 0 auto; pad
                 Add-EpubTextEntry -Archive $archive -EntryName 'EPUB/styles/book.css' -Text $css
 
                 if ($null -ne $Cover) {
+                    Update-ExporterProgress -Message ($ProgressPrefix + '｜正在写入封面')
                     $coverExtension = $Cover.Extension.ToLowerInvariant()
                     $coverEntryName = 'EPUB/images/cover' + $coverExtension
                     Add-EpubImageEntry -Archive $archive -EntryName $coverEntryName -SourceFile $Cover
@@ -1126,6 +1156,7 @@ img.cover-image { display: block; width: 100%; height: auto; margin: 0 auto; pad
                     $label = ConvertTo-XmlText $chapter.Label
                     $imageMarkup = @()
                     for ($imageIndex = 0; $imageIndex -lt @($chapter.Images).Count; $imageIndex++) {
+                        Update-ExporterProgress -Message ($ProgressPrefix + ('｜第 {0}/{1} 话：{2}｜图片 {3}/{4}' -f $chapterNumber, $Plan.Chapters.Count, $chapter.Label, ($imageIndex + 1), @($chapter.Images).Count))
                         $image = $chapter.Images[$imageIndex]
                         $extension = $image.Extension.ToLowerInvariant()
                         $imageId = 'img-c' + $chapterNumber.ToString('D4') + '-p' + ($imageIndex + 1).ToString('D6')
@@ -1184,6 +1215,7 @@ img.cover-image { display: block; width: 100%; height: auto; margin: 0 auto; pad
         }
         finally { $stream.Dispose() }
 
+        Update-ExporterProgress -Message ($ProgressPrefix + '｜正在复核 EPUB')
         $check = [IO.Compression.ZipFile]::OpenRead($temporaryPath)
         try {
             $entries = @($check.Entries)
@@ -1233,8 +1265,11 @@ function Export-ComicPlan {
         [string]$ExportMode,
         [bool]$UseCover,
         [bool]$AppendFormatToFolderName,
-        [bool]$AllowDuplicateNumbering
+        [bool]$AllowDuplicateNumbering,
+        [int]$ComicIndex = 1,
+        [int]$ComicCount = 1
     )
+    $comicPrefix = '漫画 {0}/{1}：{2}' -f $ComicIndex, $ComicCount, $Plan.Name
     $targetDefinition = Get-ExportTargetDefinition -ComicName $Plan.Name -ResolvedOutputPath $ResolvedOutputPath -ExportMode $ExportMode -AppendFormatToFolderName $AppendFormatToFolderName
     $resolvedTarget = Resolve-ExportTargetPath -Definition $targetDefinition -ResolvedOutputPath $ResolvedOutputPath -AllowDuplicateNumbering $AllowDuplicateNumbering
     $results = @()
@@ -1265,7 +1300,8 @@ function Export-ComicPlan {
             $target = Join-Path $comicOutput ($name + '.pdf')
             $expectedPaths[$target] = $true
             $cover = if ($UseCover -and $index -eq 0) { $Plan.Cover } else { $null }
-            $results += New-PdfStripDocument -DestinationPath $target -Images $chapter.Images -Cover $cover
+            $chapterPrefix = $comicPrefix + ('｜第 {0}/{1} 话：{2}' -f ($index + 1), $Plan.Chapters.Count, $chapter.Label)
+            $results += New-PdfStripDocument -DestinationPath $target -Images $chapter.Images -Cover $cover -ProgressPrefix $chapterPrefix
         }
         if ($managedOutput) {
             foreach ($oldFile in @(Get-ChildItem -LiteralPath $comicOutput -File -Filter '*.pdf' -ErrorAction SilentlyContinue)) {
@@ -1277,15 +1313,30 @@ function Export-ComicPlan {
     if ($ExportMode -eq 'Epub') {
         $target = $resolvedTarget
         $cover = if ($UseCover) { $Plan.Cover } else { $null }
-        $results += New-EpubArchive -DestinationPath $target -Plan $Plan -Cover $cover
+        $results += New-EpubArchive -DestinationPath $target -Plan $Plan -Cover $cover -ProgressPrefix $comicPrefix
         return @($results)
     }
     if ($ExportMode -eq 'SingleBook') {
         $allImages = @()
-        foreach ($chapter in $Plan.Chapters) { $allImages += @($chapter.Images) }
+        $imageProgressMap = @{}
+        for ($chapterIndex = 0; $chapterIndex -lt $Plan.Chapters.Count; $chapterIndex++) {
+            $chapter = $Plan.Chapters[$chapterIndex]
+            $chapterImages = @($chapter.Images)
+            for ($imageIndex = 0; $imageIndex -lt $chapterImages.Count; $imageIndex++) {
+                $image = $chapterImages[$imageIndex]
+                $allImages += $image
+                $imageProgressMap[$image.FullName] = [pscustomobject]@{
+                    ChapterIndex = $chapterIndex + 1
+                    ChapterCount = $Plan.Chapters.Count
+                    ChapterLabel = $chapter.Label
+                    ImageIndex = $imageIndex + 1
+                    ImageCount = $chapterImages.Count
+                }
+            }
+        }
         $target = $resolvedTarget
         $cover = if ($UseCover) { $Plan.Cover } else { $null }
-        $results += New-CbzArchive -DestinationPath $target -Images $allImages -Cover $cover -Digits 6
+        $results += New-CbzArchive -DestinationPath $target -Images $allImages -Cover $cover -Digits 6 -ProgressPrefix $comicPrefix -ImageProgressMap $imageProgressMap
         return @($results)
     }
     $comicOutput = $resolvedTarget
@@ -1314,7 +1365,8 @@ function Export-ComicPlan {
         $target = Join-Path $comicOutput ($name + '.cbz')
         $expectedPaths[$target] = $true
         $cover = if ($UseCover -and $index -eq 0) { $Plan.Cover } else { $null }
-        $results += New-CbzArchive -DestinationPath $target -Images $chapter.Images -Cover $cover -Digits 6
+        $chapterPrefix = $comicPrefix + ('｜第 {0}/{1} 话：{2}' -f ($index + 1), $Plan.Chapters.Count, $chapter.Label)
+        $results += New-CbzArchive -DestinationPath $target -Images $chapter.Images -Cover $cover -Digits 6 -ProgressPrefix $chapterPrefix
     }
     if ($managedOutput) {
         foreach ($oldFile in @(Get-ChildItem -LiteralPath $comicOutput -File -Filter '*.cbz' -ErrorAction SilentlyContinue)) {
@@ -1521,6 +1573,25 @@ function Show-ExporterWindow {
         [void]$form.Controls.Add($control)
     }
 
+    $operationControls = @($list, $selectAll, $selectNone, $refresh, $modeGroup, $optionsGroup, $outputBox, $browse, $export)
+    $setExportBusy = {
+        param([bool]$Busy)
+        $script:ExporterIsRunning = $Busy
+        foreach ($control in $operationControls) { $control.Enabled = -not $Busy }
+        $form.UseWaitCursor = $Busy
+        $form.Cursor = if ($Busy) { [Windows.Forms.Cursors]::WaitCursor } else { [Windows.Forms.Cursors]::Default }
+        $form.Refresh()
+        [Windows.Forms.Application]::DoEvents()
+    }
+    $script:ExporterProgressCallback = {
+        param([string]$Message)
+        if (-not $status.IsDisposed) {
+            $status.Text = $Message
+            $status.Refresh()
+            [Windows.Forms.Application]::DoEvents()
+        }
+    }
+
     $script:CandidateItems = @()
     $getCurrentMode = {
         if ($pdfStrip.Checked) { return 'PdfStrip' }
@@ -1630,8 +1701,7 @@ function Show-ExporterWindow {
                 return
             }
         }
-        $form.Cursor = [Windows.Forms.Cursors]::WaitCursor
-        $export.Enabled = $false
+        & $setExportBusy $true
         try {
             $exportMode = & $getCurrentMode
             if (-not $SmokeTest) {
@@ -1661,7 +1731,7 @@ function Show-ExporterWindow {
             for ($index = 0; $index -lt $plans.Count; $index++) {
                 $status.Text = ('正在导出 {0}/{1}：{2}' -f ($index + 1), $plans.Count, $plans[$index].Name)
                 [Windows.Forms.Application]::DoEvents()
-                $results = @(Export-ComicPlan -Plan $plans[$index] -ResolvedOutputPath $resolvedOutput -ExportMode $exportMode -UseCover $coverCheck.Checked -AppendFormatToFolderName $formatFolderCheck.Checked -AllowDuplicateNumbering $duplicateCheck.Checked)
+                $results = @(Export-ComicPlan -Plan $plans[$index] -ResolvedOutputPath $resolvedOutput -ExportMode $exportMode -UseCover $coverCheck.Checked -AppendFormatToFolderName $formatFolderCheck.Checked -AllowDuplicateNumbering $duplicateCheck.Checked -ComicIndex ($index + 1) -ComicCount $plans.Count)
                 $filesCreated += $results.Count
                 foreach ($result in $results) { $imagesWritten += $result.ImageCount }
             }
@@ -1675,12 +1745,17 @@ function Show-ExporterWindow {
             [Windows.Forms.MessageBox]::Show($_.Exception.Message, '漫画 CBZ / EPUB / PDF 导出器错误', 'OK', 'Error') | Out-Null
         }
         finally {
-            $export.Enabled = $true
-            $form.Cursor = [Windows.Forms.Cursors]::Default
+            & $setExportBusy $false
         }
     })
 
     $form.Add_FormClosing({
+        param($sender, $eventArgs)
+        if ($script:ExporterIsRunning) {
+            $eventArgs.Cancel = $true
+            $status.Text = '导出仍在进行，请等待当前任务完成后再关闭窗口。'
+            return
+        }
         if (-not $SmokeTest) {
             Save-ExporterSettings -SavedMode (& $getCurrentMode) -IncludeCover $coverCheck.Checked -OpenAfterExport $openCheck.Checked -AppendFormat $formatFolderCheck.Checked -AutoNumberDuplicates $duplicateCheck.Checked -SavedOutputPath $outputBox.Text.Trim()
         }
@@ -1692,7 +1767,11 @@ function Show-ExporterWindow {
         $timer.Add_Tick({ $timer.Stop(); $form.Close() })
         $form.Add_Shown({ $timer.Start() })
     }
-    [void]$form.ShowDialog()
+    try { [void]$form.ShowDialog() }
+    finally {
+        $script:ExporterProgressCallback = $null
+        $script:ExporterIsRunning = $false
+    }
 }
 
 try {
