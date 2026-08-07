@@ -4,7 +4,8 @@ param(
     [string]$ConfigPath = '',
     [switch]$NonInteractive,
     [switch]$AuditOnly,
-    [switch]$SkipOpen
+    [switch]$SkipOpen,
+    [switch]$UiSmokeTest
 )
 
 Set-StrictMode -Version Latest
@@ -15,9 +16,13 @@ $script:LauncherFileName = '漫画阅读器.html'
 $script:ConfigFileName = '漫画阅读器配置.json'
 $script:EmbeddedConfigElementId = 'local-comic-generator-config'
 $script:ImageExtensions = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif')
-$script:DefaultSelected = @()
+$script:DefaultSelected = @(
+    '外送到府',
+    '欢迎加入粉丝团!',
+    '继母的朋友们',
+    '飞机杯女神连缐中'
+)
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-$script:ProgressForm = $null
 $script:ProgressLabel = $null
 
 function Write-Info {
@@ -43,40 +48,6 @@ function Update-ProgressMessage {
     if ($null -eq $script:ProgressLabel -or $script:ProgressLabel.IsDisposed) { return }
     $script:ProgressLabel.Text = $Message
     [System.Windows.Forms.Application]::DoEvents()
-}
-
-function Show-UpdateProgress {
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = '漫画更新器'
-    $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(560, 150)
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $true
-    $form.ControlBox = $false
-    $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
-    $label = New-Object System.Windows.Forms.Label
-    $label.AutoSize = $false
-    $label.Location = New-Object System.Drawing.Point(22, 24)
-    $label.Size = New-Object System.Drawing.Size(500, 70)
-    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    $label.Text = '正在检查并生成漫画网页，请稍候……'
-    $form.Controls.Add($label)
-    $script:ProgressForm = $form
-    $script:ProgressLabel = $label
-    $form.Show()
-    [System.Windows.Forms.Application]::DoEvents()
-}
-
-function Close-UpdateProgress {
-    if ($null -ne $script:ProgressForm -and -not $script:ProgressForm.IsDisposed) {
-        $script:ProgressForm.Close()
-        $script:ProgressForm.Dispose()
-    }
-    $script:ProgressForm = $null
-    $script:ProgressLabel = $null
 }
 
 function ConvertTo-HtmlText {
@@ -130,9 +101,18 @@ function ConvertTo-ChapterNumberInfo {
 
 function Get-ChapterNumberFromName {
     param([string]$Name)
-    $match = [regex]::Match($Name, '^第\s*(\d+(?:\.\d+)?)\s*[话話]')
+    $match = [regex]::Match($Name, '^第\s*(\d+(?:\.\d+)?)\s*[话話](?<qualifier>.*)$')
     if (-not $match.Success) { return $null }
-    return ConvertTo-ChapterNumberInfo -Value $match.Groups[1].Value
+    $numberInfo = ConvertTo-ChapterNumberInfo -Value $match.Groups[1].Value
+    if ($null -eq $numberInfo) { return $null }
+    $qualifier = $match.Groups['qualifier'].Value.Trim()
+    return [pscustomobject]@{
+        Text = $numberInfo.Text
+        Value = $numberInfo.Value
+        Qualifier = $qualifier
+        QualifierKey = ([regex]::Replace($qualifier, '\s+', '')).ToLowerInvariant()
+        HasQualifier = -not [string]::IsNullOrWhiteSpace($qualifier)
+    }
 }
 
 function Test-SpecialChapterName {
@@ -441,7 +421,11 @@ function Get-FolderCandidate {
         $hasImages = @(Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue | Where-Object {
             $script:ImageExtensions -contains $_.Extension.ToLowerInvariant() -and $_.BaseName -ine 'cover'
         }).Count -gt 0
-        $hasImages -or ($metadata.ReadingOrderEnabled -and $metadata.ReadingOrderMap.ContainsKey($_.Name))
+        $normalizedName = Get-WindowsChapterNameMatchKey -Value $_.Name
+        $hasImages -or ($metadata.ReadingOrderEnabled -and (
+            $metadata.ReadingOrderMap.ContainsKey($_.Name) -or
+            $metadata.ReadingOrderNormalizedMap.ContainsKey($normalizedName)
+        ))
     })
     $rootImages = @(Get-RootBodyImageFiles -ComicPath $Directory.FullName)
     $usesRootImages = ($matching.Count -eq 0 -and $rootImages.Count -gt 0)
@@ -480,11 +464,70 @@ function Get-AllCandidates {
     return @($items)
 }
 
+function Resolve-UpdateSelection {
+    param(
+        [string[]]$PreviousNames,
+        [string[]]$CheckedNames,
+        [ValidateSet('All', 'AddOnly')][string]$UpdateMode
+    )
+    $previous = @($PreviousNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $checked = @($CheckedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($UpdateMode -eq 'AddOnly') {
+        $newNames = @($checked | Where-Object { $previous -notcontains $_ })
+        return [pscustomobject]@{
+            SelectedNames = @($previous + $newNames | Select-Object -Unique)
+            NamesToGenerate = @($newNames)
+        }
+    }
+    return [pscustomobject]@{
+        SelectedNames = @($checked)
+        NamesToGenerate = @($checked)
+    }
+}
+
+function ConvertTo-MetadataPlainText {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return '' }
+    $parts = @($Value | ForEach-Object {
+        if ($_ -is [string]) { $_ }
+        elseif ($null -ne $_.PSObject.Properties['name']) { [string]$_.name }
+        elseif ($null -ne $_.PSObject.Properties['title']) { [string]$_.title }
+        else { [string]$_ }
+    })
+    $text = ($parts -join "`r`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    $text = [regex]::Replace($text, '(?is)<\s*br\s*/?\s*>', "`n")
+    $text = [regex]::Replace($text, '(?is)</\s*(?:p|div|li|tr|h[1-6])\s*>', "`n")
+    $text = [regex]::Replace($text, '(?is)<\s*li(?:\s[^>]*)?>', '• ')
+    $text = [regex]::Replace($text, '(?is)<[^>]+>', '')
+    $text = [Net.WebUtility]::HtmlDecode($text)
+    $lines = @(($text -replace "`r`n?", "`n") -split "`n" | ForEach-Object { ([regex]::Replace($_, '[\t ]+', ' ')).Trim() })
+    return (($lines -join "`r`n").Trim())
+}
+
+function Get-MetadataFieldText {
+    param(
+        [AllowNull()][object]$Metadata,
+        [string[]]$Names
+    )
+    if ($null -eq $Metadata) { return '' }
+    foreach ($name in $Names) {
+        $property = $Metadata.PSObject.Properties[$name]
+        if ($null -eq $property) { continue }
+        $text = ConvertTo-MetadataPlainText -Value $property.Value
+        if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
+    }
+    return ''
+}
+
 function Show-ComicSelector {
     param(
+        [string]$LibraryRoot,
         [object[]]$Candidates,
         [string[]]$SelectedNames,
-        [bool]$OpenAfterGenerate
+        [bool]$OpenAfterGenerate,
+        [switch]$SkipOpen,
+        [switch]$SmokeTest
     )
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -492,8 +535,8 @@ function Show-ComicSelector {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '本地漫画网页生成器'
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(820, 610)
-    $form.MinimumSize = New-Object System.Drawing.Size(680, 480)
+    $form.Size = New-Object System.Drawing.Size(820, 665)
+    $form.MinimumSize = New-Object System.Drawing.Size(680, 540)
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
 
     $title = New-Object System.Windows.Forms.Label
@@ -504,7 +547,7 @@ function Show-ComicSelector {
     $form.Controls.Add($title)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = '任意名称的图片子文件夹都可作为章节；无顺序元数据时按名称排序。灰色项目结构不合格。'
+    $hint.Text = '“全部更新”重建所有勾选项；“仅加入新勾选”只生成本次新增项，并保留既有书架内容。'
     $hint.AutoSize = $true
     $hint.ForeColor = [System.Drawing.Color]::DimGray
     $hint.Location = New-Object System.Drawing.Point(20, 52)
@@ -585,20 +628,42 @@ function Show-ComicSelector {
     })
     $form.Controls.Add($clearAll)
 
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = '取消'
-    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $cancel.Location = New-Object System.Drawing.Point(566, 505)
-    $cancel.Size = New-Object System.Drawing.Size(100, 36)
-    $cancel.Anchor = 'Bottom,Right'
-    $form.Controls.Add($cancel)
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = '关闭'
+    $closeButton.Location = New-Object System.Drawing.Point(456, 505)
+    $closeButton.Size = New-Object System.Drawing.Size(80, 36)
+    $closeButton.Anchor = 'Bottom,Right'
+    $form.Controls.Add($closeButton)
 
-    $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = '生成 / 更新'
-    $ok.Location = New-Object System.Drawing.Point(675, 505)
-    $ok.Size = New-Object System.Drawing.Size(107, 36)
-    $ok.Anchor = 'Bottom,Right'
-    $ok.add_Click({
+    $status = New-Object System.Windows.Forms.Label
+    $status.AutoSize = $false
+    $status.Location = New-Object System.Drawing.Point(20, 552)
+    $status.Size = New-Object System.Drawing.Size(762, 54)
+    $status.Anchor = 'Bottom,Left,Right'
+    $status.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $status.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 0)
+    $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $eligibleCount = @($Candidates | Where-Object { $_.Eligible }).Count
+    $status.Text = '准备就绪：找到 {0} 部可生成漫画。选择任务后，核验与生成进度会显示在这里。' -f $eligibleCount
+    $form.Controls.Add($status)
+
+    $selectionState = [pscustomobject]@{
+        PreviousSelectedNames = @($SelectedNames)
+        IsRunning = $false
+        ExitCode = 0
+    }
+    $setBusy = {
+        param([bool]$Busy)
+        $selectionState.IsRunning = $Busy
+        foreach ($control in @($list, $openAfter, $selectAll, $clearAll, $closeButton, $addOnly, $updateAll)) {
+            $control.Enabled = -not $Busy
+        }
+        $form.UseWaitCursor = $Busy
+        $form.Cursor = if ($Busy) { [System.Windows.Forms.Cursors]::WaitCursor } else { [System.Windows.Forms.Cursors]::Default }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    $runUpdate = {
+        param([string]$UpdateMode)
         $checked = @($list.Items | Where-Object { $_.Checked -and $null -ne $_.Tag })
         if ($checked.Count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show(
@@ -609,39 +674,115 @@ function Show-ComicSelector {
             ) | Out-Null
             return
         }
-        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $form.Close()
-    })
-    $form.Controls.Add($ok)
-    $form.AcceptButton = $ok
-    $form.CancelButton = $cancel
-
-    $result = $form.ShowDialog()
-    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
-        return $null
-    }
-
-    $chosen = @()
-    foreach ($item in $list.Items) {
-        if ($item.Checked -and $null -ne $item.Tag) {
-            $chosen += [string]$item.Text
+        if ($UpdateMode -eq 'AddOnly') {
+            $newlyChecked = @($checked | Where-Object { $selectionState.PreviousSelectedNames -notcontains [string]$_.Text })
+            if ($newlyChecked.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    '没有发现本次新勾选的漫画。请勾选至少一部原先不在书架中的漫画，或改用“全部更新”。',
+                    '没有新增漫画',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information
+                ) | Out-Null
+                return
+            }
+        }
+        $checkedNames = @($checked | ForEach-Object { [string]$_.Text })
+        & $setBusy $true
+        $script:ProgressLabel = $status
+        $status.Text = if ($UpdateMode -eq 'AddOnly') { '正在准备仅加入新勾选的漫画……' } else { '正在准备全部更新……' }
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            $result = Invoke-ComicUpdate -LibraryRoot $LibraryRoot -PreviousSelectedNames @($selectionState.PreviousSelectedNames) -CheckedNames $checkedNames -UpdateMode $UpdateMode -OpenAfterGenerate ([bool]$openAfter.Checked)
+            $selectionState.PreviousSelectedNames = @($result.PersistedSelectedNames)
+            foreach ($item in $list.Items) {
+                if ($null -ne $item.Tag) { $item.Checked = $selectionState.PreviousSelectedNames -contains [string]$item.Text }
+            }
+            $summaryText = '更新完成：本次生成 {0} 部漫画、{1} 话、{2} 张图片；书架共 {3} 部。' -f $result.GeneratedCount, $result.ChapterCount, $result.ImageCount, $result.LauncherCount
+            $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Information
+            $selectionState.ExitCode = 0
+            if ($result.FailedCount -gt 0) {
+                $summaryText += "`r`n`r`n另有 $($result.FailedCount) 部未通过核验，未影响其余漫画。"
+                $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Warning
+                $selectionState.ExitCode = 2
+            }
+            $status.Text = $summaryText.Replace("`r`n`r`n", ' ')
+            [System.Windows.Forms.MessageBox]::Show($summaryText, '漫画更新器：任务已完成', [System.Windows.Forms.MessageBoxButtons]::OK, $summaryIcon) | Out-Null
+            if (-not $SkipOpen -and $openAfter.Checked -and -not [string]::IsNullOrWhiteSpace($result.LauncherPath)) {
+                Start-Process -FilePath $result.LauncherPath
+            }
+        }
+        catch {
+            $selectionState.ExitCode = 1
+            $status.Text = '更新失败：' + $_.Exception.Message
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '漫画更新器错误', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+        finally {
+            $script:ProgressLabel = $null
+            & $setBusy $false
         }
     }
-    return [pscustomobject]@{
-        SelectedNames = @($chosen)
-        OpenAfterGenerate = [bool]$openAfter.Checked
+
+    $addOnly = New-Object System.Windows.Forms.Button
+    $addOnly.Text = '仅加入新勾选'
+    $addOnly.Location = New-Object System.Drawing.Point(544, 505)
+    $addOnly.Size = New-Object System.Drawing.Size(142, 36)
+    $addOnly.Anchor = 'Bottom,Right'
+    $addOnly.add_Click({ & $runUpdate 'AddOnly' })
+    $form.Controls.Add($addOnly)
+
+    $updateAll = New-Object System.Windows.Forms.Button
+    $updateAll.Text = '全部更新'
+    $updateAll.Location = New-Object System.Drawing.Point(694, 505)
+    $updateAll.Size = New-Object System.Drawing.Size(88, 36)
+    $updateAll.Anchor = 'Bottom,Right'
+    $updateAll.BackColor = [System.Drawing.Color]::FromArgb(35, 105, 160)
+    $updateAll.ForeColor = [System.Drawing.Color]::White
+    $updateAll.add_Click({ & $runUpdate 'All' })
+    $form.Controls.Add($updateAll)
+    $form.AcceptButton = $updateAll
+    $closeButton.add_Click({ if (-not $selectionState.IsRunning) { $form.Close() } })
+    $form.CancelButton = $closeButton
+    $form.add_FormClosing({
+        param($sender, $eventArgs)
+        if ($selectionState.IsRunning) {
+            $eventArgs.Cancel = $true
+            $status.Text = '任务仍在执行，请等待完成后再关闭窗口。'
+        }
+    })
+
+    if ($SmokeTest) {
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 350
+        $timer.add_Tick({ $timer.Stop(); $form.Close() })
+        $form.add_Shown({ $timer.Start() })
     }
+    [void]$form.ShowDialog()
+    return $selectionState
+}
+
+function Get-WindowsChapterNameMatchKey {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return '' }
+    $text = ([string]$Value).Normalize([Text.NormalizationForm]::FormKC)
+    # Windows/下载器会把 ?、: 等非法字符换成全角形式，并移除末尾空格和句点。
+    # FormKC 可统一全角/半角形式；循环修剪模拟 Windows 对目录名末尾的处理。
+    while ($text.Length -gt 0 -and ([char]::IsWhiteSpace($text[$text.Length - 1]) -or $text[$text.Length - 1] -eq '.')) {
+        $text = $text.Substring(0, $text.Length - 1)
+    }
+    return $text
 }
 
 function Get-ComicMetadata {
     param([string]$ComicPath)
     $metadataPath = Join-Path $ComicPath '元数据.json'
     $result = [ordered]@{
+        Title = ''
         Author = ''
         Description = ''
         MetadataWarning = ''
         ReadingOrderEnabled = $false
         ReadingOrderMap = @{}
+        ReadingOrderNormalizedMap = @{}
         ReadingOrderError = ''
     }
     if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
@@ -650,26 +791,25 @@ function Get-ComicMetadata {
     try {
         $raw = [System.IO.File]::ReadAllText($metadataPath, [System.Text.Encoding]::UTF8)
         $meta = $raw | ConvertFrom-Json
-        if ($meta.PSObject.Properties.Name -contains 'author') {
-            $result.Author = (@($meta.author) -join '、')
-        }
-        if ($meta.PSObject.Properties.Name -contains 'description') {
-            $result.Description = [string]$meta.description
-        }
+        $result.Title = Get-MetadataFieldText -Metadata $meta -Names @('name', 'title')
+        $authorText = Get-MetadataFieldText -Metadata $meta -Names @('author', 'authors', 'artist', 'artists')
+        $result.Author = ([regex]::Replace($authorText, '\s*\r?\n\s*', '、')).Trim('、')
+        $result.Description = Get-MetadataFieldText -Metadata $meta -Names @('description', 'intro', 'summary', 'desc', '简介', '簡介')
         $organizerSchema = 0
         if ($null -ne $meta.PSObject.Properties['organizer'] -and
             $null -ne $meta.organizer -and
             $null -ne $meta.organizer.PSObject.Properties['schemaVersion']) {
             [void][int]::TryParse([string]$meta.organizer.schemaVersion, [ref]$organizerSchema)
         }
-        if ($organizerSchema -ge 2) {
+        $chapterInfos = @()
+        if ($null -ne $meta.PSObject.Properties['chapterInfos']) {
+            $chapterInfos = @($meta.chapterInfos)
+        }
+        if ($organizerSchema -ge 2 -or $chapterInfos.Count -gt 0) {
             $orderErrors = New-Object 'System.Collections.Generic.List[string]'
             $orderMap = @{}
+            $normalizedOrderMap = @{}
             $usedOrders = @{}
-            $chapterInfos = @()
-            if ($null -ne $meta.PSObject.Properties['chapterInfos']) {
-                $chapterInfos = @($meta.chapterInfos)
-            }
             if ($chapterInfos.Count -eq 0) {
                 $orderErrors.Add('新版整理器元数据中没有 chapterInfos。')
             }
@@ -697,7 +837,20 @@ function Get-ComicMetadata {
                     $orderErrors.Add(('阅读顺序元数据中的顺序重复：' + $readingOrder))
                     continue
                 }
+                $normalizedKey = Get-WindowsChapterNameMatchKey -Value $chapterFolder
+                if ([string]::IsNullOrWhiteSpace($normalizedKey)) {
+                    $orderErrors.Add(('阅读顺序元数据中的章节名称无法用于匹配：' + $chapterFolder))
+                    continue
+                }
+                if ($normalizedOrderMap.ContainsKey($normalizedKey)) {
+                    $otherFolder = [string]$normalizedOrderMap[$normalizedKey].Folder
+                    if (-not $otherFolder.Equals($chapterFolder, [StringComparison]::OrdinalIgnoreCase)) {
+                        $orderErrors.Add(('章节名称按 Windows 文件名规则处理后发生重复：{0}、{1}' -f $otherFolder, $chapterFolder))
+                        continue
+                    }
+                }
                 $orderMap[$chapterFolder] = $readingOrder
+                $normalizedOrderMap[$normalizedKey] = [pscustomobject]@{ Folder = $chapterFolder; Order = $readingOrder }
                 $usedOrders[[string]$readingOrder] = $true
             }
             if ($orderErrors.Count -gt 0) {
@@ -706,6 +859,7 @@ function Get-ComicMetadata {
             else {
                 $result.ReadingOrderEnabled = $true
                 $result.ReadingOrderMap = $orderMap
+                $result.ReadingOrderNormalizedMap = $normalizedOrderMap
             }
         }
     }
@@ -742,21 +896,28 @@ function Get-ComicAudit {
             $script:ImageExtensions -contains $_.Extension.ToLowerInvariant() -and $_.BaseName -ine 'cover'
         }).Count -gt 0
         $numberInfo = Get-ChapterNumberFromName -Name $dir.Name
-        $isMetadataChapter = $metadata.ReadingOrderEnabled -and $metadata.ReadingOrderMap.ContainsKey($dir.Name)
+        $normalizedDirectoryName = Get-WindowsChapterNameMatchKey -Value $dir.Name
+        $isMetadataChapter = $metadata.ReadingOrderEnabled -and (
+            $metadata.ReadingOrderMap.ContainsKey($dir.Name) -or
+            $metadata.ReadingOrderNormalizedMap.ContainsKey($normalizedDirectoryName)
+        )
         if (-not $hasChapterImages -and -not $isMetadataChapter) {
             $warnings.Add(('已忽略不含漫画图片的子文件夹：' + $dir.Name))
             continue
         }
         $isNumeric = ($null -ne $numberInfo)
+        $hasQualifier = $isNumeric -and [bool]$numberInfo.HasQualifier
         $chapterDrafts += [pscustomobject]@{
             IsRootChapter = $false
             ImageFiles = $null
             IsNumeric = $isNumeric
             Number = if ($isNumeric) { $numberInfo.Text } else { '' }
+            HasQualifier = $hasQualifier
+            QualifierKey = if ($hasQualifier) { $numberInfo.QualifierKey } else { '' }
             SortGroup = if ($isNumeric) { 0 } else { 1 }
             SortNumber = if ($isNumeric) { $numberInfo.Value } else { [decimal]0 }
-            ChapterLabel = if ($isNumeric) { '第 ' + $numberInfo.Text + ' 话' } else { $dir.Name }
-            ReaderStem = if ($isNumeric) { '第' + $numberInfo.Text + '话' } else { $dir.Name }
+            ChapterLabel = if ($isNumeric -and -not $hasQualifier) { '第 ' + $numberInfo.Text + ' 话' } else { $dir.Name }
+            ReaderStem = if ($isNumeric -and -not $hasQualifier) { '第' + $numberInfo.Text + '话' } else { $dir.Name }
             Name = $dir.Name
             NaturalSortKey = Get-NaturalNameSortKey -Name $dir.Name
             FullName = $dir.FullName
@@ -777,6 +938,8 @@ function Get-ComicAudit {
                     ImageFiles = @($group.Files)
                     IsNumeric = $false
                     Number = ''
+                    HasQualifier = $false
+                    QualifierKey = ''
                     SortGroup = 1
                     SortNumber = [decimal]0
                     ChapterLabel = $group.Name
@@ -795,6 +958,8 @@ function Get-ComicAudit {
                 ImageFiles = @($rootImageFiles)
                 IsNumeric = $true
                 Number = '1'
+                HasQualifier = $false
+                QualifierKey = ''
                 SortGroup = 0
                 SortNumber = [decimal]1
                 ChapterLabel = '第 1 话'
@@ -811,9 +976,16 @@ function Get-ComicAudit {
         $errors.Add('没有可识别的章节')
     }
     else {
-        $duplicates = @($chapterDrafts | Where-Object IsNumeric | Group-Object Number | Where-Object { $_.Count -gt 1 })
-        foreach ($duplicate in $duplicates) {
-            $errors.Add(('章节编号重复：第 {0} 话（{1}）' -f $duplicate.Name, (($duplicate.Group | ForEach-Object Name) -join '、')))
+        $sameNumberGroups = @($chapterDrafts | Where-Object IsNumeric | Group-Object Number | Where-Object { $_.Count -gt 1 })
+        foreach ($numberGroup in $sameNumberGroups) {
+            $plainChapters = @($numberGroup.Group | Where-Object { -not $_.HasQualifier })
+            if ($plainChapters.Count -gt 1) {
+                $errors.Add(('章节编号重复：第 {0} 话（{1}）' -f $numberGroup.Name, (($plainChapters | ForEach-Object Name) -join '、')))
+            }
+            $duplicateQualifiers = @($numberGroup.Group | Where-Object HasQualifier | Group-Object QualifierKey | Where-Object { $_.Count -gt 1 })
+            foreach ($duplicateQualifier in $duplicateQualifiers) {
+                $errors.Add(('章节编号和分段名称重复：第 {0} 话（{1}）' -f $numberGroup.Name, (($duplicateQualifier.Group | ForEach-Object Name) -join '、')))
+            }
         }
         $numericDrafts = @($chapterDrafts | Where-Object IsNumeric | Sort-Object SortNumber, Name)
         if ($numericDrafts.Count -gt 0) {
@@ -892,12 +1064,22 @@ function Get-ComicAudit {
     }
     elseif ($metadata.ReadingOrderEnabled) {
         $missingOrder = @()
+        $matchedMetadataFolders = @{}
         foreach ($chapter in $chapters) {
             if ($metadata.ReadingOrderMap.ContainsKey($chapter.Name)) {
                 $chapter.ReadingOrder = [int]$metadata.ReadingOrderMap[$chapter.Name]
+                $matchedMetadataFolders[$chapter.Name] = $true
             }
             else {
-                $missingOrder += $chapter.Name
+                $normalizedName = Get-WindowsChapterNameMatchKey -Value $chapter.Name
+                if ($metadata.ReadingOrderNormalizedMap.ContainsKey($normalizedName)) {
+                    $matchedEntry = $metadata.ReadingOrderNormalizedMap[$normalizedName]
+                    $chapter.ReadingOrder = [int]$matchedEntry.Order
+                    $matchedMetadataFolders[[string]$matchedEntry.Folder] = $true
+                }
+                else {
+                    $missingOrder += $chapter.Name
+                }
             }
         }
         if ($missingOrder.Count -gt 0) {
@@ -905,9 +1087,7 @@ function Get-ComicAudit {
         }
         else {
             $chapters = @($chapters | Sort-Object ReadingOrder, SortNumber, Name)
-            $currentNames = @{}
-            foreach ($chapter in $chapters) { $currentNames[$chapter.Name] = $true }
-            $staleNames = @($metadata.ReadingOrderMap.Keys | Where-Object { -not $currentNames.ContainsKey($_) })
+            $staleNames = @($metadata.ReadingOrderMap.Keys | Where-Object { -not $matchedMetadataFolders.ContainsKey($_) })
             if ($staleNames.Count -gt 0) {
                 $warnings.Add(('阅读顺序元数据含有已不存在的章节，已忽略：' + ($staleNames -join '、')))
             }
@@ -1646,43 +1826,88 @@ __THEME_RUNTIME__
 '@
 }
 
+function New-RootCardHtml {
+    param([object]$Comic)
+    $card = New-Object System.Text.StringBuilder
+    $comicSegment = ConvertTo-UrlSegment $Comic.Name
+    $firstChapter = $Comic.Chapters[0]
+    $firstHref = $comicSegment + '/' + (ConvertTo-UrlSegment $firstChapter.ReaderFile)
+    $readerMap = [ordered]@{}
+    foreach ($chapter in $Comic.Chapters) {
+        $readerMap[$chapter.Key] = $comicSegment + '/' + (ConvertTo-UrlSegment $chapter.ReaderFile)
+    }
+    $readerMapJson = ConvertTo-SafeJson $readerMap
+    $indexHref = $comicSegment + '/index.html'
+    $coverHref = $comicSegment + '/' + $Comic.CoverRelativeHref
+    $title = ConvertTo-HtmlText $Comic.Name
+    $meta = ('{0} 话 · {1} 张图片' -f $Comic.ChapterCount, $Comic.TotalImages)
+    [void]$card.AppendLine(('    <article class="card" data-comic-key="{0}" data-first-href="{1}" data-reader-map="{2}">' -f $Comic.Key, (ConvertTo-HtmlText $firstHref), (ConvertTo-HtmlText $readerMapJson)))
+    [void]$card.AppendLine(('      <a class="cover-link" href="{0}"><img class="cover" src="{1}" alt="{2} 封面"></a>' -f (ConvertTo-HtmlText $indexHref), (ConvertTo-HtmlText $coverHref), $title))
+    [void]$card.AppendLine('      <div class="card-body">')
+    [void]$card.AppendLine(('        <h2>{0}</h2>' -f $title))
+    [void]$card.AppendLine(('        <p class="meta">{0}</p>' -f (ConvertTo-HtmlText $meta)))
+    [void]$card.AppendLine('        <p class="progress">尚未开始</p>')
+    [void]$card.AppendLine('        <div class="actions">')
+    [void]$card.AppendLine(('          <a class="button primary" href="{0}">章节目录</a>' -f (ConvertTo-HtmlText $indexHref)))
+    [void]$card.AppendLine(('          <a class="button continue-link" href="{0}">开始阅读</a>' -f (ConvertTo-HtmlText $firstHref)))
+    [void]$card.AppendLine('        </div>')
+    [void]$card.AppendLine('      </div>')
+    [void]$card.AppendLine('    </article>')
+    return $card.ToString().TrimEnd()
+}
+
+function Get-ExistingRootCards {
+    param(
+        [string]$LibraryRoot,
+        [string[]]$ComicNames
+    )
+    if (@($ComicNames).Count -eq 0) { return @{} }
+    $path = Join-Path $LibraryRoot $script:LauncherFileName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw '找不到现有漫画阅读器，无法在“仅加入”模式下保留旧书架；请先使用一次“全部更新”。'
+    }
+    $html = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
+    $cardsByKey = @{}
+    foreach ($match in [regex]::Matches($html, '<article class="card"\s+data-comic-key="([^"]+)".*?</article>', [Text.RegularExpressions.RegexOptions]::Singleline)) {
+        $cardsByKey[$match.Groups[1].Value] = $match.Value
+    }
+    $result = @{}
+    foreach ($name in @($ComicNames)) {
+        $key = Get-StableKey -Value $name
+        if (-not $cardsByKey.ContainsKey($key)) {
+            throw ('现有总书架缺少“{0}”的卡片。为避免误删旧漫画，本次没有执行；请改用“全部更新”修复书架。' -f $name)
+        }
+        $result[$name] = [string]$cardsByKey[$key]
+    }
+    return $result
+}
+
 function New-RootPage {
     param(
         [object[]]$Comics,
         [string]$LibraryRoot,
         [string[]]$SelectedNames,
-        [bool]$OpenAfterGenerate
+        [bool]$OpenAfterGenerate,
+        [hashtable]$PreservedCards = @{}
     )
     $cards = New-Object System.Text.StringBuilder
-    foreach ($comic in @($Comics | Sort-Object Name)) {
-        $comicSegment = ConvertTo-UrlSegment $comic.Name
-        $firstChapter = $comic.Chapters[0]
-        $firstHref = $comicSegment + '/' + (ConvertTo-UrlSegment $firstChapter.ReaderFile)
-        $readerMap = [ordered]@{}
-        foreach ($chapter in $comic.Chapters) {
-            $readerMap[$chapter.Key] = $comicSegment + '/' + (ConvertTo-UrlSegment $chapter.ReaderFile)
+    $cardEntries = @()
+    $generatedNames = @{}
+    foreach ($comic in @($Comics)) {
+        $generatedNames[$comic.Name] = $true
+        $cardEntries += [pscustomobject]@{ Name = $comic.Name; Html = New-RootCardHtml -Comic $comic }
+    }
+    foreach ($name in @($PreservedCards.Keys)) {
+        if (-not $generatedNames.ContainsKey($name)) {
+            $cardEntries += [pscustomobject]@{ Name = [string]$name; Html = [string]$PreservedCards[$name] }
         }
-        $readerMapJson = ConvertTo-SafeJson $readerMap
-        $indexHref = $comicSegment + '/index.html'
-        $coverHref = $comicSegment + '/' + $comic.CoverRelativeHref
-        $title = ConvertTo-HtmlText $comic.Name
-        $meta = ('{0} 话 · {1} 张图片' -f $comic.ChapterCount, $comic.TotalImages)
-        [void]$cards.AppendLine(('    <article class="card" data-comic-key="{0}" data-first-href="{1}" data-reader-map="{2}">' -f $comic.Key, (ConvertTo-HtmlText $firstHref), (ConvertTo-HtmlText $readerMapJson)))
-        [void]$cards.AppendLine(('      <a class="cover-link" href="{0}"><img class="cover" src="{1}" alt="{2} 封面"></a>' -f (ConvertTo-HtmlText $indexHref), (ConvertTo-HtmlText $coverHref), $title))
-        [void]$cards.AppendLine('      <div class="card-body">')
-        [void]$cards.AppendLine(('        <h2>{0}</h2>' -f $title))
-        [void]$cards.AppendLine(('        <p class="meta">{0}</p>' -f (ConvertTo-HtmlText $meta)))
-        [void]$cards.AppendLine('        <p class="progress">尚未开始</p>')
-        [void]$cards.AppendLine('        <div class="actions">')
-        [void]$cards.AppendLine(('          <a class="button primary" href="{0}">章节目录</a>' -f (ConvertTo-HtmlText $indexHref)))
-        [void]$cards.AppendLine(('          <a class="button continue-link" href="{0}">开始阅读</a>' -f (ConvertTo-HtmlText $firstHref)))
-        [void]$cards.AppendLine('        </div>')
-        [void]$cards.AppendLine('      </div>')
-        [void]$cards.AppendLine('    </article>')
+    }
+    foreach ($entry in @($cardEntries | Sort-Object Name)) {
+        [void]$cards.AppendLine($entry.Html.TrimEnd())
     }
 
     $template = Get-RootTemplate
-    $content = $template.Replace('__COMIC_COUNT__', [string]$Comics.Count)
+    $content = $template.Replace('__COMIC_COUNT__', [string]$cardEntries.Count)
     $content = $content.Replace('__CARDS__', $cards.ToString().TrimEnd())
     $content = $content.Replace('__GENERATED_AT__', (ConvertTo-HtmlText (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
     $embeddedConfig = [ordered]@{
@@ -1872,6 +2097,119 @@ function Test-GeneratedComic {
     return @($problems)
 }
 
+function Invoke-ComicUpdate {
+    param(
+        [string]$LibraryRoot,
+        [string[]]$PreviousSelectedNames,
+        [string[]]$CheckedNames,
+        [ValidateSet('All', 'AddOnly')][string]$UpdateMode,
+        [bool]$OpenAfterGenerate,
+        [switch]$AuditOnlyMode
+    )
+    $selectionPlan = Resolve-UpdateSelection -PreviousNames $PreviousSelectedNames -CheckedNames $CheckedNames -UpdateMode $UpdateMode
+    $selectedNames = @($selectionPlan.SelectedNames)
+    $namesToGenerate = @($selectionPlan.NamesToGenerate)
+    if ($selectedNames.Count -eq 0) { throw '没有选择任何漫画。' }
+    if ($UpdateMode -eq 'AddOnly' -and $namesToGenerate.Count -eq 0) { throw '没有发现本次新勾选的漫画。' }
+
+    $preservedCards = @{}
+    $namesToAudit = @($selectedNames)
+    if ($UpdateMode -eq 'AddOnly') {
+        $preservedCards = Get-ExistingRootCards -LibraryRoot $LibraryRoot -ComicNames $PreviousSelectedNames
+        $namesToAudit = @($namesToGenerate)
+        Write-Info ('快速加入模式：保留 {0} 部既有漫画，仅核验并生成 {1} 部新漫画。' -f $PreviousSelectedNames.Count, $namesToAudit.Count)
+    }
+
+    $audited = @()
+    $failed = @()
+    for ($auditIndex = 0; $auditIndex -lt $namesToAudit.Count; $auditIndex++) {
+        $name = $namesToAudit[$auditIndex]
+        $path = Join-Path $LibraryRoot $name
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+            $failed += [pscustomobject]@{ Name = $name; Errors = @('文件夹不存在：' + $path) }
+            Write-Bad ('核验失败：' + $name + '（文件夹不存在）')
+            continue
+        }
+        Write-Info ('正在核验 {0}/{1}：{2}' -f ($auditIndex + 1), $namesToAudit.Count, $name)
+        $audit = Get-ComicAudit -ComicDirectory (Get-Item -LiteralPath $path)
+        if ($audit.IsValid) {
+            Write-Good ('核验通过：{0} 话，{1} 张图片' -f $audit.ChapterCount, $audit.TotalImages)
+            foreach ($warning in $audit.Warnings) { Write-Host ('  警告：' + $warning) -ForegroundColor Yellow }
+            $audited += $audit
+        }
+        else {
+            Write-Bad ('核验失败：' + $name)
+            foreach ($problem in $audit.Errors) { Write-Host ('  - ' + $problem) -ForegroundColor Red }
+            $failed += $audit
+        }
+    }
+
+    if ($AuditOnlyMode) {
+        if ($failed.Count -eq 0) { Write-Good '只读核验完成，未写入网页。' }
+        return [pscustomobject]@{
+            PersistedSelectedNames = @($selectedNames)
+            Generated = @()
+            Failed = @($failed)
+            GeneratedCount = 0
+            FailedCount = $failed.Count
+            ChapterCount = 0
+            ImageCount = 0
+            LauncherCount = 0
+            LauncherPath = ''
+        }
+    }
+    if ($audited.Count -eq 0) { throw '没有任何漫画通过核验，未生成网页。' }
+    $generationTargets = @($audited | Where-Object { $namesToGenerate -contains $_.Name })
+    if ($generationTargets.Count -eq 0) { throw '本次需要生成的漫画均未通过核验，未修改网页。' }
+
+    $generated = @()
+    for ($generationIndex = 0; $generationIndex -lt $generationTargets.Count; $generationIndex++) {
+        $comic = $generationTargets[$generationIndex]
+        try {
+            Write-Info ('正在生成 {0}/{1}：{2}' -f ($generationIndex + 1), $generationTargets.Count, $comic.Name)
+            New-ComicPages -Comic $comic
+            $verifyProblems = @(Test-GeneratedComic -Comic $comic)
+            if ($verifyProblems.Count -gt 0) { throw ('生成后复核失败：' + ($verifyProblems -join '；')) }
+            $removedLegacyPages = Remove-LegacyChapterPages -Comic $comic
+            if ($removedLegacyPages -gt 0) { Write-Info ('已移除旧位置的章节 index.html：' + $removedLegacyPages + ' 个') }
+            $generated += $comic
+            Write-Good ('生成并复核完成：' + $comic.Name)
+        }
+        catch {
+            Write-Bad ($comic.Name + '：' + $_.Exception.Message)
+            $failed += [pscustomobject]@{ Name = $comic.Name; Errors = @($_.Exception.Message) }
+        }
+    }
+
+    if ($generated.Count -eq 0) { throw '没有任何漫画成功生成，未更新总打开器。' }
+    $launcherComics = @($generated | Group-Object Name | ForEach-Object { $_.Group[0] })
+    $persistedSelectedNames = if ($UpdateMode -eq 'AddOnly') {
+        @($PreviousSelectedNames + @($generated | ForEach-Object { $_.Name }) | Select-Object -Unique)
+    }
+    else { @($launcherComics | ForEach-Object { $_.Name }) }
+    $launcherCount = $preservedCards.Count + $launcherComics.Count
+    Write-Info '正在更新并复核总打开器……'
+    $launcherPath = New-RootPage -Comics $launcherComics -LibraryRoot $LibraryRoot -SelectedNames $persistedSelectedNames -OpenAfterGenerate $OpenAfterGenerate -PreservedCards $preservedCards
+    $launcherHtml = [System.IO.File]::ReadAllText($launcherPath, [System.Text.Encoding]::UTF8)
+    $rootCardCount = ([regex]::Matches($launcherHtml, '<article class="card" ')).Count
+    if ($rootCardCount -ne $launcherCount) { throw "总打开器复核失败：应有 $launcherCount 部漫画，实际有 $rootCardCount 个卡片。" }
+
+    $chapterCount = [int](($generated | Measure-Object ChapterCount -Sum).Sum)
+    $imageCount = [int](($generated | Measure-Object TotalImages -Sum).Sum)
+    Write-Good ('总打开器已更新：' + $launcherPath)
+    return [pscustomobject]@{
+        PersistedSelectedNames = @($persistedSelectedNames)
+        Generated = @($generated)
+        Failed = @($failed)
+        GeneratedCount = $generated.Count
+        FailedCount = $failed.Count
+        ChapterCount = $chapterCount
+        ImageCount = $imageCount
+        LauncherCount = $launcherCount
+        LauncherPath = $launcherPath
+    }
+}
+
 try {
     $scriptPath = if (-not [string]::IsNullOrWhiteSpace($env:LOCAL_COMIC_TOOL_PATH)) {
         $env:LOCAL_COMIC_TOOL_PATH
@@ -1920,113 +2258,30 @@ try {
             Test-Path -LiteralPath (Join-Path $resolvedRoot $_) -PathType Container
         })
     }
+    $previousSelectedNames = @($selectedNames)
     $openAfterGenerate = [bool]$configuration.openAfterGenerate
     if (-not $NonInteractive) {
-        $selection = Show-ComicSelector -Candidates $candidates -SelectedNames $selectedNames -OpenAfterGenerate $openAfterGenerate
-        if ($null -eq $selection) {
-            Write-Info '用户已取消，没有修改任何网页。'
-            exit 0
-        }
-        $selectedNames = @($selection.SelectedNames)
-        $openAfterGenerate = [bool]$selection.OpenAfterGenerate
+        $uiResult = Show-ComicSelector -LibraryRoot $resolvedRoot -Candidates $candidates -SelectedNames $selectedNames -OpenAfterGenerate $openAfterGenerate -SkipOpen:$SkipOpen -SmokeTest:$UiSmokeTest
+        exit ([int]$uiResult.ExitCode)
     }
 
-    if ($selectedNames.Count -eq 0) {
-        throw '没有选择任何漫画。'
-    }
-    if (-not $NonInteractive) { Show-UpdateProgress }
-
-    $audited = @()
-    $failed = @()
-    foreach ($name in $selectedNames) {
-        $path = Join-Path $resolvedRoot $name
-        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
-            $failed += [pscustomobject]@{ Name = $name; Errors = @('文件夹不存在：' + $path) }
-            continue
-        }
-        Write-Info ('核验：' + $name)
-        $audit = Get-ComicAudit -ComicDirectory (Get-Item -LiteralPath $path)
-        if ($audit.IsValid) {
-            Write-Good ('核验通过：{0} 话，{1} 张图片' -f $audit.ChapterCount, $audit.TotalImages)
-            foreach ($warning in $audit.Warnings) { Write-Host ('  警告：' + $warning) -ForegroundColor Yellow }
-            $audited += $audit
-        }
-        else {
-            Write-Bad ('核验失败：' + $name)
-            foreach ($problem in $audit.Errors) { Write-Host ('  - ' + $problem) -ForegroundColor Red }
-            $failed += $audit
-        }
-    }
-
+    $result = Invoke-ComicUpdate -LibraryRoot $resolvedRoot -PreviousSelectedNames $previousSelectedNames -CheckedNames $selectedNames -UpdateMode 'All' -OpenAfterGenerate $openAfterGenerate -AuditOnlyMode:$AuditOnly
     if ($AuditOnly) {
-        Close-UpdateProgress
-        if ($failed.Count -gt 0) { exit 2 }
-        Write-Good '只读核验完成，未写入网页。'
+        if ($result.FailedCount -gt 0) { exit 2 }
         exit 0
     }
-    if ($audited.Count -eq 0) {
-        throw '没有任何漫画通过核验，未生成网页。'
-    }
-
-    $generated = @()
-    foreach ($comic in $audited) {
-        try {
-            Write-Info ('生成：' + $comic.Name)
-            New-ComicPages -Comic $comic
-            $verifyProblems = @(Test-GeneratedComic -Comic $comic)
-            if ($verifyProblems.Count -gt 0) {
-                throw ('生成后复核失败：' + ($verifyProblems -join '；'))
-            }
-            $removedLegacyPages = Remove-LegacyChapterPages -Comic $comic
-            if ($removedLegacyPages -gt 0) {
-                Write-Info ('已移除旧位置的章节 index.html：' + $removedLegacyPages + ' 个')
-            }
-            $generated += $comic
-            Write-Good ('生成并复核完成：' + $comic.Name)
-        }
-        catch {
-            Write-Bad ($comic.Name + '：' + $_.Exception.Message)
-            $failed += [pscustomobject]@{ Name = $comic.Name; Errors = @($_.Exception.Message) }
-        }
-    }
-
-    if ($generated.Count -eq 0) {
-        throw '没有任何漫画成功生成，未更新总打开器。'
-    }
-    $launcherPath = New-RootPage -Comics $generated -LibraryRoot $resolvedRoot -SelectedNames $selectedNames -OpenAfterGenerate $openAfterGenerate
-    $launcherHtml = [System.IO.File]::ReadAllText($launcherPath, [System.Text.Encoding]::UTF8)
-    $rootCardCount = ([regex]::Matches($launcherHtml, '<article class="card" ')).Count
-    if ($rootCardCount -ne $generated.Count) {
-        throw "总打开器复核失败：应有 $($generated.Count) 部漫画，实际有 $rootCardCount 个卡片。"
-    }
-
-    Write-Good ('总打开器已更新：' + $launcherPath)
     Write-Host ''
-    Write-Host ('成功：{0} 部漫画，{1} 话，{2} 张图片。' -f $generated.Count, (($generated | Measure-Object ChapterCount -Sum).Sum), (($generated | Measure-Object TotalImages -Sum).Sum)) -ForegroundColor Green
-    if ($failed.Count -gt 0) {
-        Write-Host ('失败：{0} 部漫画。错误已显示在上方，其他漫画不受影响。' -f $failed.Count) -ForegroundColor Yellow
+    Write-Host ('本次生成：{0} 部漫画，{1} 话，{2} 张图片；书架共 {3} 部。' -f $result.GeneratedCount, $result.ChapterCount, $result.ImageCount, $result.LauncherCount) -ForegroundColor Green
+    if ($result.FailedCount -gt 0) {
+        Write-Host ('失败：{0} 部漫画。错误已显示在上方，其他漫画不受影响。' -f $result.FailedCount) -ForegroundColor Yellow
+        exit 2
     }
-    Close-UpdateProgress
-    if (-not $NonInteractive) {
-        Add-Type -AssemblyName System.Windows.Forms
-        $summaryText = ('更新完成：{0} 部漫画，{1} 话，{2} 张图片。' -f $generated.Count, (($generated | Measure-Object ChapterCount -Sum).Sum), (($generated | Measure-Object TotalImages -Sum).Sum))
-        $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Information
-        if ($failed.Count -gt 0) {
-            $summaryText += "`r`n`r`n另有 $($failed.Count) 部未通过核验，未影响其余漫画。"
-            $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Warning
-        }
-        [System.Windows.Forms.MessageBox]::Show($summaryText, '漫画更新器', [System.Windows.Forms.MessageBoxButtons]::OK, $summaryIcon) | Out-Null
-    }
-    if (-not $SkipOpen -and -not $NonInteractive -and $openAfterGenerate) {
-        Start-Process -FilePath $launcherPath
-    }
-    if ($failed.Count -gt 0) { exit 2 }
     exit 0
 }
 catch {
-    Close-UpdateProgress
+    $script:ProgressLabel = $null
     Write-Bad $_.Exception.Message
-    if (-not $NonInteractive) {
+    if (-not $NonInteractive -and -not $UiSmokeTest) {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '漫画更新器错误', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     }
