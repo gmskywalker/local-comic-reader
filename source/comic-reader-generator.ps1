@@ -468,15 +468,14 @@ function Resolve-UpdateSelection {
     param(
         [string[]]$PreviousNames,
         [string[]]$CheckedNames,
-        [ValidateSet('All', 'AddOnly')][string]$UpdateMode
+        [ValidateSet('All', 'Selected')][string]$UpdateMode
     )
     $previous = @($PreviousNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $checked = @($CheckedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    if ($UpdateMode -eq 'AddOnly') {
-        $newNames = @($checked | Where-Object { $previous -notcontains $_ })
+    if ($UpdateMode -eq 'Selected') {
         return [pscustomobject]@{
-            SelectedNames = @($previous + $newNames | Select-Object -Unique)
-            NamesToGenerate = @($newNames)
+            SelectedNames = @($previous + $checked | Select-Object -Unique)
+            NamesToGenerate = @($checked)
         }
     }
     return [pscustomobject]@{
@@ -540,14 +539,14 @@ function Show-ComicSelector {
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = '选择要加入“漫画阅读器”的文件夹'
+    $title.Text = '选择要加入或更新的漫画文件夹'
     $title.AutoSize = $true
     $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 15, [System.Drawing.FontStyle]::Bold)
     $title.Location = New-Object System.Drawing.Point(18, 16)
     $form.Controls.Add($title)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = '“全部更新”重建所有勾选项；“仅加入新勾选”只生成本次新增项，并保留既有书架内容。'
+    $hint.Text = '勾上新漫画即可加入；旧漫画先取消再重新勾上即可更新。其他书架内容保持不动。'
     $hint.AutoSize = $true
     $hint.ForeColor = [System.Drawing.Color]::DimGray
     $hint.Location = New-Object System.Drawing.Point(20, 52)
@@ -567,12 +566,13 @@ function Show-ComicSelector {
     foreach ($candidate in $Candidates) {
         $item = New-Object System.Windows.Forms.ListViewItem($candidate.Name)
         if ($candidate.Eligible) {
-            $candidateStatus = '可生成，共 {0} 话' -f $candidate.ChapterCount
+            $membership = if ($SelectedNames -contains $candidate.Name) { '已在书架；' } else { '尚未加入；' }
+            $candidateStatus = $membership + ('可生成，共 {0} 话' -f $candidate.ChapterCount)
             if ($candidate.UsesRootImages) {
                 $candidateStatus += '；根目录按单话'
             }
             if ($candidate.UsesCompositeGroups) {
-                $candidateStatus = '可生成，共 {0} 话；按文件名前缀自动分组' -f $candidate.ChapterCount
+                $candidateStatus = $membership + ('可生成，共 {0} 话；按文件名前缀自动分组' -f $candidate.ChapterCount)
             }
             if (-not $candidate.HasCover) {
                 $candidateStatus += '；自动封面'
@@ -588,10 +588,27 @@ function Show-ComicSelector {
         }
         [void]$list.Items.Add($item)
     }
+    $selectionState = [pscustomobject]@{
+        PreviousSelectedNames = @($SelectedNames)
+        TargetNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        SuppressTargetTracking = $false
+        IsRunning = $false
+        ExitCode = 0
+    }
     $list.add_ItemCheck({
         param($sender, $eventArgs)
-        if ($null -eq $sender.Items[$eventArgs.Index].Tag) {
+        $changedItem = $sender.Items[$eventArgs.Index]
+        if ($null -eq $changedItem.Tag) {
             $eventArgs.NewValue = $eventArgs.CurrentValue
+            return
+        }
+        if ($selectionState.SuppressTargetTracking) { return }
+        $changedName = [string]$changedItem.Text
+        if ($eventArgs.NewValue -eq [System.Windows.Forms.CheckState]::Checked) {
+            [void]$selectionState.TargetNames.Add($changedName)
+        }
+        else {
+            [void]$selectionState.TargetNames.Remove($changedName)
         }
     })
     $form.Controls.Add($list)
@@ -610,9 +627,16 @@ function Show-ComicSelector {
     $selectAll.Size = New-Object System.Drawing.Size(145, 36)
     $selectAll.Anchor = 'Bottom,Left'
     $selectAll.add_Click({
-        foreach ($item in $list.Items) {
-            if ($null -ne $item.Tag) { $item.Checked = $true }
+        $selectionState.SuppressTargetTracking = $true
+        try {
+            foreach ($item in $list.Items) {
+                if ($null -ne $item.Tag) {
+                    $item.Checked = $true
+                    [void]$selectionState.TargetNames.Add([string]$item.Text)
+                }
+            }
         }
+        finally { $selectionState.SuppressTargetTracking = $false }
     })
     $form.Controls.Add($selectAll)
 
@@ -622,15 +646,20 @@ function Show-ComicSelector {
     $clearAll.Size = New-Object System.Drawing.Size(110, 36)
     $clearAll.Anchor = 'Bottom,Left'
     $clearAll.add_Click({
-        foreach ($item in $list.Items) {
-            if ($null -ne $item.Tag) { $item.Checked = $false }
+        $selectionState.SuppressTargetTracking = $true
+        try {
+            foreach ($item in $list.Items) {
+                if ($null -ne $item.Tag) { $item.Checked = $false }
+            }
+            $selectionState.TargetNames.Clear()
         }
+        finally { $selectionState.SuppressTargetTracking = $false }
     })
     $form.Controls.Add($clearAll)
 
     $closeButton = New-Object System.Windows.Forms.Button
     $closeButton.Text = '关闭'
-    $closeButton.Location = New-Object System.Drawing.Point(456, 505)
+    $closeButton.Location = New-Object System.Drawing.Point(438, 505)
     $closeButton.Size = New-Object System.Drawing.Size(80, 36)
     $closeButton.Anchor = 'Bottom,Right'
     $form.Controls.Add($closeButton)
@@ -647,15 +676,10 @@ function Show-ComicSelector {
     $status.Text = '准备就绪：找到 {0} 部可生成漫画。选择任务后，核验与生成进度会显示在这里。' -f $eligibleCount
     $form.Controls.Add($status)
 
-    $selectionState = [pscustomobject]@{
-        PreviousSelectedNames = @($SelectedNames)
-        IsRunning = $false
-        ExitCode = 0
-    }
     $setBusy = {
         param([bool]$Busy)
         $selectionState.IsRunning = $Busy
-        foreach ($control in @($list, $openAfter, $selectAll, $clearAll, $closeButton, $addOnly, $updateAll)) {
+        foreach ($control in @($list, $openAfter, $selectAll, $clearAll, $closeButton, $updateSelected, $updateAll)) {
             $control.Enabled = -not $Busy
         }
         $form.UseWaitCursor = $Busy
@@ -665,38 +689,40 @@ function Show-ComicSelector {
     $runUpdate = {
         param([string]$UpdateMode)
         $checked = @($list.Items | Where-Object { $_.Checked -and $null -ne $_.Tag })
-        if ($checked.Count -eq 0) {
+        $checkedNames = if ($UpdateMode -eq 'Selected') {
+            @($checked | Where-Object { $selectionState.TargetNames.Contains([string]$_.Text) } | ForEach-Object { [string]$_.Text })
+        }
+        else {
+            @($checked | ForEach-Object { [string]$_.Text })
+        }
+        if ($checkedNames.Count -eq 0) {
+            $emptyMessage = if ($UpdateMode -eq 'Selected') {
+                '请勾选要加入的新漫画；若要更新已在书架中的旧漫画，请先取消再重新勾上。'
+            }
+            else { '请至少勾选一部结构合格的漫画。' }
             [System.Windows.Forms.MessageBox]::Show(
-                '请至少勾选一部结构合格的漫画。',
+                $emptyMessage,
                 '尚未选择',
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Information
             ) | Out-Null
             return
         }
-        if ($UpdateMode -eq 'AddOnly') {
-            $newlyChecked = @($checked | Where-Object { $selectionState.PreviousSelectedNames -notcontains [string]$_.Text })
-            if ($newlyChecked.Count -eq 0) {
-                [System.Windows.Forms.MessageBox]::Show(
-                    '没有发现本次新勾选的漫画。请勾选至少一部原先不在书架中的漫画，或改用“全部更新”。',
-                    '没有新增漫画',
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Information
-                ) | Out-Null
-                return
-            }
-        }
-        $checkedNames = @($checked | ForEach-Object { [string]$_.Text })
         & $setBusy $true
         $script:ProgressLabel = $status
-        $status.Text = if ($UpdateMode -eq 'AddOnly') { '正在准备仅加入新勾选的漫画……' } else { '正在准备全部更新……' }
+        $status.Text = if ($UpdateMode -eq 'Selected') { '正在准备加入 / 更新勾选的漫画……' } else { '正在准备全部更新……' }
         [System.Windows.Forms.Application]::DoEvents()
         try {
             $result = Invoke-ComicUpdate -LibraryRoot $LibraryRoot -PreviousSelectedNames @($selectionState.PreviousSelectedNames) -CheckedNames $checkedNames -UpdateMode $UpdateMode -OpenAfterGenerate ([bool]$openAfter.Checked)
             $selectionState.PreviousSelectedNames = @($result.PersistedSelectedNames)
-            foreach ($item in $list.Items) {
-                if ($null -ne $item.Tag) { $item.Checked = $selectionState.PreviousSelectedNames -contains [string]$item.Text }
+            $selectionState.SuppressTargetTracking = $true
+            try {
+                foreach ($item in $list.Items) {
+                    if ($null -ne $item.Tag) { $item.Checked = $selectionState.PreviousSelectedNames -contains [string]$item.Text }
+                }
+                $selectionState.TargetNames.Clear()
             }
+            finally { $selectionState.SuppressTargetTracking = $false }
             $summaryText = '更新完成：本次生成 {0} 部漫画、{1} 话、{2} 张图片；书架共 {3} 部。' -f $result.GeneratedCount, $result.ChapterCount, $result.ImageCount, $result.LauncherCount
             $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Information
             $selectionState.ExitCode = 0
@@ -722,13 +748,13 @@ function Show-ComicSelector {
         }
     }
 
-    $addOnly = New-Object System.Windows.Forms.Button
-    $addOnly.Text = '仅加入新勾选'
-    $addOnly.Location = New-Object System.Drawing.Point(544, 505)
-    $addOnly.Size = New-Object System.Drawing.Size(142, 36)
-    $addOnly.Anchor = 'Bottom,Right'
-    $addOnly.add_Click({ & $runUpdate 'AddOnly' })
-    $form.Controls.Add($addOnly)
+    $updateSelected = New-Object System.Windows.Forms.Button
+    $updateSelected.Text = '加入 / 更新本次勾选'
+    $updateSelected.Location = New-Object System.Drawing.Point(526, 505)
+    $updateSelected.Size = New-Object System.Drawing.Size(160, 36)
+    $updateSelected.Anchor = 'Bottom,Right'
+    $updateSelected.add_Click({ & $runUpdate 'Selected' })
+    $form.Controls.Add($updateSelected)
 
     $updateAll = New-Object System.Windows.Forms.Button
     $updateAll.Text = '全部更新'
@@ -1864,7 +1890,7 @@ function Get-ExistingRootCards {
     if (@($ComicNames).Count -eq 0) { return @{} }
     $path = Join-Path $LibraryRoot $script:LauncherFileName
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw '找不到现有漫画阅读器，无法在“仅加入”模式下保留旧书架；请先使用一次“全部更新”。'
+        throw '找不到现有漫画阅读器，无法在“加入 / 更新勾选”模式下保留旧书架；请先使用一次“全部更新”。'
     }
     $html = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
     $cardsByKey = @{}
@@ -2102,7 +2128,7 @@ function Invoke-ComicUpdate {
         [string]$LibraryRoot,
         [string[]]$PreviousSelectedNames,
         [string[]]$CheckedNames,
-        [ValidateSet('All', 'AddOnly')][string]$UpdateMode,
+        [ValidateSet('All', 'Selected')][string]$UpdateMode,
         [bool]$OpenAfterGenerate,
         [switch]$AuditOnlyMode
     )
@@ -2110,14 +2136,14 @@ function Invoke-ComicUpdate {
     $selectedNames = @($selectionPlan.SelectedNames)
     $namesToGenerate = @($selectionPlan.NamesToGenerate)
     if ($selectedNames.Count -eq 0) { throw '没有选择任何漫画。' }
-    if ($UpdateMode -eq 'AddOnly' -and $namesToGenerate.Count -eq 0) { throw '没有发现本次新勾选的漫画。' }
+    if ($UpdateMode -eq 'Selected' -and $namesToGenerate.Count -eq 0) { throw '没有可加入或更新的勾选漫画。' }
 
     $preservedCards = @{}
     $namesToAudit = @($selectedNames)
-    if ($UpdateMode -eq 'AddOnly') {
+    if ($UpdateMode -eq 'Selected') {
         $preservedCards = Get-ExistingRootCards -LibraryRoot $LibraryRoot -ComicNames $PreviousSelectedNames
         $namesToAudit = @($namesToGenerate)
-        Write-Info ('快速加入模式：保留 {0} 部既有漫画，仅核验并生成 {1} 部新漫画。' -f $PreviousSelectedNames.Count, $namesToAudit.Count)
+        Write-Info ('勾选更新模式：保留其他既有漫画，核验并生成 {0} 部勾选漫画（新漫画加入，旧漫画更新）。' -f $namesToAudit.Count)
     }
 
     $audited = @()
@@ -2183,11 +2209,11 @@ function Invoke-ComicUpdate {
 
     if ($generated.Count -eq 0) { throw '没有任何漫画成功生成，未更新总打开器。' }
     $launcherComics = @($generated | Group-Object Name | ForEach-Object { $_.Group[0] })
-    $persistedSelectedNames = if ($UpdateMode -eq 'AddOnly') {
+    $persistedSelectedNames = if ($UpdateMode -eq 'Selected') {
         @($PreviousSelectedNames + @($generated | ForEach-Object { $_.Name }) | Select-Object -Unique)
     }
     else { @($launcherComics | ForEach-Object { $_.Name }) }
-    $launcherCount = $preservedCards.Count + $launcherComics.Count
+    $launcherCount = @($persistedSelectedNames | Select-Object -Unique).Count
     Write-Info '正在更新并复核总打开器……'
     $launcherPath = New-RootPage -Comics $launcherComics -LibraryRoot $LibraryRoot -SelectedNames $persistedSelectedNames -OpenAfterGenerate $OpenAfterGenerate -PreservedCards $preservedCards
     $launcherHtml = [System.IO.File]::ReadAllText($launcherPath, [System.Text.Encoding]::UTF8)
