@@ -113,7 +113,7 @@ New-HiddenVbsTool -SourcePath (Join-Path $PSScriptRoot 'comic-reader-generator.p
 New-HiddenVbsTool -SourcePath (Join-Path $PSScriptRoot 'comic-organizer.ps1') -DestinationPath (Join-Path $OutputDirectory '漫画整理器.vbs') -DisplayName '漫画整理器错误'
 $cbzSourcePath = Join-Path $PSScriptRoot 'comic-cbz-exporter.ps1'
 if (Test-Path -LiteralPath $cbzSourcePath -PathType Leaf) {
-    New-HiddenVbsTool -SourcePath $cbzSourcePath -DestinationPath (Join-Path $OutputDirectory '漫画导出器.vbs') -DisplayName '漫画 CBZ / EPUB 导出器错误'
+    New-HiddenVbsTool -SourcePath $cbzSourcePath -DestinationPath (Join-Path $OutputDirectory '漫画导出器.vbs') -DisplayName '漫画 CBZ / EPUB / PDF 导出器错误'
 }
 
 Get-ChildItem -LiteralPath $OutputDirectory -File | Select-Object Name, Length

@@ -79,7 +79,7 @@ function Get-SpecialChapterInfoFromName {
     param([string]$Name)
     $match = [regex]::Match(
         $Name,
-        '^(特典(?:话|話)?|番外(?:篇|话|話)?|插画集|插畫集|イラスト集|附录|附錄|后日谈|後日談|Extra|Special)(?:\s+(.*))?$',
+        '^(特典(?:话|話)?|番外(?:篇|话|話)?(?:\s*\d+(?:\.\d+)?)?|插画集|插畫集|イラスト集|附录|附錄|附赠|附贈|后日谈|後日談|后记|後記|小短篇|封面|线下画展展品|線下畫展展品|Extra|Special)(?:\s+(.*))?$',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase
     )
     if (-not $match.Success) { return $null }
@@ -113,6 +113,30 @@ function ConvertTo-ChapterLabelInfo {
         BaseFolderName = $text
         DisplayLabel = $text
     }
+}
+
+function Get-InitialOrganizerChapterFields {
+    param(
+        [string]$ChapterName,
+        [bool]$IsRootChapter,
+        [string]$DefaultNumber,
+        [bool]$PreserveNumericNumber
+    )
+    $initialNumber = $DefaultNumber
+    $sourceNumber = Get-ChapterNumberFromName -Name $ChapterName
+    $specialInfo = Get-SpecialChapterInfoFromName -Name $ChapterName
+    if ($null -ne $sourceNumber -and ($PreserveNumericNumber -or $sourceNumber.Text.Contains('.'))) {
+        $initialNumber = $sourceNumber.Text
+    }
+    elseif ($null -ne $specialInfo) {
+        $initialNumber = $specialInfo.Label
+    }
+    elseif ($null -eq $sourceNumber -and $ChapterName -cne $script:RootChapterToken) {
+        $arbitraryLabel = ConvertTo-ChapterLabelInfo -Value $ChapterName
+        if ($null -ne $arbitraryLabel) { $initialNumber = $ChapterName }
+    }
+    $initialTitle = if ($null -ne $specialInfo) { $specialInfo.Title } else { Get-ChapterTitleFromName -Name $ChapterName }
+    return [pscustomobject]@{ Number = $initialNumber; Title = $initialTitle }
 }
 
 function ConvertTo-NumberRangeText {
@@ -154,6 +178,129 @@ function Get-NaturalNameSortKey {
         param($match)
         return $match.Value.PadLeft(24, '0')
     })
+}
+
+function Get-WindowsChapterNameMatchKey {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return '' }
+    $text = ([string]$Value).Normalize([Text.NormalizationForm]::FormKC)
+    while ($text.Length -gt 0 -and ([char]::IsWhiteSpace($text[$text.Length - 1]) -or $text[$text.Length - 1] -eq '.')) {
+        $text = $text.Substring(0, $text.Length - 1)
+    }
+    return $text
+}
+
+function Get-SourceChapterOrderConfiguration {
+    param([string]$ComicPath)
+    $result = [ordered]@{ Enabled = $false; ExactMap = @{}; NormalizedMap = @{}; Warning = '' }
+    $metadataPath = Join-Path $ComicPath '元数据.json'
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return [pscustomobject]$result }
+    try {
+        $metadata = [IO.File]::ReadAllText($metadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $chapterInfos = if ($null -ne $metadata.PSObject.Properties['chapterInfos']) { @($metadata.chapterInfos) } else { @() }
+        if ($chapterInfos.Count -eq 0) { return [pscustomobject]$result }
+        $errors = New-Object 'System.Collections.Generic.List[string]'
+        $exactMap = @{}
+        $normalizedMap = @{}
+        $usedOrders = @{}
+        foreach ($chapterInfo in $chapterInfos) {
+            $chapterFolder = ''
+            if ($null -ne $chapterInfo.PSObject.Properties['chapterFolder']) { $chapterFolder = [string]$chapterInfo.chapterFolder }
+            elseif ($null -ne $chapterInfo.PSObject.Properties['chapterTitle']) { $chapterFolder = [string]$chapterInfo.chapterTitle }
+            $order = 0
+            if ([string]::IsNullOrWhiteSpace($chapterFolder) -or $null -eq $chapterInfo.PSObject.Properties['order'] -or -not [int]::TryParse([string]$chapterInfo.order, [ref]$order) -or $order -lt 1) {
+                $errors.Add('存在缺少章节文件夹名或有效顺序的 chapterInfos 项。')
+                continue
+            }
+            if ($exactMap.ContainsKey($chapterFolder)) {
+                $errors.Add(('章节名称重复：' + $chapterFolder))
+                continue
+            }
+            if ($usedOrders.ContainsKey([string]$order)) {
+                $errors.Add(('章节顺序重复：' + $order))
+                continue
+            }
+            $normalizedKey = Get-WindowsChapterNameMatchKey -Value $chapterFolder
+            if ([string]::IsNullOrWhiteSpace($normalizedKey)) {
+                $errors.Add(('章节名称无法用于匹配：' + $chapterFolder))
+                continue
+            }
+            if ($normalizedMap.ContainsKey($normalizedKey)) {
+                $errors.Add(('章节名称按 Windows 文件名规则处理后重复：{0}、{1}' -f $normalizedMap[$normalizedKey].Folder, $chapterFolder))
+                continue
+            }
+            $entry = [pscustomobject]@{ Folder = $chapterFolder; Order = $order }
+            $exactMap[$chapterFolder] = $entry
+            $normalizedMap[$normalizedKey] = $entry
+            $usedOrders[[string]$order] = $true
+        }
+        if ($errors.Count -gt 0) {
+            $result.Warning = '元数据.json 的章节顺序无效，已改用名称自然排序：' + ($errors -join '；')
+            return [pscustomobject]$result
+        }
+        $result.Enabled = $true
+        $result.ExactMap = $exactMap
+        $result.NormalizedMap = $normalizedMap
+    }
+    catch {
+        $result.Warning = '元数据.json 无法读取章节顺序，已改用名称自然排序：' + $_.Exception.Message
+    }
+    return [pscustomobject]$result
+}
+
+function Set-SourceChapterEntryOrder {
+    param([string]$ComicPath, [object[]]$Entries)
+    $naturalEntries = @($Entries | Sort-Object { Get-NaturalNameSortKey -Name $_.Name }, Name)
+    if ($naturalEntries.Count -le 1) {
+        foreach ($entry in $naturalEntries) {
+            $entry | Add-Member -NotePropertyName OrderSource -NotePropertyValue 'Natural' -Force
+            $entry | Add-Member -NotePropertyName OrderWarning -NotePropertyValue '' -Force
+        }
+        return @($naturalEntries)
+    }
+    $configuration = Get-SourceChapterOrderConfiguration -ComicPath $ComicPath
+    if (-not $configuration.Enabled) {
+        foreach ($entry in $naturalEntries) {
+            $entry | Add-Member -NotePropertyName OrderSource -NotePropertyValue 'Natural' -Force
+            $entry | Add-Member -NotePropertyName OrderWarning -NotePropertyValue $configuration.Warning -Force
+        }
+        return @($naturalEntries)
+    }
+    $matched = @()
+    $missing = @()
+    $usedMetadataFolders = @{}
+    foreach ($entry in $naturalEntries) {
+        $configured = $null
+        if ($configuration.ExactMap.ContainsKey($entry.Name)) {
+            $configured = $configuration.ExactMap[$entry.Name]
+        }
+        else {
+            $normalizedKey = Get-WindowsChapterNameMatchKey -Value $entry.Name
+            if ($configuration.NormalizedMap.ContainsKey($normalizedKey)) { $configured = $configuration.NormalizedMap[$normalizedKey] }
+        }
+        if ($null -eq $configured) {
+            $missing += $entry.Name
+            continue
+        }
+        $usedMetadataFolders[[string]$configured.Folder] = $true
+        $matched += [pscustomobject]@{ Entry = $entry; Order = [int]$configured.Order }
+    }
+    if ($missing.Count -gt 0) {
+        $warning = '元数据.json 的章节顺序没有覆盖以下章节，已改用名称自然排序：' + ($missing -join '、')
+        foreach ($entry in $naturalEntries) {
+            $entry | Add-Member -NotePropertyName OrderSource -NotePropertyValue 'Natural' -Force
+            $entry | Add-Member -NotePropertyName OrderWarning -NotePropertyValue $warning -Force
+        }
+        return @($naturalEntries)
+    }
+    $stale = @($configuration.ExactMap.Keys | Where-Object { -not $usedMetadataFolders.ContainsKey($_) })
+    $warning = if ($stale.Count -gt 0) { '元数据顺序中有已不存在的章节，已忽略：' + ($stale -join '、') } else { '' }
+    $ordered = @($matched | Sort-Object Order | ForEach-Object { $_.Entry })
+    foreach ($entry in $ordered) {
+        $entry | Add-Member -NotePropertyName OrderSource -NotePropertyValue 'Metadata' -Force
+        $entry | Add-Member -NotePropertyName OrderWarning -NotePropertyValue $warning -Force
+    }
+    return @($ordered)
 }
 
 function Get-NumericImages {
@@ -353,7 +500,7 @@ function Get-SourceChapterEntries {
         throw '漫画根目录中有正文图片，同时又存在章节文件夹；结构有歧义，请只保留一种正文结构。'
     }
     if ($chapterDirectories.Count -gt 0) {
-        return @($chapterDirectories | ForEach-Object {
+        $entries = @($chapterDirectories | ForEach-Object {
             $files = @(Get-ChildItem -LiteralPath $_.FullName -File | Where-Object { $script:ImageExtensions -contains $_.Extension.ToLowerInvariant() })
             $sequence = Get-FlexibleImageSequence -Files $files -Context $_.Name
             [pscustomobject]@{
@@ -364,18 +511,20 @@ function Get-SourceChapterEntries {
                 Warning = $sequence.Warning
             }
         })
+        return @(Set-SourceChapterEntryOrder -ComicPath $ComicPath -Entries $entries)
     }
     if ($rootImages.Count -gt 0) {
         $layout = Get-RootImageLayout -ComicPath $ComicPath
-        if ($layout.Recognized) { return @($layout.Entries) }
+        if ($layout.Recognized) { return @(Set-SourceChapterEntryOrder -ComicPath $ComicPath -Entries @($layout.Entries)) }
         $sequence = Get-FlexibleImageSequence -Files $rootImages -Context $script:RootChapterToken
-        return @([pscustomobject]@{
+        $entries = @([pscustomobject]@{
             Name = $script:RootChapterToken
             IsRootChapter = $true
             Images = @($sequence.Images)
             OrderMode = $sequence.Mode
             Warning = $sequence.Warning
         })
+        return @(Set-SourceChapterEntryOrder -ComicPath $ComicPath -Entries $entries)
     }
     return @()
 }
@@ -433,6 +582,68 @@ function Read-OrganizerPlan {
     param([string]$Path)
     $raw = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
     return ($raw | ConvertFrom-Json)
+}
+
+function ConvertTo-MetadataPlainText {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return '' }
+    $parts = @($Value | ForEach-Object {
+        if ($_ -is [string]) { $_ }
+        elseif ($null -ne $_.PSObject.Properties['name']) { [string]$_.name }
+        elseif ($null -ne $_.PSObject.Properties['title']) { [string]$_.title }
+        else { [string]$_ }
+    })
+    $text = ($parts -join "`r`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    $text = [regex]::Replace($text, '(?is)<\s*br\s*/?\s*>', "`n")
+    $text = [regex]::Replace($text, '(?is)</\s*(?:p|div|li|tr|h[1-6])\s*>', "`n")
+    $text = [regex]::Replace($text, '(?is)<\s*li(?:\s[^>]*)?>', '• ')
+    $text = [regex]::Replace($text, '(?is)<[^>]+>', '')
+    $text = [Net.WebUtility]::HtmlDecode($text)
+    $lines = @($text -replace "`r`n?", "`n" -split "`n" | ForEach-Object {
+        ([regex]::Replace($_, '[\t ]+', ' ')).Trim()
+    })
+    $normalized = New-Object 'System.Collections.Generic.List[string]'
+    $lastWasBlank = $true
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            if (-not $lastWasBlank) { $normalized.Add('') }
+            $lastWasBlank = $true
+        }
+        else {
+            $normalized.Add($line)
+            $lastWasBlank = $false
+        }
+    }
+    while ($normalized.Count -gt 0 -and [string]::IsNullOrWhiteSpace($normalized[$normalized.Count - 1])) { $normalized.RemoveAt($normalized.Count - 1) }
+    return ($normalized -join "`r`n").Trim()
+}
+
+function Get-MetadataDescription {
+    param([AllowNull()][object]$Metadata)
+    foreach ($fieldName in @('description', 'intro', 'summary', 'desc', '简介', '簡介')) {
+        $value = Get-ObjectProperty -Object $Metadata -Name $fieldName -Default $null
+        $text = ConvertTo-MetadataPlainText -Value $value
+        if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
+    }
+    return ''
+}
+
+function Get-SourceDescription {
+    param(
+        [string]$LibraryRoot,
+        [string]$SourceFolder
+    )
+    if ([string]::IsNullOrWhiteSpace($SourceFolder)) { return '' }
+    $metadataPath = Join-Path (Join-Path $LibraryRoot $SourceFolder) '元数据.json'
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return '' }
+    try {
+        $metadata = [IO.File]::ReadAllText($metadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        return Get-MetadataDescription -Metadata $metadata
+    }
+    catch {
+        return ''
+    }
 }
 
 function Test-OrganizerPlan {
@@ -720,6 +931,29 @@ function Test-OrganizerPlan {
         }
     }
 
+    $descriptionProperty = $Plan.PSObject.Properties['description']
+    $descriptionSource = [string](Get-ObjectProperty -Object $Plan -Name 'descriptionSource' -Default '')
+    $description = if ($null -ne $descriptionProperty) { [string]$descriptionProperty.Value } else { '' }
+    if ($null -eq $descriptionProperty) {
+        # 兼容旧版方案：旧方案没有简介字段时，沿用原先从封面来源继承简介的行为。
+        if ([string]::IsNullOrWhiteSpace($descriptionSource)) { $descriptionSource = $coverSource }
+        $description = Get-SourceDescription -LibraryRoot $LibraryRoot -SourceFolder $descriptionSource
+    }
+    if (-not [string]::IsNullOrWhiteSpace($descriptionSource)) {
+        if (-not (Test-SimpleFolderName -Name $descriptionSource)) {
+            $errors.Add('简介来源文件夹名称无效。')
+        }
+        else {
+            $descriptionSourcePath = Join-Path $LibraryRoot $descriptionSource
+            if (-not (Test-Path -LiteralPath $descriptionSourcePath -PathType Container)) {
+                $errors.Add(('简介来源文件夹不存在：' + $descriptionSource))
+            }
+            elseif ($selectedSourceFolders.Count -gt 0 -and -not $selectedSourceFolders.Contains($descriptionSource)) {
+                $warnings.Add('简介来源不在章节来源中，但已保留手动编辑后的简介文本。')
+            }
+        }
+    }
+
     $totalImages = 0
     foreach ($chapter in $resolvedChapters) { $totalImages += $chapter.Images.Count }
     return [pscustomobject]@{
@@ -734,6 +968,8 @@ function Test-OrganizerPlan {
         CoverPath = $coverPath
         CoverOutputName = $coverOutputName
         CoverIsAutomatic = $coverIsAutomatic
+        Description = $description
+        DescriptionSource = $descriptionSource
         Chapters = @($resolvedChapters | Sort-Object ReadingOrder)
         ChapterCount = $resolvedChapters.Count
         TotalImages = $totalImages
@@ -777,15 +1013,17 @@ function New-OutputMetadata {
         }
     })
     $organizerInfo = [pscustomobject][ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         generatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         sourceFolders = @($Audit.SourceFolders)
         chapterCount = $Audit.ChapterCount
         totalImages = $Audit.TotalImages
         coverFile = $Audit.CoverOutputName
         coverAutomatic = $Audit.CoverIsAutomatic
+        descriptionSource = $Audit.DescriptionSource
     }
     $metadata | Add-Member -NotePropertyName name -NotePropertyValue $Audit.OutputName -Force
+    $metadata | Add-Member -NotePropertyName description -NotePropertyValue $Audit.Description -Force
     $metadata | Add-Member -NotePropertyName chapterInfos -NotePropertyValue $chapterInfos -Force
     $metadata | Add-Member -NotePropertyName organizer -NotePropertyValue $organizerInfo -Force
     return $metadata
@@ -909,7 +1147,7 @@ function Show-OrganizerWindow {
     $form.Controls.Add($title)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = '支持任意章节名、复合文件名前缀分话及名称排序兜底；勾选“并入上一话”可把多个来源接成同一话。'
+    $hint.Text = '载入时优先采用元数据章节顺序；无有效配置时按名称排序。勾选“并入上一话”可把多个来源接成同一话。'
     $hint.AutoSize = $true
     $hint.ForeColor = [System.Drawing.Color]::DimGray
     $hint.Location = New-Object System.Drawing.Point(18, 48)
@@ -923,7 +1161,7 @@ function Show-OrganizerWindow {
 
     $sourceList = New-Object System.Windows.Forms.CheckedListBox
     $sourceList.Location = New-Object System.Drawing.Point(18, 106)
-    $sourceList.Size = New-Object System.Drawing.Size(365, 480)
+    $sourceList.Size = New-Object System.Drawing.Size(365, 438)
     $sourceList.Anchor = 'Top,Bottom,Left'
     $sourceList.CheckOnClick = $true
     $sourceList.HorizontalScrollbar = $true
@@ -934,10 +1172,25 @@ function Show-OrganizerWindow {
 
     $loadSelected = New-Object System.Windows.Forms.Button
     $loadSelected.Text = '载入所选文件夹'
-    $loadSelected.Location = New-Object System.Drawing.Point(18, 600)
-    $loadSelected.Size = New-Object System.Drawing.Size(150, 36)
+    $loadSelected.Location = New-Object System.Drawing.Point(18, 558)
+    $loadSelected.Size = New-Object System.Drawing.Size(177, 36)
     $loadSelected.Anchor = 'Bottom,Left'
     $form.Controls.Add($loadSelected)
+
+    $loadNewSources = New-Object System.Windows.Forms.Button
+    $loadNewSources.Text = '载入新增文件夹'
+    $loadNewSources.Location = New-Object System.Drawing.Point(203, 558)
+    $loadNewSources.Size = New-Object System.Drawing.Size(180, 36)
+    $loadNewSources.Anchor = 'Bottom,Left'
+    $loadNewSources.Enabled = $false
+    $form.Controls.Add($loadNewSources)
+
+    $rescanSources = New-Object System.Windows.Forms.Button
+    $rescanSources.Text = '重新扫描来源文件夹库'
+    $rescanSources.Location = New-Object System.Drawing.Point(18, 600)
+    $rescanSources.Size = New-Object System.Drawing.Size(365, 36)
+    $rescanSources.Anchor = 'Bottom,Left'
+    $form.Controls.Add($rescanSources)
 
     $outputLabel = New-Object System.Windows.Forms.Label
     $outputLabel.Text = '输出漫画名称：'
@@ -945,11 +1198,22 @@ function Show-OrganizerWindow {
     $outputLabel.Location = New-Object System.Drawing.Point(405, 82)
     $form.Controls.Add($outputLabel)
 
-    $outputName = New-Object System.Windows.Forms.TextBox
+    $outputName = New-Object System.Windows.Forms.ComboBox
+    $outputName.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+    $outputName.AutoCompleteMode = [System.Windows.Forms.AutoCompleteMode]::SuggestAppend
+    $outputName.AutoCompleteSource = [System.Windows.Forms.AutoCompleteSource]::ListItems
     $outputName.Location = New-Object System.Drawing.Point(510, 78)
-    $outputName.Size = New-Object System.Drawing.Size(735, 27)
+    $outputName.Size = New-Object System.Drawing.Size(565, 27)
     $outputName.Anchor = 'Top,Left,Right'
     $form.Controls.Add($outputName)
+
+    $descriptionButton = New-Object System.Windows.Forms.Button
+    $descriptionButton.Text = '编辑简介（未填写）'
+    $descriptionButton.Location = New-Object System.Drawing.Point(1083, 75)
+    $descriptionButton.Size = New-Object System.Drawing.Size(162, 32)
+    $descriptionButton.Anchor = 'Top,Right'
+    $descriptionButton.BackColor = [System.Drawing.Color]::FromArgb(238, 244, 250)
+    $form.Controls.Add($descriptionButton)
 
     $grid = New-Object System.Windows.Forms.DataGridView
     $grid.Location = New-Object System.Drawing.Point(405, 118)
@@ -1090,6 +1354,10 @@ function Show-OrganizerWindow {
     $form.Controls.Add($status)
 
     $script:lastDefaultOutput = ''
+    $script:OrganizerDescription = ''
+    $script:OrganizerDescriptionSource = ''
+    $script:OrganizerDescriptionLocked = $false
+    $script:OrganizerLoadedOnce = $false
 
     $showMessage = {
         param([string]$Message, [string]$Caption, [System.Windows.Forms.MessageBoxIcon]$Icon)
@@ -1101,6 +1369,165 @@ function Show-OrganizerWindow {
             $Icon
         ) | Out-Null
     }
+
+    $updateDescriptionButton = {
+        $length = $script:OrganizerDescription.Length
+        if (-not $script:OrganizerDescriptionLocked -and -not [string]::IsNullOrWhiteSpace($script:OrganizerDescriptionSource)) {
+            $descriptionButton.Text = ('简介：随漫画名（{0}字）' -f $length)
+        }
+        elseif ($script:OrganizerDescriptionLocked) {
+            $descriptionButton.Text = if ($length -eq 0) { '编辑简介（已固定为空）' } else { '编辑简介（已固定 {0}字）' -f $length }
+        }
+        elseif ($length -eq 0) {
+            $descriptionButton.Text = '编辑简介（未填写）'
+        }
+        else {
+            $descriptionButton.Text = ('编辑简介（{0}字）' -f $length)
+        }
+    }
+
+    $syncDefaultDescriptionFromOutputName = {
+        if ($script:OrganizerDescriptionLocked -or $outputName.SelectedIndex -lt 0) { return }
+        $sourceName = [string]$outputName.SelectedItem
+        if ([string]::IsNullOrWhiteSpace($sourceName)) { return }
+        $script:OrganizerDescriptionSource = $sourceName
+        $script:OrganizerDescription = Get-SourceDescription -LibraryRoot $LibraryRoot -SourceFolder $sourceName
+        & $updateDescriptionButton
+    }
+
+    $refreshOutputNameChoices = {
+        param([string[]]$PreferredSources, [string]$PreferredText)
+        $sourceNames = @($PreferredSources | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        $outputName.BeginUpdate()
+        try {
+            $outputName.Items.Clear()
+            foreach ($sourceName in $sourceNames) { [void]$outputName.Items.Add($sourceName) }
+        }
+        finally { $outputName.EndUpdate() }
+        if (-not [string]::IsNullOrWhiteSpace($PreferredText)) {
+            $matchingIndex = $outputName.Items.IndexOf($PreferredText)
+            if ($matchingIndex -ge 0) { $outputName.SelectedIndex = $matchingIndex } else { $outputName.Text = $PreferredText }
+        }
+        elseif ($outputName.Items.Count -gt 0) {
+            $outputName.SelectedIndex = 0
+        }
+    }
+
+    $outputName.add_SelectedIndexChanged({ & $syncDefaultDescriptionFromOutputName })
+
+    $descriptionButton.add_Click({
+        $sourceNames = @($sourceList.CheckedItems | ForEach-Object { [string]$_ })
+        if ($sourceNames.Count -eq 0) {
+            $sourceNames = @($grid.Rows | ForEach-Object { [string]$_.Cells['SourceFolder'].Value } | Where-Object { $_ } | Select-Object -Unique)
+        }
+        $descriptions = @{}
+        foreach ($sourceName in $sourceNames) {
+            $sourceDescription = Get-SourceDescription -LibraryRoot $LibraryRoot -SourceFolder $sourceName
+            if (-not [string]::IsNullOrWhiteSpace($sourceDescription)) {
+                $descriptions[$sourceName] = $sourceDescription
+            }
+        }
+
+        $dialog = New-Object System.Windows.Forms.Form
+        $dialog.Text = '选择并编辑漫画简介'
+        $dialog.StartPosition = 'CenterParent'
+        $dialog.Size = New-Object System.Drawing.Size(820, 610)
+        $dialog.MinimumSize = New-Object System.Drawing.Size(680, 500)
+        $dialog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+        $dialog.MinimizeBox = $false
+
+        $sourceCaption = New-Object System.Windows.Forms.Label
+        $sourceCaption.Text = '简介来源（只列出含简介的已导入文件夹）：'
+        $sourceCaption.AutoSize = $true
+        $sourceCaption.Location = New-Object System.Drawing.Point(18, 18)
+        $dialog.Controls.Add($sourceCaption)
+
+        $sourceCombo = New-Object System.Windows.Forms.ComboBox
+        $sourceCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $sourceCombo.Location = New-Object System.Drawing.Point(18, 48)
+        $sourceCombo.Size = New-Object System.Drawing.Size(620, 30)
+        $sourceCombo.Anchor = 'Top,Left,Right'
+        [void]$sourceCombo.Items.Add('手动编辑 / 留空')
+        foreach ($sourceName in @($descriptions.Keys | Sort-Object)) { [void]$sourceCombo.Items.Add($sourceName) }
+        $sourceCombo.SelectedIndex = 0
+        if (-not [string]::IsNullOrWhiteSpace($script:OrganizerDescriptionSource)) {
+            $existingIndex = $sourceCombo.Items.IndexOf($script:OrganizerDescriptionSource)
+            if ($existingIndex -ge 0) { $sourceCombo.SelectedIndex = $existingIndex }
+        }
+        $dialog.Controls.Add($sourceCombo)
+
+        $adoptButton = New-Object System.Windows.Forms.Button
+        $adoptButton.Text = '采用所选简介'
+        $adoptButton.Location = New-Object System.Drawing.Point(648, 46)
+        $adoptButton.Size = New-Object System.Drawing.Size(135, 34)
+        $adoptButton.Anchor = 'Top,Right'
+        $dialog.Controls.Add($adoptButton)
+
+        $editCaption = New-Object System.Windows.Forms.Label
+        $editCaption.Text = '最终简介（可继续修改；清空后输出空简介）：'
+        $editCaption.AutoSize = $true
+        $editCaption.Location = New-Object System.Drawing.Point(18, 96)
+        $dialog.Controls.Add($editCaption)
+
+        $editor = New-Object System.Windows.Forms.TextBox
+        $editor.Multiline = $true
+        $editor.AcceptsReturn = $true
+        $editor.ScrollBars = 'Vertical'
+        $editor.WordWrap = $true
+        $editor.Location = New-Object System.Drawing.Point(18, 126)
+        $editor.Size = New-Object System.Drawing.Size(765, 365)
+        $editor.Anchor = 'Top,Bottom,Left,Right'
+        $editor.Text = $script:OrganizerDescription
+        $dialog.Controls.Add($editor)
+
+        $countLabel = New-Object System.Windows.Forms.Label
+        $countLabel.AutoSize = $true
+        $countLabel.Location = New-Object System.Drawing.Point(18, 505)
+        $countLabel.Anchor = 'Bottom,Left'
+        $dialog.Controls.Add($countLabel)
+        $refreshCount = { $countLabel.Text = ('当前 {0} 字' -f $editor.Text.Length) }
+        $editor.add_TextChanged({ & $refreshCount })
+        & $refreshCount
+
+        $adoptButton.add_Click({
+            if ($sourceCombo.SelectedIndex -le 0) {
+                $editor.Clear()
+                return
+            }
+            $selectedSource = [string]$sourceCombo.SelectedItem
+            $editor.Text = [string]$descriptions[$selectedSource]
+        })
+
+        $okDescription = New-Object System.Windows.Forms.Button
+        $okDescription.Text = '确定'
+        $okDescription.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $okDescription.Location = New-Object System.Drawing.Point(574, 520)
+        $okDescription.Size = New-Object System.Drawing.Size(100, 36)
+        $okDescription.Anchor = 'Bottom,Right'
+        $dialog.Controls.Add($okDescription)
+
+        $cancelDescription = New-Object System.Windows.Forms.Button
+        $cancelDescription.Text = '取消'
+        $cancelDescription.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $cancelDescription.Location = New-Object System.Drawing.Point(683, 520)
+        $cancelDescription.Size = New-Object System.Drawing.Size(100, 36)
+        $cancelDescription.Anchor = 'Bottom,Right'
+        $dialog.Controls.Add($cancelDescription)
+        $dialog.AcceptButton = $okDescription
+        $dialog.CancelButton = $cancelDescription
+
+        if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            $script:OrganizerDescription = $editor.Text.Trim()
+            $script:OrganizerDescriptionSource = if ($sourceCombo.SelectedIndex -gt 0) { [string]$sourceCombo.SelectedItem } else { '' }
+            $script:OrganizerDescriptionLocked = $true
+            & $updateDescriptionButton
+            $status.Text = if ($script:OrganizerDescription.Length -gt 0) {
+                ('已设置漫画简介：{0} 字；最终仍可再次编辑。' -f $script:OrganizerDescription.Length)
+            }
+            else { '已将输出漫画简介设为空。' }
+        }
+        $dialog.Dispose()
+    })
 
     $renumberRows = {
         if ($grid.Rows.Count -eq 0) { return }
@@ -1186,9 +1613,12 @@ function Show-OrganizerWindow {
             $selectedCoverSource = [string]$grid.Rows[0].Cells['SourceFolder'].Value
         }
         return [pscustomobject][ordered]@{
-            schemaVersion = 3
+            schemaVersion = 5
             outputName = $outputName.Text.Trim()
             coverSource = $selectedCoverSource
+            descriptionSource = $script:OrganizerDescriptionSource
+            description = $script:OrganizerDescription
+            descriptionLocked = $script:OrganizerDescriptionLocked
             selectedSourceFolders = @($sourceList.CheckedItems | ForEach-Object { [string]$_ })
             chapters = $chapters
         }
@@ -1197,7 +1627,8 @@ function Show-OrganizerWindow {
     $setGridFromPlan = {
         param([object]$Plan)
         $grid.Rows.Clear()
-        $outputName.Text = [string](Get-ObjectProperty -Object $Plan -Name 'outputName' -Default '')
+        $planOutputName = [string](Get-ObjectProperty -Object $Plan -Name 'outputName' -Default '')
+        $outputName.Text = $planOutputName
         $sourceNames = @((Get-ObjectProperty -Object $Plan -Name 'selectedSourceFolders' -Default @()) | ForEach-Object {
             [string]$_
         } | Where-Object { $_ } | Select-Object -Unique)
@@ -1207,6 +1638,18 @@ function Show-OrganizerWindow {
             } | Where-Object { $_ } | Select-Object -Unique)
         }
         $requestedCover = [string](Get-ObjectProperty -Object $Plan -Name 'coverSource' -Default '')
+        $descriptionProperty = $Plan.PSObject.Properties['description']
+        $script:OrganizerDescriptionSource = [string](Get-ObjectProperty -Object $Plan -Name 'descriptionSource' -Default '')
+        if ($null -ne $descriptionProperty) {
+            $script:OrganizerDescription = [string]$descriptionProperty.Value
+            $script:OrganizerDescriptionLocked = [bool](Get-ObjectProperty -Object $Plan -Name 'descriptionLocked' -Default $true)
+        }
+        else {
+            $script:OrganizerDescriptionSource = ''
+            $script:OrganizerDescription = ''
+            $script:OrganizerDescriptionLocked = $false
+        }
+        & $updateDescriptionButton
         foreach ($chapter in @((Get-ObjectProperty -Object $Plan -Name 'chapters' -Default @()))) {
             $sourceFolder = [string](Get-ObjectProperty -Object $chapter -Name 'sourceFolder' -Default '')
             $sourceChapter = [string](Get-ObjectProperty -Object $chapter -Name 'sourceChapter' -Default '')
@@ -1240,8 +1683,67 @@ function Show-OrganizerWindow {
         for ($index = 0; $index -lt $sourceList.Items.Count; $index++) {
             $sourceList.SetItemChecked($index, ($sourceNames -contains [string]$sourceList.Items[$index]))
         }
+        & $refreshOutputNameChoices $sourceNames $planOutputName
+        if (-not $script:OrganizerDescriptionLocked) { & $syncDefaultDescriptionFromOutputName }
         $script:lastDefaultOutput = $outputName.Text
+        $script:OrganizerLoadedOnce = $true
+        $loadSelected.Text = '重新载入所选文件夹'
+        $loadNewSources.Enabled = $true
         $status.Text = ('已加载方案：{0} 话。' -f $grid.Rows.Count)
+    }
+
+    $getLoadedSourceNames = {
+        return @($grid.Rows | ForEach-Object { [string]$_.Cells['SourceFolder'].Value } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    }
+
+    $addSourceRows = {
+        param([string[]]$Names, [bool]$ResetRows)
+        $originalRowCount = $grid.Rows.Count
+        if ($ResetRows) {
+            $grid.Rows.Clear()
+            $originalRowCount = 0
+        }
+        $existingSources = @(& $getLoadedSourceNames)
+        $allSourceNames = @($existingSources + $Names | Select-Object -Unique)
+        $outputNumber = $grid.Rows.Count
+        $metadataOrderSources = @()
+        $orderWarnings = @()
+        try {
+            foreach ($name in $Names) {
+                $comicPath = Join-Path $LibraryRoot $name
+                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath)
+                if ($sourceChapterEntries.Count -gt 0 -and [string]$sourceChapterEntries[0].OrderSource -eq 'Metadata') {
+                    $metadataOrderSources += $name
+                }
+                $sourceOrderWarning = @($sourceChapterEntries | ForEach-Object { [string]$_.OrderWarning } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+                foreach ($warning in $sourceOrderWarning) { $orderWarnings += ($name + '：' + $warning) }
+                foreach ($chapterDirectory in $sourceChapterEntries) {
+                    $imageCount = @($chapterDirectory.Images).Count
+                    if ($imageCount -eq 0) { throw ($name + '\' + $chapterDirectory.Name + '：没有可载入的图片。') }
+                    $outputNumber++
+                    $initialFields = Get-InitialOrganizerChapterFields -ChapterName $chapterDirectory.Name -IsRootChapter ([bool]$chapterDirectory.IsRootChapter) -DefaultNumber ([string]$outputNumber) -PreserveNumericNumber ($allSourceNames.Count -eq 1)
+                    [void]$grid.Rows.Add($initialFields.Number, $initialFields.Title, $name, $chapterDirectory.Name, 1, $imageCount, $imageCount, $false, ($grid.Rows.Count -eq 0))
+                }
+            }
+        }
+        catch {
+            while ($grid.Rows.Count -gt $originalRowCount) { $grid.Rows.RemoveAt($grid.Rows.Count - 1) }
+            & $showMessage $_.Exception.Message '来源载入失败' ([System.Windows.Forms.MessageBoxIcon]::Error)
+            return $null
+        }
+        return [pscustomobject]@{
+            AddedSources = @($Names)
+            AddedRows = $grid.Rows.Count - $originalRowCount
+            MetadataOrderSources = @($metadataOrderSources)
+            OrderWarnings = @($orderWarnings)
+        }
+    }
+
+    $showOrderWarnings = {
+        param([object]$LoadResult)
+        if ($null -ne $LoadResult -and @($LoadResult.OrderWarnings).Count -gt 0) {
+            & $showMessage (@($LoadResult.OrderWarnings) -join "`r`n`r`n") '章节顺序配置未完全采用' ([System.Windows.Forms.MessageBoxIcon]::Warning)
+        }
     }
 
     $loadSelected.add_Click({
@@ -1250,55 +1752,90 @@ function Show-OrganizerWindow {
             & $showMessage '请至少勾选一个来源漫画文件夹。' '尚未选择' ([System.Windows.Forms.MessageBoxIcon]::Information)
             return
         }
-        if ([string]::IsNullOrWhiteSpace($outputName.Text) -or $outputName.Text -ceq $script:lastDefaultOutput) {
-            $outputName.Text = $selectedNames[0]
-            $script:lastDefaultOutput = $selectedNames[0]
+        $currentOutputText = $outputName.Text.Trim()
+        $useDefaultName = [string]::IsNullOrWhiteSpace($currentOutputText) -or $currentOutputText -ceq $script:lastDefaultOutput
+        $wasLoaded = $script:OrganizerLoadedOnce
+        $loadResult = & $addSourceRows $selectedNames $true
+        if ($null -eq $loadResult) { return }
+        $preferredName = if ($useDefaultName) { $selectedNames[0] } else { $currentOutputText }
+        & $refreshOutputNameChoices $selectedNames $preferredName
+        if (-not $script:OrganizerDescriptionLocked) { & $syncDefaultDescriptionFromOutputName }
+        if ($useDefaultName) { $script:lastDefaultOutput = $selectedNames[0] }
+        $script:OrganizerLoadedOnce = $true
+        $loadSelected.Text = '重新载入所选文件夹'
+        $loadNewSources.Enabled = $true
+        $metadataSourceCount = @($loadResult.MetadataOrderSources).Count
+        $orderStatus = if ($metadataSourceCount -gt 0) { '其中 {0} 个来源已采用元数据章节顺序。' -f $metadataSourceCount } else { '未发现可采用的元数据章节顺序。' }
+        $status.Text = if ($wasLoaded) {
+            '已重新载入 {0} 个来源、{1} 行章节；{2} 原表格编辑已重置。' -f $selectedNames.Count, $grid.Rows.Count, $orderStatus
         }
-        $grid.Rows.Clear()
-        $outputNumber = 0
-        foreach ($name in $selectedNames) {
-            $comicPath = Join-Path $LibraryRoot $name
+        else { '已载入 {0} 个来源、{1} 行章节；{2}' -f $selectedNames.Count, $grid.Rows.Count, $orderStatus }
+        & $showOrderWarnings $loadResult
+    })
+
+    $loadNewSources.add_Click({
+        $selectedNames = @($sourceList.CheckedItems | ForEach-Object { [string]$_ })
+        $loadedNames = @(& $getLoadedSourceNames)
+        $newNames = @($selectedNames | Where-Object { $loadedNames -notcontains $_ })
+        if ($newNames.Count -eq 0) {
+            & $showMessage '当前勾选项中没有尚未载入的新文件夹。原有表格编辑保持不变。' '没有新增来源' ([System.Windows.Forms.MessageBoxIcon]::Information)
+            return
+        }
+        $currentOutputText = $outputName.Text
+        $loadResult = & $addSourceRows $newNames $false
+        if ($null -eq $loadResult) { return }
+        $allLoadedNames = @(& $getLoadedSourceNames)
+        & $refreshOutputNameChoices $allLoadedNames $currentOutputText
+        $status.Text = ('已追加 {0} 个新来源、{1} 行章节；原有 {2} 行编辑未重置。' -f $newNames.Count, $loadResult.AddedRows, ($grid.Rows.Count - $loadResult.AddedRows))
+        & $showOrderWarnings $loadResult
+    })
+
+    $rescanSources.add_Click({
+        $checkedNames = @($sourceList.CheckedItems | ForEach-Object { [string]$_ })
+        $loadedNames = @(& $getLoadedSourceNames)
+        $keepChecked = @($checkedNames + $loadedNames | Select-Object -Unique)
+        try {
+            $rescannedCandidates = @(Get-CandidateFolders -LibraryRoot $LibraryRoot)
+            $sourceList.BeginUpdate()
             try {
-                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath)
+                $sourceList.Items.Clear()
+                foreach ($candidate in $rescannedCandidates) {
+                    $index = $sourceList.Items.Add($candidate.Name)
+                    if ($keepChecked -contains $candidate.Name) { $sourceList.SetItemChecked($index, $true) }
+                }
             }
-            catch {
-                & $showMessage ($name + "`r`n" + $_.Exception.Message) '来源结构有歧义' ([System.Windows.Forms.MessageBoxIcon]::Error)
-                return
-            }
-            foreach ($chapterDirectory in $sourceChapterEntries) {
+            finally { $sourceList.EndUpdate() }
+
+            $refreshProblems = @()
+            $refreshedRows = 0
+            foreach ($row in $grid.Rows) {
+                $sourceFolder = [string]$row.Cells['SourceFolder'].Value
+                $sourceChapter = [string]$row.Cells['SourceChapter'].Value
+                $oldTotal = 0
+                [void][int]::TryParse([string]$row.Cells['Total'].Value, [ref]$oldTotal)
                 try {
-                    $info = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $name -SourceChapter $chapterDirectory.Name
-                    $outputNumber++
-                    $initialNumber = [string]$outputNumber
-                    $sourceNumber = Get-ChapterNumberFromName -Name $chapterDirectory.Name
-                    $specialInfo = Get-SpecialChapterInfoFromName -Name $chapterDirectory.Name
-                    if ($selectedNames.Count -eq 1 -and $null -ne $sourceNumber) {
-                        $initialNumber = $sourceNumber.Text
-                    }
-                    elseif ($null -ne $specialInfo) {
-                        $initialNumber = $specialInfo.Label
-                    }
-                    elseif ($selectedNames.Count -eq 1 -and -not $chapterDirectory.IsRootChapter) {
-                        $arbitraryLabel = ConvertTo-ChapterLabelInfo -Value $chapterDirectory.Name
-                        if ($null -ne $arbitraryLabel) {
-                            $initialNumber = $chapterDirectory.Name
-                        }
-                    }
-                    $initialTitle = if ($null -ne $specialInfo) {
-                        $specialInfo.Title
-                    }
-                    else {
-                        Get-ChapterTitleFromName -Name $chapterDirectory.Name
-                    }
-                    [void]$grid.Rows.Add($initialNumber, $initialTitle, $name, $chapterDirectory.Name, 1, $info.Count, $info.Count, $false, ($outputNumber -eq 1))
+                    $newTotal = (Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter).Count
+                    $endValue = 0
+                    $endWasTotal = [int]::TryParse([string]$row.Cells['End'].Value, [ref]$endValue) -and $oldTotal -gt 0 -and $endValue -eq $oldTotal
+                    if ($endWasTotal -or [string]::IsNullOrWhiteSpace([string]$row.Cells['End'].Value)) { $row.Cells['End'].Value = $newTotal }
+                    $row.Cells['Total'].Value = $newTotal
+                    $refreshedRows++
                 }
                 catch {
-                    & $showMessage ($name + '\' + $chapterDirectory.Name + "`r`n" + $_.Exception.Message) '来源图片错误' ([System.Windows.Forms.MessageBoxIcon]::Error)
-                    return
+                    $row.Cells['Total'].Value = '缺失'
+                    $refreshProblems += ($sourceFolder + '\' + $sourceChapter + '：' + $_.Exception.Message)
                 }
             }
+            & $refreshOutputNameChoices (@(& $getLoadedSourceNames)) $outputName.Text
+            $loadNewSources.Enabled = $grid.Rows.Count -gt 0
+            $status.Text = ('重新扫描完成：来源库 {0} 个文件夹，已刷新 {1} 行载入信息；表格编辑和手动范围保持不变。' -f $rescannedCandidates.Count, $refreshedRows)
+            if ($refreshProblems.Count -gt 0) {
+                & $showMessage ($refreshProblems -join "`r`n") '部分已载入来源发生变化' ([System.Windows.Forms.MessageBoxIcon]::Warning)
+            }
         }
-        $status.Text = ('已载入 {0} 个来源文件夹，生成 {1} 行初始章节。输出名称和每行范围均可编辑。' -f $selectedNames.Count, $grid.Rows.Count)
+        catch {
+            & $showMessage $_.Exception.Message '重新扫描失败' ([System.Windows.Forms.MessageBoxIcon]::Error)
+        }
     })
 
     $duplicateRow.add_Click({
@@ -1398,13 +1935,17 @@ function Show-OrganizerWindow {
 
     $helpButton.add_Click({
         $helpText = @'
-1. 勾选一个或多个来源文件夹，再点击“载入所选文件夹”。
-2. 根目录若为 P01_001、P02_001 等格式，会按前缀自动生成多行章节；无法识别页码时按名称自然排序。
-3. 表格从上到下就是阅读顺序，可修改话序、章节名、范围并上下移动。
-4. 若要把多个文件夹或分组接成同一话，把来源行排在一起，并从第二行起勾选“并入上一话”。
-5. “按范围拆分选中行”可把总集的一行拆成多话。
-6. 原文件不会修改；结果输出到“整理完成”，正文统一重命名为 0001、0002……。
-7. 纯数字或复合页码会检查重复和缺号；无法识别的名称排序模式会明确警告无法判断缺图。
+1. 首次勾选来源后点击“载入所选文件夹”；载入后该按钮会变为“重新载入”，使用它会重建表格并重置现有编辑。
+2. 编辑中途新增来源时，先“重新扫描来源文件夹库”，再勾选新来源并点击“载入新增文件夹”，原有行不会重置。
+3. 输出漫画名称可手动输入，也可用右侧下拉箭头直接选择已载入漫画名称。
+4. 简介默认跟随输出漫画名称所选来源；在简介窗口按“确定”后即固定，不再随名称来源变化。
+5. 来源若有元数据.json 且 chapterInfos 完整有效，会按其中的 order 排列；无配置或无法完整匹配时按名称自然排序并提示原因。
+6. 根目录若为 P01_001、P02_001 等格式，会按前缀自动生成多行章节；无法识别页码时按名称自然排序。
+7. 表格从上到下就是阅读顺序，可修改话序、章节名、范围并上下移动；非数字话序会保留原特殊名称。
+8. 若要把多个文件夹或分组接成同一话，把来源行排在一起，并从第二行起勾选“并入上一话”。
+9. “按范围拆分选中行”可把总集的一行拆成多话。
+10. 原文件不会修改；结果输出到“整理完成”，正文统一重命名为 0001、0002……。
+11. 纯数字或复合页码会检查重复和缺号；无法识别的名称排序模式会明确警告无法判断缺图。
 '@
         & $showMessage $helpText '漫画整理器使用说明' ([System.Windows.Forms.MessageBoxIcon]::Information)
     })
