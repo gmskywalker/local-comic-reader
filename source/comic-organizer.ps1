@@ -14,6 +14,16 @@ $script:ImageExtensions = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.
 $script:OutputFolderName = '整理完成'
 $script:RootChapterToken = '[根目录正文]'
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:OrganizerProgressCallback = $null
+$script:OrganizerIsRunning = $false
+$script:OrganizerBusyControlStates = @()
+
+function Update-OrganizerProgress {
+    param([string]$Message)
+    if ($null -ne $script:OrganizerProgressCallback -and -not [string]::IsNullOrWhiteSpace($Message)) {
+        & $script:OrganizerProgressCallback $Message
+    }
+}
 
 function Write-JsonFile {
     param([string]$Path, [object]$Value)
@@ -533,7 +543,8 @@ function Get-SourceChapterInfo {
     param(
         [string]$LibraryRoot,
         [string]$SourceFolder,
-        [string]$SourceChapter
+        [string]$SourceChapter,
+        [hashtable]$SourceEntriesCache = $null
     )
     if (-not (Test-SimpleFolderName $SourceFolder)) {
         throw ('来源漫画文件夹名称不合法：' + $SourceFolder)
@@ -542,7 +553,13 @@ function Get-SourceChapterInfo {
     if (-not (Test-Path -LiteralPath $comicPath -PathType Container)) {
         throw ('来源漫画文件夹不存在：' + $SourceFolder)
     }
-    $entries = @(Get-SourceChapterEntries -ComicPath $comicPath)
+    if ($null -ne $SourceEntriesCache -and $SourceEntriesCache.ContainsKey($SourceFolder)) {
+        $entries = @($SourceEntriesCache[$SourceFolder])
+    }
+    else {
+        $entries = @(Get-SourceChapterEntries -ComicPath $comicPath)
+        if ($null -ne $SourceEntriesCache) { $SourceEntriesCache[$SourceFolder] = @($entries) }
+    }
     $entry = @($entries | Where-Object { $_.Name -ceq $SourceChapter } | Select-Object -First 1)
     if ($entry.Count -eq 0) { throw ('来源章节不存在或命名分组已经变化：' + $SourceFolder + '\' + $SourceChapter) }
     return [pscustomobject]@{
@@ -650,7 +667,8 @@ function Test-OrganizerPlan {
     param(
         [object]$Plan,
         [string]$LibraryRoot,
-        [switch]$IgnoreExistingOutput
+        [switch]$IgnoreExistingOutput,
+        [string]$ProgressPrefix = '正在核验方案'
     )
 
     $errors = New-Object 'System.Collections.Generic.List[string]'
@@ -683,6 +701,7 @@ function Test-OrganizerPlan {
 
     $resolvedChapters = @()
     $sourceCache = @{}
+    $sourceEntriesCache = @{}
     $usageBySource = @{}
     $selectedSourceFolders = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($sourceFolderValue in @((Get-ObjectProperty -Object $Plan -Name 'selectedSourceFolders' -Default @()))) {
@@ -702,6 +721,7 @@ function Test-OrganizerPlan {
 
     foreach ($chapter in $planChapters) {
         $planRowIndex++
+        Update-OrganizerProgress -Message ('{0}：第 {1}/{2} 行' -f $ProgressPrefix, $planRowIndex, $planChapters.Count)
         $mergeWithPrevious = [bool](Get-ObjectProperty -Object $chapter -Name 'mergeWithPrevious' -Default $false)
         $labelInfo = $null
         $number = ''
@@ -758,7 +778,7 @@ function Test-OrganizerPlan {
         $sourceKey = $sourceFolder + '|' + $sourceChapter
         if (-not $sourceCache.ContainsKey($sourceKey)) {
             try {
-                $sourceCache[$sourceKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter
+                $sourceCache[$sourceKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache
             }
             catch {
                 $errors.Add(($sourceFolder + '\' + $sourceChapter + '：' + $_.Exception.Message))
@@ -780,6 +800,9 @@ function Test-OrganizerPlan {
         $usage = $usageBySource[$sourceKey]
         $hasOverlap = $false
         for ($imageNumber = $start; $imageNumber -le $end; $imageNumber++) {
+            if ($imageNumber -eq $start -or $imageNumber -eq $end -or (($imageNumber - $start) % 250) -eq 0) {
+                Update-OrganizerProgress -Message ('{0}：第 {1}/{2} 行｜检查图片 {3}/{4}' -f $ProgressPrefix, $planRowIndex, $planChapters.Count, ($imageNumber - $start + 1), ($end - $start + 1))
+            }
             if ($usage.ContainsKey([string]$imageNumber)) {
                 $errors.Add(('图片被重复使用：{0}\{1}\{2:D4}（{3} 与 {4} 重叠）' -f $sourceFolder, $sourceChapter, $imageNumber, $usage[[string]$imageNumber], $chapterLabel))
                 $hasOverlap = $true
@@ -846,20 +869,31 @@ function Test-OrganizerPlan {
         }
     }
 
-    foreach ($sourceFolder in $selectedSourceFolders) {
+    $selectedSourceArray = @($selectedSourceFolders)
+    for ($sourceFolderIndex = 0; $sourceFolderIndex -lt $selectedSourceArray.Count; $sourceFolderIndex++) {
+        $sourceFolder = $selectedSourceArray[$sourceFolderIndex]
+        Update-OrganizerProgress -Message ('{0}：检查来源 {1}/{2}｜{3}' -f $ProgressPrefix, ($sourceFolderIndex + 1), $selectedSourceArray.Count, $sourceFolder)
         $comicPath = Join-Path $LibraryRoot $sourceFolder
         try {
-            $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath)
+            if ($sourceEntriesCache.ContainsKey($sourceFolder)) {
+                $sourceChapterEntries = @($sourceEntriesCache[$sourceFolder])
+            }
+            else {
+                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath)
+                $sourceEntriesCache[$sourceFolder] = @($sourceChapterEntries)
+            }
         }
         catch {
             $errors.Add(($sourceFolder + '：' + $_.Exception.Message))
             continue
         }
-        foreach ($chapterDirectory in $sourceChapterEntries) {
+        for ($sourceChapterIndex = 0; $sourceChapterIndex -lt $sourceChapterEntries.Count; $sourceChapterIndex++) {
+            $chapterDirectory = $sourceChapterEntries[$sourceChapterIndex]
+            Update-OrganizerProgress -Message ('{0}：检查来源 {1}/{2}｜章节 {3}/{4}：{5}' -f $ProgressPrefix, ($sourceFolderIndex + 1), $selectedSourceArray.Count, ($sourceChapterIndex + 1), $sourceChapterEntries.Count, $chapterDirectory.Name)
             $sourceKey = $sourceFolder + '|' + $chapterDirectory.Name
             try {
                 if (-not $sourceCache.ContainsKey($sourceKey)) {
-                    $sourceCache[$sourceKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $chapterDirectory.Name
+                    $sourceCache[$sourceKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $chapterDirectory.Name -SourceEntriesCache $sourceEntriesCache
                 }
                 $sourceInfo = $sourceCache[$sourceKey]
                 if (-not $usageBySource.ContainsKey($sourceKey)) {
@@ -911,11 +945,17 @@ function Test-OrganizerPlan {
         }
         else {
             try {
-                $coverChapterDirectories = @(Get-SourceChapterEntries -ComicPath $coverComicPath)
+                if ($sourceEntriesCache.ContainsKey($coverSource)) {
+                    $coverChapterDirectories = @($sourceEntriesCache[$coverSource])
+                }
+                else {
+                    $coverChapterDirectories = @(Get-SourceChapterEntries -ComicPath $coverComicPath)
+                    $sourceEntriesCache[$coverSource] = @($coverChapterDirectories)
+                }
                 if ($coverChapterDirectories.Count -eq 0) {
                     throw '没有可识别的章节文件夹。'
                 }
-                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverChapterDirectories[0].Name
+                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverChapterDirectories[0].Name -SourceEntriesCache $sourceEntriesCache
                 $coverImage = $coverChapterInfo.Images[0]
                 $coverPath = $coverImage.FullName
                 $coverOutputName = 'cover' + $coverImage.Extension.ToLowerInvariant()
@@ -956,6 +996,7 @@ function Test-OrganizerPlan {
 
     $totalImages = 0
     foreach ($chapter in $resolvedChapters) { $totalImages += $chapter.Images.Count }
+    Update-OrganizerProgress -Message ('{0}完成：{1} 话，{2} 张图片' -f $ProgressPrefix, $resolvedChapters.Count, $totalImages)
     return [pscustomobject]@{
         IsValid = ($errors.Count -eq 0)
         Errors = @($errors)
@@ -1032,7 +1073,8 @@ function New-OutputMetadata {
 function Test-NormalizedOutput {
     param(
         [string]$OutputPath,
-        [object]$Audit
+        [object]$Audit,
+        [string]$ProgressPrefix = '正在复核输出'
     )
     $errors = New-Object 'System.Collections.Generic.List[string]'
     $outputCoverPath = Join-Path $OutputPath $Audit.CoverOutputName
@@ -1042,7 +1084,9 @@ function Test-NormalizedOutput {
     elseif ((Get-Item -LiteralPath $outputCoverPath).Length -eq 0) {
         $errors.Add(('输出封面是空文件：' + $Audit.CoverOutputName))
     }
-    foreach ($chapter in $Audit.Chapters) {
+    for ($chapterIndex = 0; $chapterIndex -lt $Audit.Chapters.Count; $chapterIndex++) {
+        $chapter = $Audit.Chapters[$chapterIndex]
+        Update-OrganizerProgress -Message ('{0}：第 {1}/{2} 话｜{3}' -f $ProgressPrefix, ($chapterIndex + 1), $Audit.Chapters.Count, $chapter.FolderName)
         $folderName = $chapter.FolderName
         $chapterPath = Join-Path $OutputPath $folderName
         if (-not (Test-Path -LiteralPath $chapterPath -PathType Container)) {
@@ -1065,7 +1109,8 @@ function Test-NormalizedOutput {
 function Invoke-OrganizerPlan {
     param(
         [object]$Audit,
-        [string]$LibraryRoot
+        [string]$LibraryRoot,
+        [string]$ProgressPrefix = '正在整理'
     )
     if (-not $Audit.IsValid) {
         throw '整理方案未通过核验。'
@@ -1086,28 +1131,35 @@ function Invoke-OrganizerPlan {
 
     try {
         [void](New-Item -ItemType Directory -Path $temporaryPath)
+        Update-OrganizerProgress -Message ($ProgressPrefix + '：正在复制封面')
         Copy-Item -LiteralPath $Audit.CoverPath -Destination (Join-Path $temporaryPath $Audit.CoverOutputName)
 
-        foreach ($chapter in $Audit.Chapters) {
+        $copiedImages = 0
+        for ($chapterIndex = 0; $chapterIndex -lt $Audit.Chapters.Count; $chapterIndex++) {
+            $chapter = $Audit.Chapters[$chapterIndex]
             $folderName = $chapter.FolderName
             $chapterPath = Join-Path $temporaryPath $folderName
             [void](New-Item -ItemType Directory -Path $chapterPath)
             $outputNumber = 0
             foreach ($image in $chapter.Images) {
                 $outputNumber++
+                $copiedImages++
+                Update-OrganizerProgress -Message ('{0}：第 {1}/{2} 话｜{3}｜图片 {4}/{5}｜总体 {6}/{7}' -f $ProgressPrefix, ($chapterIndex + 1), $Audit.Chapters.Count, $folderName, $outputNumber, $chapter.Images.Count, $copiedImages, $Audit.TotalImages)
                 $destinationName = $outputNumber.ToString('D4') + $image.Extension.ToLowerInvariant()
                 Copy-Item -LiteralPath $image.FullName -Destination (Join-Path $chapterPath $destinationName)
             }
         }
 
+        Update-OrganizerProgress -Message ($ProgressPrefix + '：正在写入元数据与整理方案')
         $metadata = New-OutputMetadata -Audit $Audit -LibraryRoot $LibraryRoot
         Write-JsonFile -Path (Join-Path $temporaryPath '元数据.json') -Value $metadata
         Write-JsonFile -Path (Join-Path $temporaryPath '整理方案.json') -Value $Audit.Plan
 
-        $verifyErrors = @(Test-NormalizedOutput -OutputPath $temporaryPath -Audit $Audit)
+        $verifyErrors = @(Test-NormalizedOutput -OutputPath $temporaryPath -Audit $Audit -ProgressPrefix '正在复核整理结果')
         if ($verifyErrors.Count -gt 0) {
             throw ('输出复核失败：' + ($verifyErrors -join '；'))
         }
+        Update-OrganizerProgress -Message ($ProgressPrefix + '：正在完成输出文件夹')
         Move-Item -LiteralPath $temporaryPath -Destination $Audit.OutputPath
         return $Audit.OutputPath
     }
@@ -1358,6 +1410,40 @@ function Show-OrganizerWindow {
     $script:OrganizerDescriptionSource = ''
     $script:OrganizerDescriptionLocked = $false
     $script:OrganizerLoadedOnce = $false
+
+    $operationControls = @(
+        $sourceList, $loadSelected, $loadNewSources, $rescanSources, $outputName, $descriptionButton,
+        $grid, $splitRow, $duplicateRow, $deleteRow, $moveUp, $moveDown, $autoNumber,
+        $validateButton, $savePlan, $loadPlan, $helpButton, $generateButton
+    )
+    $setOrganizerBusy = {
+        param([bool]$Busy)
+        if ($Busy) {
+            $script:OrganizerBusyControlStates = @($operationControls | ForEach-Object {
+                [pscustomobject]@{ Control = $_; Enabled = $_.Enabled }
+            })
+            foreach ($control in $operationControls) { $control.Enabled = $false }
+        }
+        else {
+            foreach ($state in @($script:OrganizerBusyControlStates)) {
+                if ($null -ne $state.Control -and -not $state.Control.IsDisposed) { $state.Control.Enabled = [bool]$state.Enabled }
+            }
+            $script:OrganizerBusyControlStates = @()
+        }
+        $script:OrganizerIsRunning = $Busy
+        $form.UseWaitCursor = $Busy
+        $form.Cursor = if ($Busy) { [System.Windows.Forms.Cursors]::WaitCursor } else { [System.Windows.Forms.Cursors]::Default }
+        $form.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    $script:OrganizerProgressCallback = {
+        param([string]$Message)
+        if (-not $status.IsDisposed) {
+            $status.Text = $Message
+            $status.Refresh()
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    }
 
     $showMessage = {
         param([string]$Message, [string]$Caption, [System.Windows.Forms.MessageBoxIcon]$Icon)
@@ -1626,6 +1712,9 @@ function Show-OrganizerWindow {
 
     $setGridFromPlan = {
         param([object]$Plan)
+        $planChapters = @((Get-ObjectProperty -Object $Plan -Name 'chapters' -Default @()))
+        $sourceEntriesCache = @{}
+        $grid.SuspendLayout()
         $grid.Rows.Clear()
         $planOutputName = [string](Get-ObjectProperty -Object $Plan -Name 'outputName' -Default '')
         $outputName.Text = $planOutputName
@@ -1650,26 +1739,33 @@ function Show-OrganizerWindow {
             $script:OrganizerDescriptionLocked = $false
         }
         & $updateDescriptionButton
-        foreach ($chapter in @((Get-ObjectProperty -Object $Plan -Name 'chapters' -Default @()))) {
-            $sourceFolder = [string](Get-ObjectProperty -Object $chapter -Name 'sourceFolder' -Default '')
-            $sourceChapter = [string](Get-ObjectProperty -Object $chapter -Name 'sourceChapter' -Default '')
-            $total = ''
-            try {
-                $total = (Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter).Count
+        try {
+            for ($chapterIndex = 0; $chapterIndex -lt $planChapters.Count; $chapterIndex++) {
+                $chapter = $planChapters[$chapterIndex]
+                $status.Text = ('正在载入方案：第 {0}/{1} 行……' -f ($chapterIndex + 1), $planChapters.Count)
+                $status.Refresh()
+                [System.Windows.Forms.Application]::DoEvents()
+                $sourceFolder = [string](Get-ObjectProperty -Object $chapter -Name 'sourceFolder' -Default '')
+                $sourceChapter = [string](Get-ObjectProperty -Object $chapter -Name 'sourceChapter' -Default '')
+                $total = ''
+                try {
+                    $total = (Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache).Count
+                }
+                catch {}
+                [void]$grid.Rows.Add(
+                    [string](Get-ObjectProperty -Object $chapter -Name 'number' -Default ''),
+                    [string](Get-ObjectProperty -Object $chapter -Name 'title' -Default ''),
+                    $sourceFolder,
+                    $sourceChapter,
+                    [string](Get-ObjectProperty -Object $chapter -Name 'start' -Default ''),
+                    [string](Get-ObjectProperty -Object $chapter -Name 'end' -Default ''),
+                    [string]$total,
+                    [bool](Get-ObjectProperty -Object $chapter -Name 'mergeWithPrevious' -Default $false),
+                    $false
+                )
             }
-            catch {}
-            [void]$grid.Rows.Add(
-                [string](Get-ObjectProperty -Object $chapter -Name 'number' -Default ''),
-                [string](Get-ObjectProperty -Object $chapter -Name 'title' -Default ''),
-                $sourceFolder,
-                $sourceChapter,
-                [string](Get-ObjectProperty -Object $chapter -Name 'start' -Default ''),
-                [string](Get-ObjectProperty -Object $chapter -Name 'end' -Default ''),
-                [string]$total,
-                [bool](Get-ObjectProperty -Object $chapter -Name 'mergeWithPrevious' -Default $false),
-                $false
-            )
         }
+        finally { $grid.ResumeLayout() }
         if ($grid.Rows.Count -gt 0) {
             $coverRowIndex = 0
             for ($index = 0; $index -lt $grid.Rows.Count; $index++) {
@@ -1808,13 +1904,18 @@ function Show-OrganizerWindow {
 
             $refreshProblems = @()
             $refreshedRows = 0
-            foreach ($row in $grid.Rows) {
+            $sourceEntriesCache = @{}
+            for ($rowIndex = 0; $rowIndex -lt $grid.Rows.Count; $rowIndex++) {
+                $row = $grid.Rows[$rowIndex]
+                $status.Text = ('正在刷新已载入章节：第 {0}/{1} 行……' -f ($rowIndex + 1), $grid.Rows.Count)
+                $status.Refresh()
+                [System.Windows.Forms.Application]::DoEvents()
                 $sourceFolder = [string]$row.Cells['SourceFolder'].Value
                 $sourceChapter = [string]$row.Cells['SourceChapter'].Value
                 $oldTotal = 0
                 [void][int]::TryParse([string]$row.Cells['Total'].Value, [ref]$oldTotal)
                 try {
-                    $newTotal = (Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter).Count
+                    $newTotal = (Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache).Count
                     $endValue = 0
                     $endWasTotal = [int]::TryParse([string]$row.Cells['End'].Value, [ref]$endValue) -and $oldTotal -gt 0 -and $endValue -eq $oldTotal
                     if ($endWasTotal -or [string]::IsNullOrWhiteSpace([string]$row.Cells['End'].Value)) { $row.Cells['End'].Value = $newTotal }
@@ -1994,20 +2095,28 @@ function Show-OrganizerWindow {
         $dialog.InitialDirectory = $LibraryRoot
         $dialog.Filter = 'JSON 方案 (*.json)|*.json'
         if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            if ($script:OrganizerIsRunning) { return }
+            & $setOrganizerBusy $true
             try {
                 & $setGridFromPlan (Read-OrganizerPlan -Path $dialog.FileName)
             }
             catch {
                 & $showMessage $_.Exception.Message '加载失败' ([System.Windows.Forms.MessageBoxIcon]::Error)
             }
+            finally { & $setOrganizerBusy $false }
         }
     })
 
     $generateButton.add_Click({
+        if ($script:OrganizerIsRunning) { return }
+        & $setOrganizerBusy $true
         try {
+            $status.Text = '正在读取界面中的整理方案…'
+            [System.Windows.Forms.Application]::DoEvents()
             $plan = & $getPlanFromGrid
-            $audit = Test-OrganizerPlan -Plan $plan -LibraryRoot $LibraryRoot
+            $audit = Test-OrganizerPlan -Plan $plan -LibraryRoot $LibraryRoot -ProgressPrefix '正在核验整理方案'
             if (-not $audit.IsValid) {
+                $status.Text = '方案未通过核验，请查看提示后修改。'
                 & $showMessage (($audit.Errors | Select-Object -First 30) -join "`r`n") '方案未通过' ([System.Windows.Forms.MessageBoxIcon]::Error)
                 return
             }
@@ -2034,24 +2143,37 @@ function Show-OrganizerWindow {
                 [System.Windows.Forms.MessageBoxIcon]::Question
             )
             if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-            $form.UseWaitCursor = $true
-            [System.Windows.Forms.Application]::DoEvents()
-            $resultPath = Invoke-OrganizerPlan -Audit $audit -LibraryRoot $LibraryRoot
-            $form.UseWaitCursor = $false
+            $resultPath = Invoke-OrganizerPlan -Audit $audit -LibraryRoot $LibraryRoot -ProgressPrefix '正在复制整理'
             $status.Text = ('整理完成：' + $resultPath)
             & $showMessage ("整理并复核完成。`r`n`r`n$resultPath`r`n`r`n确认无误后，可手动复制到漫画大文件夹。") '整理完成' ([System.Windows.Forms.MessageBoxIcon]::Information)
         }
         catch {
-            $form.UseWaitCursor = $false
+            $status.Text = '整理失败：' + $_.Exception.Message
             & $showMessage $_.Exception.Message '整理失败' ([System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+        finally { & $setOrganizerBusy $false }
+    })
+
+    $form.add_FormClosing({
+        param($sender, $eventArgs)
+        if ($script:OrganizerIsRunning) {
+            $eventArgs.Cancel = $true
+            $status.Text = '整理任务仍在进行，请等待完成后再关闭窗口。'
         }
     })
 
     if ($SmokeTest) {
+        $script:OrganizerProgressCallback = $null
+        $script:OrganizerIsRunning = $false
         $form.Dispose()
         return
     }
-    [void]$form.ShowDialog()
+    try { [void]$form.ShowDialog() }
+    finally {
+        $script:OrganizerProgressCallback = $null
+        $script:OrganizerIsRunning = $false
+        $script:OrganizerBusyControlStates = @()
+    }
 }
 
 try {
