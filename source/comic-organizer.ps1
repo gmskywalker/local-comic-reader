@@ -245,7 +245,7 @@ function Get-SourceChapterOrderConfiguration {
                 continue
             }
             $coverMode = if ($null -ne $chapterInfo.PSObject.Properties['coverMode']) { ([string]$chapterInfo.coverMode).Trim().ToLowerInvariant() } else { 'first' }
-            if ($coverMode -notin @('first', 'custom', 'none')) { $coverMode = 'first' }
+            if ($coverMode -notin @('first', 'custom', 'chapter', 'none')) { $coverMode = 'first' }
             $coverFile = if ($null -ne $chapterInfo.PSObject.Properties['coverFile']) { ([string]$chapterInfo.coverFile).Trim() } else { '' }
             $entry = [pscustomobject]@{ Folder = $chapterFolder; Order = $order; CoverMode = $coverMode; CoverFile = $coverFile }
             $exactMap[$chapterFolder] = $entry
@@ -756,11 +756,12 @@ function Test-OrganizerPlan {
         Update-OrganizerProgress -Message ('{0}：第 {1}/{2} 行' -f $ProgressPrefix, $planRowIndex, $planChapters.Count)
         $mergeWithPrevious = [bool](Get-ObjectProperty -Object $chapter -Name 'mergeWithPrevious' -Default $false)
         $chapterCoverMode = ([string](Get-ObjectProperty -Object $chapter -Name 'chapterCoverMode' -Default 'first')).Trim().ToLowerInvariant()
+        $chapterCoverFromMetadata = ($chapterCoverMode -eq 'metadata')
         $chapterCoverSourcePath = ([string](Get-ObjectProperty -Object $chapter -Name 'chapterCoverPath' -Default '')).Trim()
         $chapterCoverFile = ''
-        if ($chapterCoverMode -notin @('metadata', 'first', 'custom', 'none')) { $chapterCoverMode = 'first' }
+        if ($chapterCoverMode -notin @('metadata', 'first', 'custom', 'chapter', 'insert', 'none')) { $chapterCoverMode = 'first' }
         if ($mergeWithPrevious) {
-            if ($chapterCoverMode -eq 'custom' -and -not [string]::IsNullOrWhiteSpace($chapterCoverSourcePath)) {
+            if ($chapterCoverMode -in @('custom', 'chapter', 'insert') -and -not [string]::IsNullOrWhiteSpace($chapterCoverSourcePath)) {
                 $warnings.Add(('第 {0} 行已并入上一话，其章节封面设置不会单独使用。' -f $planRowIndex))
             }
         }
@@ -837,25 +838,32 @@ function Test-OrganizerPlan {
 
         if (-not $mergeWithPrevious -and $chapterCoverMode -eq 'metadata') {
             $chapterCoverMode = [string]$sourceInfo.ConfiguredCoverMode
-            if ($chapterCoverMode -notin @('first', 'custom', 'none')) { $chapterCoverMode = 'first' }
-            if ($chapterCoverMode -eq 'custom') {
+            if ($chapterCoverMode -notin @('first', 'custom', 'chapter', 'none')) { $chapterCoverMode = 'first' }
+            if ($chapterCoverMode -in @('custom', 'chapter')) {
                 $chapterCoverSourcePath = Resolve-ConfiguredSourceCoverPath -ComicPath $sourceInfo.ComicPath -RelativePath ([string]$sourceInfo.ConfiguredCoverFile)
+                if ($chapterCoverMode -eq 'chapter' -and -not [string]::IsNullOrWhiteSpace($chapterCoverSourcePath)) {
+                    $matchedSourceBodyImage = @($sourceInfo.Images | Where-Object {
+                        [IO.Path]::GetFullPath([string]$_.FullName).Equals([IO.Path]::GetFullPath($chapterCoverSourcePath), [StringComparison]::OrdinalIgnoreCase)
+                    })
+                    if ($matchedSourceBodyImage.Count -eq 0) { $chapterCoverSourcePath = '' }
+                }
                 if ([string]::IsNullOrWhiteSpace($chapterCoverSourcePath)) {
-                    $warnings.Add(('第 {0} 行无法采用来源元数据中的自选章节封面，已回退为首图：{1}\{2}' -f $planRowIndex, $sourceFolder, $sourceChapter))
+                    $coverKind = if ($chapterCoverMode -eq 'chapter') { '该话正文图片' } else { '自选章节封面' }
+                    $warnings.Add(('第 {0} 行无法采用来源元数据中的{1}，已回退为首图：{2}\{3}' -f $planRowIndex, $coverKind, $sourceFolder, $sourceChapter))
                     $chapterCoverMode = 'first'
                 }
             }
         }
-        if (-not $mergeWithPrevious -and $chapterCoverMode -eq 'custom') {
+        if (-not $mergeWithPrevious -and $chapterCoverMode -in @('custom', 'insert')) {
             if (-not (Test-Path -LiteralPath $chapterCoverSourcePath -PathType Leaf)) {
-                $errors.Add(('第 {0} 行选择的章节封面不存在：{1}' -f $planRowIndex, $chapterCoverSourcePath))
+                $errors.Add(('第 {0} 行选择的本地图片不存在：{1}' -f $planRowIndex, $chapterCoverSourcePath))
             }
             else {
                 $chapterCoverSourceFile = Get-Item -LiteralPath $chapterCoverSourcePath
                 if ($script:ImageExtensions -notcontains $chapterCoverSourceFile.Extension.ToLowerInvariant() -or $chapterCoverSourceFile.Length -eq 0) {
-                    $errors.Add(('第 {0} 行选择的章节封面不是有效图片：{1}' -f $planRowIndex, $chapterCoverSourcePath))
+                    $errors.Add(('第 {0} 行选择的本地图片不是有效图片：{1}' -f $planRowIndex, $chapterCoverSourcePath))
                 }
-                else {
+                elseif ($chapterCoverMode -eq 'custom') {
                     $chapterCoverFile = $script:ReaderResourceFolderName + '/' + $script:ChapterCoverFolderName + '/chapter-' + (($resolvedChapters.Count + 1).ToString('D4')) + $chapterCoverSourceFile.Extension.ToLowerInvariant()
                 }
             }
@@ -897,6 +905,9 @@ function Test-OrganizerPlan {
         $rangeHistoryBySource[$sourceKey] = @($rangeHistoryBySource[$sourceKey]) + @([pscustomobject]@{ Start = $start; End = $end; Label = $chapterLabel; Row = $planRowIndex })
         [void]$selectedSourceFolders.Add($sourceFolder)
         $selectedImages = @($sourceInfo.Images[($start - 1)..($end - 1)])
+        if (-not $mergeWithPrevious -and $chapterCoverMode -eq 'insert' -and (Test-Path -LiteralPath $chapterCoverSourcePath -PathType Leaf)) {
+            $selectedImages = @((Get-Item -LiteralPath $chapterCoverSourcePath)) + @($selectedImages)
+        }
         if ($mergeWithPrevious) {
             $targetChapter = $resolvedChapters[-1]
             $targetChapter.Images = @($targetChapter.Images) + @($selectedImages)
@@ -925,10 +936,40 @@ function Test-OrganizerPlan {
                 SourceParts = @([pscustomobject]@{ SourceFolder = $sourceFolder; SourceChapter = $sourceChapter; Start = $start; End = $end })
                 Images = @($selectedImages)
                 HasOverlap = $hasOverlap
-                ChapterCoverMode = $chapterCoverMode
-                ChapterCoverSourcePath = $chapterCoverSourcePath
+                ChapterCoverMode = $(if ($chapterCoverMode -eq 'insert') { 'first' } else { $chapterCoverMode })
+                ChapterCoverSourcePath = $(if ($chapterCoverMode -eq 'insert') { '' } else { $chapterCoverSourcePath })
                 ChapterCoverFile = $chapterCoverFile
+                ChapterCoverInherited = $chapterCoverFromMetadata
             }
+        }
+    }
+
+    foreach ($resolvedChapter in $resolvedChapters) {
+        if ([string]$resolvedChapter.ChapterCoverMode -ne 'chapter') { continue }
+        $coverSourceFull = ''
+        try { $coverSourceFull = [IO.Path]::GetFullPath([string]$resolvedChapter.ChapterCoverSourcePath) } catch {}
+        $matchedIndex = -1
+        for ($imageIndex = 0; $imageIndex -lt @($resolvedChapter.Images).Count; $imageIndex++) {
+            if ([string]::IsNullOrWhiteSpace($coverSourceFull)) { break }
+            if ([IO.Path]::GetFullPath([string]$resolvedChapter.Images[$imageIndex].FullName).Equals($coverSourceFull, [StringComparison]::OrdinalIgnoreCase)) {
+                $matchedIndex = $imageIndex
+                break
+            }
+        }
+        if ($matchedIndex -ge 0) {
+            $matchedImage = $resolvedChapter.Images[$matchedIndex]
+            $outputImageName = ($matchedIndex + 1).ToString('D4') + $matchedImage.Extension.ToLowerInvariant()
+            $resolvedChapter.ChapterCoverFile = ([string]$resolvedChapter.FolderName).Replace('\', '/') + '/' + $outputImageName
+            continue
+        }
+        if ([bool]$resolvedChapter.ChapterCoverInherited) {
+            $warnings.Add(('{0}：来源元数据指定的“该话其他图片”未包含在本次输出范围内，已回退首图。' -f $resolvedChapter.DisplayLabel))
+            $resolvedChapter.ChapterCoverMode = 'first'
+            $resolvedChapter.ChapterCoverSourcePath = ''
+            $resolvedChapter.ChapterCoverFile = ''
+        }
+        else {
+            $errors.Add(('{0}：选择的“该话其他图片”不在最终输出章节的图片范围内，请重新选择。' -f $resolvedChapter.DisplayLabel))
         }
     }
 
@@ -1165,7 +1206,7 @@ function New-OutputMetadata {
         }
     })
     $organizerInfo = [pscustomobject][ordered]@{
-        schemaVersion = 6
+        schemaVersion = 7
         generatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         sourceFolders = @($Audit.SourceFolders)
         chapterCount = $Audit.ChapterCount
@@ -1225,6 +1266,22 @@ function Test-NormalizedOutput {
             }
             elseif ((Get-Item -LiteralPath $customChapterCoverPath).Length -eq 0) {
                 $errors.Add(($folderName + '：自选章节封面是空文件。'))
+            }
+        }
+        elseif ([string]$chapter.ChapterCoverMode -eq 'chapter') {
+            $coverRelativePath = ([string]$chapter.ChapterCoverFile) -replace '/', [IO.Path]::DirectorySeparatorChar
+            $bodyChapterCoverPath = Join-Path $OutputPath $coverRelativePath
+            $expectedChapterPrefix = [IO.Path]::GetFullPath($chapterPath).TrimEnd('\') + '\'
+            $resolvedBodyCover = ''
+            try { $resolvedBodyCover = [IO.Path]::GetFullPath($bodyChapterCoverPath) } catch {}
+            if ([string]::IsNullOrWhiteSpace($resolvedBodyCover) -or -not $resolvedBodyCover.StartsWith($expectedChapterPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $errors.Add(($folderName + '：“该话其他图片”的相对路径未指向本话正文目录。'))
+            }
+            elseif (-not (Test-Path -LiteralPath $resolvedBodyCover -PathType Leaf)) {
+                $errors.Add(($folderName + '：缺少“该话其他图片”封面 ' + $chapter.ChapterCoverFile))
+            }
+            elseif ((Get-Item -LiteralPath $resolvedBodyCover).Length -eq 0) {
+                $errors.Add(($folderName + '：“该话其他图片”封面是空文件。'))
             }
         }
     }
@@ -1450,7 +1507,7 @@ function Show-OrganizerWindow {
     $chapterCoverColumn.Name = 'ChapterCover'
     $chapterCoverColumn.HeaderText = '章节封面 ▼'
     $chapterCoverColumn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    foreach ($coverChoice in @('跟随元数据', '首图', '自选', '隐藏')) { [void]$chapterCoverColumn.Items.Add($coverChoice) }
+    foreach ($coverChoice in @('跟随元数据', '首图', '自选', '本地图片插入为首图', '该话其他图片', '隐藏')) { [void]$chapterCoverColumn.Items.Add($coverChoice) }
     [void]$grid.Columns.Add($chapterCoverColumn)
     [void]$grid.Columns.Add('ChapterCoverMode', '章节封面模式')
     [void]$grid.Columns.Add('ChapterCoverPath', '章节封面路径')
@@ -1493,7 +1550,7 @@ function Show-OrganizerWindow {
     $grid.Columns['End'].Width = 65
     $grid.Columns['Total'].Width = 55
     $grid.Columns['ChapterCover'].Width = 115
-    $grid.Columns['ChapterCover'].ToolTipText = '可直接下拉选择：首图、自选本地图片、隐藏或跟随来源元数据'
+    $grid.Columns['ChapterCover'].ToolTipText = '自选：复制到阅读器资源；本地图片插入为首图：输出为 0001、原正文顺延；该话其他图片：直接引用本话正文；也可选择首图、隐藏或跟随元数据'
     $grid.Columns['ChapterCoverMode'].Visible = $false
     $grid.Columns['ChapterCoverPath'].Visible = $false
     $grid.Columns['Merge'].Width = 82
@@ -1501,7 +1558,7 @@ function Show-OrganizerWindow {
     $grid.Columns['Batch'].Width = 48
     $grid.Columns['MetadataCoverInfo'].Width = 170
     $grid.Columns['MetadataCoverInfo'].ReadOnly = $true
-    $grid.Columns['MetadataCoverInfo'].ToolTipText = '当章节封面选择“跟随元数据”时，这里显示来源元数据最终会采用首图、隐藏还是资源目录中的自选图片'
+    $grid.Columns['MetadataCoverInfo'].ToolTipText = '当章节封面选择“跟随元数据”时，这里显示来源元数据最终会采用首图、隐藏、资源目录自选图片，还是本话正文图片'
     $grid.Columns['MetadataCoverInfo'].DisplayIndex = $grid.Columns['ChapterCover'].DisplayIndex + 1
     $grid.Columns['Total'].ReadOnly = $true
     $form.Controls.Add($grid)
@@ -1739,6 +1796,21 @@ function Show-OrganizerWindow {
             if (-not [string]::IsNullOrWhiteSpace($resolvedPath)) { $details += "`r`n本地位置：" + $resolvedPath }
             else { $details += "`r`n注意：当前路径无法解析或图片已不存在。" }
             return [pscustomobject]@{ Display = '自选：' + $displayName; Details = $details }
+        }
+        if ($mode -eq 'chapter') {
+            $relativePath = ([string]$SourceInfo.ConfiguredCoverFile).Trim()
+            $displayName = if ([string]::IsNullOrWhiteSpace($relativePath)) { '路径缺失' } else { [IO.Path]::GetFileName($relativePath) }
+            $resolvedPath = if ([string]::IsNullOrWhiteSpace($ComicPath)) { '' } else { Resolve-ConfiguredSourceCoverPath -ComicPath $ComicPath -RelativePath $relativePath }
+            if (-not [string]::IsNullOrWhiteSpace($resolvedPath) -and $null -ne $SourceInfo.PSObject.Properties['Images']) {
+                $belongsToChapter = @($SourceInfo.Images | Where-Object {
+                    [IO.Path]::GetFullPath([string]$_.FullName).Equals([IO.Path]::GetFullPath($resolvedPath), [StringComparison]::OrdinalIgnoreCase)
+                }).Count -gt 0
+                if (-not $belongsToChapter) { $resolvedPath = '' }
+            }
+            $details = '来源元数据直接引用该话正文图片：' + $relativePath
+            if (-not [string]::IsNullOrWhiteSpace($resolvedPath)) { $details += "`r`n本地位置：" + $resolvedPath }
+            else { $details += "`r`n注意：当前路径无法解析或图片已不存在。" }
+            return [pscustomobject]@{ Display = '该话图片：' + $displayName; Details = $details }
         }
         return [pscustomobject]@{ Display = '首图'; Details = '来源元数据把这一话设为首图；跟随元数据时采用该话第一张正文图片。' }
     }
@@ -2100,6 +2172,46 @@ function Show-OrganizerWindow {
         if ($rows.Count -eq 0 -and $null -ne $grid.CurrentRow) { $rows = @($grid.CurrentRow) }
         return @($rows)
     }
+    $getLogicalChapterImagesForRow = {
+        param([System.Windows.Forms.DataGridViewRow]$OwnerRow)
+        if ($null -eq $OwnerRow -or $OwnerRow.Cells['Merge'].Value -eq $true) { return @() }
+        $result = New-Object 'System.Collections.Generic.List[object]'
+        for ($rowIndex = $OwnerRow.Index; $rowIndex -lt $grid.Rows.Count; $rowIndex++) {
+            $partRow = $grid.Rows[$rowIndex]
+            if ($rowIndex -gt $OwnerRow.Index -and $partRow.Cells['Merge'].Value -ne $true) { break }
+            $sourceFolder = [string]$partRow.Cells['SourceFolder'].Value
+            $sourceChapter = [string]$partRow.Cells['SourceChapter'].Value
+            $sourceInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter
+            $start = 0
+            $end = 0
+            if (-not [int]::TryParse([string]$partRow.Cells['Start'].Value, [ref]$start) -or
+                -not [int]::TryParse([string]$partRow.Cells['End'].Value, [ref]$end) -or
+                $start -lt 1 -or $end -lt $start -or $end -gt $sourceInfo.Count) {
+                throw ('请先修正图片范围：{0}\{1}（{2}-{3} / {4}）' -f $sourceFolder, $sourceChapter, $partRow.Cells['Start'].Value, $partRow.Cells['End'].Value, $sourceInfo.Count)
+            }
+            foreach ($image in @($sourceInfo.Images[($start - 1)..($end - 1)])) { [void]$result.Add($image) }
+        }
+        return @($result.ToArray())
+    }
+    $pickChapterBodyCover = {
+        param([System.Windows.Forms.DataGridViewRow]$OwnerRow, [int]$CurrentNumber, [int]$TotalNumber)
+        $images = @(& $getLogicalChapterImagesForRow $OwnerRow)
+        if ($images.Count -eq 0) { throw '当前输出章节没有可选择的正文图片。' }
+        $picker = New-Object System.Windows.Forms.OpenFileDialog
+        $picker.Title = if ($TotalNumber -gt 1) { '为第 {0}/{1} 个所选章节选择本话正文图片' -f $CurrentNumber, $TotalNumber } else { '选择该话其他正文图片' }
+        $picker.InitialDirectory = [IO.Path]::GetDirectoryName([string]$images[0].FullName)
+        $picker.Filter = '本话正文图片|*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp;*.avif|所有文件|*.*'
+        if ($picker.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        $pickedFullName = [IO.Path]::GetFullPath($picker.FileName)
+        $match = @($images | Where-Object {
+            [IO.Path]::GetFullPath([string]$_.FullName).Equals($pickedFullName, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+        if ($match.Count -eq 0) {
+            & $showMessage '只能选择最终会输出到当前这一话中的正文图片，不能选择其他章节或外部文件。' '不属于当前章节' ([System.Windows.Forms.MessageBoxIcon]::Warning)
+            return $null
+        }
+        return $match[0]
+    }
     $setChapterCoverRows = {
         param([object[]]$Rows, [string]$Mode, [string]$Path)
         $usableRows = @($Rows | Where-Object { $_.Cells['Merge'].Value -ne $true })
@@ -2108,17 +2220,17 @@ function Show-OrganizerWindow {
             return
         }
         & $pushUndoSnapshot
-        $display = switch ($Mode) { 'metadata' { '跟随元数据' } 'custom' { '自选' } 'none' { '隐藏' } default { '首图' } }
+        $display = switch ($Mode) { 'metadata' { '跟随元数据' } 'custom' { '自选' } 'insert' { '本地图片插入为首图' } 'chapter' { '该话其他图片' } 'none' { '隐藏' } default { '首图' } }
         $chapterCoverUiState.Changing = $true
         try {
             foreach ($row in $usableRows) {
                 $row.Cells['ChapterCoverMode'].Value = $Mode
-                $row.Cells['ChapterCoverPath'].Value = if ($Mode -eq 'custom') { $Path } else { '' }
+                $row.Cells['ChapterCoverPath'].Value = if ($Mode -in @('custom', 'chapter', 'insert')) { $Path } else { '' }
                 $row.Cells['ChapterCover'].Value = $display
             }
         }
         finally { $chapterCoverUiState.Changing = $false }
-        if ($Mode -in @('first', 'custom')) { $showChapterCovers.Checked = $true }
+        if ($Mode -in @('first', 'custom', 'chapter', 'insert')) { $showChapterCovers.Checked = $true }
         $skippedCount = @($Rows).Count - $usableRows.Count
         if ($Mode -eq 'metadata') {
             $actualValues = @($usableRows | ForEach-Object { [string]$_.Cells['MetadataCoverInfo'].Value } | Where-Object { $_ } | Select-Object -Unique)
@@ -2128,6 +2240,46 @@ function Show-OrganizerWindow {
             $status.Text = ('已把 {0} 行章节封面设为“{1}”{2}。' -f $usableRows.Count, $display, $(if ($skippedCount -gt 0) { '，并跳过 ' + $skippedCount + ' 行“并入上一话”' } else { '' }))
         }
     }
+    $applyChapterBodyCoverRows = {
+        param([object[]]$Rows)
+        $usableRows = @($Rows | Where-Object { $_.Cells['Merge'].Value -ne $true } | Sort-Object Index)
+        if ($usableRows.Count -eq 0) {
+            & $showMessage '所选行都会并入其他章节；请勾选该话的第一行设置封面。' '章节封面' ([System.Windows.Forms.MessageBoxIcon]::Information)
+            return $false
+        }
+        if ($usableRows.Count -gt 1) {
+            $answer = [System.Windows.Forms.MessageBox]::Show($form, ('“该话其他图片”必须分别属于对应章节。将依次为 {0} 话选择正文图片，是否继续？' -f $usableRows.Count), '逐话选择正文图片', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return $false }
+        }
+        $selectedPaths = @{}
+        try {
+            for ($index = 0; $index -lt $usableRows.Count; $index++) {
+                $pickedImage = & $pickChapterBodyCover $usableRows[$index] ($index + 1) $usableRows.Count
+                if ($null -eq $pickedImage) {
+                    $status.Text = '已取消“该话其他图片”选择，未改动任何章节。'
+                    return $false
+                }
+                $selectedPaths[[string]$usableRows[$index].Index] = [string]$pickedImage.FullName
+            }
+        }
+        catch {
+            & $showMessage $_.Exception.Message '无法选择本话正文图片' ([System.Windows.Forms.MessageBoxIcon]::Error)
+            return $false
+        }
+        & $pushUndoSnapshot
+        $chapterCoverUiState.Changing = $true
+        try {
+            foreach ($row in $usableRows) {
+                $row.Cells['ChapterCoverMode'].Value = 'chapter'
+                $row.Cells['ChapterCoverPath'].Value = [string]$selectedPaths[[string]$row.Index]
+                $row.Cells['ChapterCover'].Value = '该话其他图片'
+            }
+        }
+        finally { $chapterCoverUiState.Changing = $false }
+        $showChapterCovers.Checked = $true
+        $status.Text = ('已为 {0} 话选择正文图片作封面；输出后直接引用标准化正文图片，不会复制到漫画阅读器资源。' -f $usableRows.Count)
+        return $true
+    }
     $applyChapterCoverChoice = {
         param([string]$Mode)
         $rows = @(& $getBatchRows)
@@ -2135,15 +2287,23 @@ function Show-OrganizerWindow {
             & $showMessage '请先勾选第一列中的一行或多行；未勾选时也可直接点中一行再操作。' '章节封面' ([System.Windows.Forms.MessageBoxIcon]::Information)
             return
         }
+        if ($Mode -eq 'chapter') {
+            [void](& $applyChapterBodyCoverRows $rows)
+            return
+        }
         $path = ''
-        if ($Mode -eq 'custom') {
+        if ($Mode -in @('custom', 'insert')) {
             $picker = New-Object System.Windows.Forms.OpenFileDialog
-            $picker.Title = if ($rows.Count -gt 1) { '选择要统一用于所选章节的目录封面' } else { '选择这一话的目录封面' }
+            $picker.Title = if ($Mode -eq 'insert') {
+                if ($rows.Count -gt 1) { '选择要插入为所选各话 0001 的本地图片' } else { '选择要插入为本话 0001 的本地图片' }
+            }
+            elseif ($rows.Count -gt 1) { '选择要统一用于所选章节的目录封面' } else { '选择这一话的目录封面' }
             $picker.Filter = '图片文件|*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp;*.avif|所有文件|*.*'
             if ($picker.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
             $path = $picker.FileName
             if ($rows.Count -gt 1) {
-                $answer = [System.Windows.Forms.MessageBox]::Show($form, ('将同一张图片设为所选 {0} 行的章节封面，是否继续？' -f $rows.Count), '批量设置自选封面', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+                $question = if ($Mode -eq 'insert') { '将同一张本地图片插入所选 {0} 话的开头，并在输出中把原正文整体顺延，是否继续？' -f $rows.Count } else { '将同一张图片设为所选 {0} 行的章节封面，是否继续？' -f $rows.Count }
+                $answer = [System.Windows.Forms.MessageBox]::Show($form, $question, '批量设置章节封面', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
                 if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
             }
         }
@@ -2153,10 +2313,14 @@ function Show-OrganizerWindow {
     $metadataChapterCover = $chapterCoverMenu.Items.Add('跟随元数据')
     $firstPageCover = $chapterCoverMenu.Items.Add('首图')
     $customChapterCover = $chapterCoverMenu.Items.Add('自选任意本地图片…')
+    $insertLocalAsFirst = $chapterCoverMenu.Items.Add('本地图片插入为首图…（输出正文顺延）')
+    $chapterBodyCover = $chapterCoverMenu.Items.Add('该话其他图片…（直接引用，不复制）')
     $noChapterCover = $chapterCoverMenu.Items.Add('隐藏')
     $metadataChapterCover.add_Click({ & $applyChapterCoverChoice 'metadata' })
     $firstPageCover.add_Click({ & $applyChapterCoverChoice 'first' })
     $customChapterCover.add_Click({ & $applyChapterCoverChoice 'custom' })
+    $insertLocalAsFirst.add_Click({ & $applyChapterCoverChoice 'insert' })
+    $chapterBodyCover.add_Click({ & $applyChapterCoverChoice 'chapter' })
     $noChapterCover.add_Click({ & $applyChapterCoverChoice 'none' })
     $chapterCoverButton.add_Click({ $chapterCoverMenu.Show($chapterCoverButton, 0, $chapterCoverButton.Height) })
 
@@ -2269,17 +2433,25 @@ function Show-OrganizerWindow {
         $columnName = $grid.Columns[$eventArgs.ColumnIndex].Name
         if ($columnName -eq 'ChapterCover') {
             $choice = [string]$row.Cells['ChapterCover'].Value
-            $mode = switch ($choice) { '跟随元数据' { 'metadata' } '自选' { 'custom' } '隐藏' { 'none' } default { 'first' } }
-            if ($mode -eq 'custom' -and [string]::IsNullOrWhiteSpace([string]$row.Cells['ChapterCoverPath'].Value) -and -not $chapterCoverUiState.Picking) {
+            $mode = switch ($choice) { '跟随元数据' { 'metadata' } '自选' { 'custom' } '本地图片插入为首图' { 'insert' } '该话其他图片' { 'chapter' } '隐藏' { 'none' } default { 'first' } }
+            $storedMode = [string]$row.Cells['ChapterCoverMode'].Value
+            $needsPicker = $mode -in @('custom', 'chapter', 'insert') -and ($storedMode -ne $mode -or [string]::IsNullOrWhiteSpace([string]$row.Cells['ChapterCoverPath'].Value))
+            if ($needsPicker -and -not $chapterCoverUiState.Picking) {
                 $chapterCoverUiState.Picking = $true
                 try {
-                    $picker = New-Object System.Windows.Forms.OpenFileDialog
-                    $picker.Title = '选择这一话的目录封面'
-                    $picker.Filter = '图片文件|*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp;*.avif|所有文件|*.*'
-                    if ($picker.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
-                        & $setChapterCoverRows @($row) 'custom' $picker.FileName
+                    if ($mode -eq 'chapter') {
+                        $applied = & $applyChapterBodyCoverRows @($row)
+                        if (-not $applied) { & $setChapterCoverRows @($row) 'first' '' }
                     }
-                    else { & $setChapterCoverRows @($row) 'first' '' }
+                    else {
+                        $picker = New-Object System.Windows.Forms.OpenFileDialog
+                        $picker.Title = if ($mode -eq 'insert') { '选择要插入为本话 0001 的本地图片' } else { '选择这一话的目录封面' }
+                        $picker.Filter = '图片文件|*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp;*.avif|所有文件|*.*'
+                        if ($picker.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+                            & $setChapterCoverRows @($row) $mode $picker.FileName
+                        }
+                        else { & $setChapterCoverRows @($row) 'first' '' }
+                    }
                 }
                 finally { $chapterCoverUiState.Picking = $false }
             }
@@ -2337,7 +2509,7 @@ function Show-OrganizerWindow {
             $selectedCoverSource = [string]$grid.Rows[0].Cells['SourceFolder'].Value
         }
         return [pscustomobject][ordered]@{
-            schemaVersion = 7
+            schemaVersion = 8
             outputName = $outputName.Text.Trim()
             coverSource = $selectedCoverSource
             customCoverPath = $script:OrganizerCustomCoverPath
@@ -2406,7 +2578,7 @@ function Show-OrganizerWindow {
                     [string](Get-ObjectProperty -Object $chapter -Name 'start' -Default ''),
                     [string](Get-ObjectProperty -Object $chapter -Name 'end' -Default ''),
                     [string]$total,
-                    $(switch ([string](Get-ObjectProperty -Object $chapter -Name 'chapterCoverMode' -Default 'first')) { 'metadata' { '跟随元数据' } 'custom' { '自选' } 'none' { '隐藏' } default { '首图' } }),
+                    $(switch ([string](Get-ObjectProperty -Object $chapter -Name 'chapterCoverMode' -Default 'first')) { 'metadata' { '跟随元数据' } 'custom' { '自选' } 'insert' { '本地图片插入为首图' } 'chapter' { '该话其他图片' } 'none' { '隐藏' } default { '首图' } }),
                     [string](Get-ObjectProperty -Object $chapter -Name 'chapterCoverMode' -Default 'first'),
                     [string](Get-ObjectProperty -Object $chapter -Name 'chapterCoverPath' -Default ''),
                     [bool](Get-ObjectProperty -Object $chapter -Name 'mergeWithPrevious' -Default $false),
@@ -2482,6 +2654,7 @@ function Show-OrganizerWindow {
                     $chapterCoverDisplay = switch ($chapterCoverMode) {
                         'metadata' { '跟随元数据' }
                         'custom' { '自选' }
+                        'chapter' { '该话其他图片' }
                         'none' { '隐藏' }
                         default { '首图' }
                     }
@@ -2961,7 +3134,7 @@ function Show-OrganizerWindow {
 9. “合并所选为同一话”允许所选行不连续；整理器会把它们聚拢到第一条所选行的位置并按原相对顺序合并。并入行会保留原话序、章节名、章节封面和元数据指向并灰显，便于辨认来源，但这些字段逻辑上不会单独生效或占用章节编号。
 10. “按范围拆分选中行”会检查是否连续完整覆盖；1-3,3-10 这类边界重复可自动修正，其他缺口或重叠必须二次确认。
 11. “整本封面”可沿用勾选来源，也可选择任意本地图片；自选图片只会复制，不会改动原文件。
-12. “漫画目录显示每话封面”是整本总开关：未勾选时目录不显示任何章节缩略图；勾选后，每行的跟随元数据、首图、自选或隐藏设置才会生效。“元数据实际指向”列会显示跟随后最终是首图、隐藏还是资源目录中的自选图片。
+12. “漫画目录显示每话封面”是整本总开关：未勾选时目录不显示任何章节缩略图；勾选后，每行设置才会生效。“自选”会复制外部图片到漫画阅读器资源；“本地图片插入为首图”会在整理结果中把外部图片输出为 0001、原正文顺延并把元数据设为首图；“该话其他图片”直接引用本话正文，不会复制。“元数据实际指向”列会显示跟随后的最终结果。
 13. 图片被重复使用不再直接报错中止；整理前会汇总重叠范围并二次确认，疑似简单边界手误会单独标明。
 14. 原文件不会修改；结果输出到“整理完成”，正文统一重命名为 0001、0002……。
 15. “从选中行后续编号”只计算合并后的独立逻辑章节，并入同一话的来源行不会占号，也不会改写其灰显的原话序；连续勾选多个逻辑章节时以最后一个为锚点。
@@ -3122,6 +3295,8 @@ function Show-OrganizerWindow {
         $smokeLoadResult = & $addSourceRows @([string]$smokeCandidate.Name) $true
         if ($null -eq $smokeLoadResult -or $grid.Rows.Count -eq 0) { throw '整理器 UI 冒烟测试无法载入章节行。' }
         if ([string]::IsNullOrWhiteSpace([string]$grid.Rows[0].Cells['MetadataCoverInfo'].Value)) { throw '整理器没有显示“跟随元数据”的实际章节封面指向。' }
+        if (-not $chapterCoverColumn.Items.Contains('该话其他图片') -or -not $chapterCoverMenu.Items.Contains($chapterBodyCover)) { throw '整理器缺少“该话其他图片”章节封面选项。' }
+        if (-not $chapterCoverColumn.Items.Contains('本地图片插入为首图') -or -not $chapterCoverMenu.Items.Contains($insertLocalAsFirst)) { throw '整理器缺少“本地图片插入为首图”选项。' }
         if ($undoButton.Text -ne '撤销' -or $redoButton.Text -ne '恢复') { throw '整理器缺少撤销或恢复按钮。' }
         $smokeHistoryNumber = [string]$grid.Rows[0].Cells['Number'].Value
         & $pushUndoSnapshot
