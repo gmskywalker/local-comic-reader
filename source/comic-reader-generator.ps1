@@ -16,6 +16,10 @@ $script:LauncherFileName = '漫画阅读器.html'
 $script:ConfigFileName = '漫画阅读器配置.json'
 $script:EmbeddedConfigElementId = 'local-comic-generator-config'
 $script:ImageExtensions = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif')
+$script:ReaderResourceFolderName = '漫画阅读器资源'
+$script:ChapterCoverFolderName = '章节封面'
+$script:CollectionCoverFolderName = '合集封面'
+$script:CollectionPagePrefix = '漫画合集-'
 $script:DefaultSelected = @(
     '外送到府',
     '欢迎加入粉丝团!',
@@ -59,6 +63,37 @@ function ConvertTo-HtmlText {
 function ConvertTo-UrlSegment {
     param([string]$Value)
     return [System.Uri]::EscapeDataString($Value)
+}
+
+function ConvertTo-RelativeUrlPath {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return (([regex]::Split($Value, '[/\\]+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object {
+        ConvertTo-UrlSegment ([string]$_)
+    }) -join '/')
+}
+
+function Test-SafeRelativePath {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value) -or [IO.Path]::IsPathRooted($Value)) { return $false }
+    $parts = @([regex]::Split($Value, '[/\\]+') | Where-Object { $_ -ne '' })
+    if ($parts.Count -eq 0) { return $false }
+    foreach ($part in $parts) {
+        if ($part -in @('.', '..') -or $part -match '[<>:"|?*]') { return $false }
+    }
+    return $true
+}
+
+function Resolve-SafeChildPath {
+    param(
+        [string]$Root,
+        [string]$RelativePath
+    )
+    if (-not (Test-SafeRelativePath -Value $RelativePath)) { return '' }
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $candidate = [IO.Path]::GetFullPath((Join-Path $rootFull ($RelativePath -replace '/', [IO.Path]::DirectorySeparatorChar)))
+    if (-not $candidate.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { return '' }
+    return $candidate
 }
 
 function ConvertTo-SafeJson {
@@ -356,16 +391,198 @@ function Write-JsonFile {
     [System.IO.File]::WriteAllText($Path, $json, $script:Utf8NoBom)
 }
 
+function ConvertTo-CollectionDefinition {
+    param([AllowNull()][object]$Parsed)
+    if ($null -eq $Parsed) { return $null }
+    $title = if ($null -ne $Parsed.PSObject.Properties['title']) { [string]$Parsed.title } else { '' }
+    $id = if ($null -ne $Parsed.PSObject.Properties['id']) { [string]$Parsed.id } else { '' }
+    if ($id -notmatch '^[A-Za-z0-9_-]{4,64}$') {
+        $seed = if ([string]::IsNullOrWhiteSpace($title)) { [guid]::NewGuid().ToString('N') } else { $title }
+        $id = 'collection-' + (Get-StableKey -Value $seed).Substring(0, 12)
+    }
+    $description = if ($null -ne $Parsed.PSObject.Properties['description']) { [string]$Parsed.description } else { '' }
+    $members = @()
+    if ($null -ne $Parsed.PSObject.Properties['members']) {
+        $members = @($Parsed.members | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
+    }
+    $hideMembers = $true
+    if ($null -ne $Parsed.PSObject.Properties['hideMembersOnRoot']) { $hideMembers = [bool]$Parsed.hideMembersOnRoot }
+    $coverMode = if ($null -ne $Parsed.PSObject.Properties['coverMode']) { [string]$Parsed.coverMode } else { 'auto' }
+    if ($coverMode -notin @('auto', 'comic', 'custom')) { $coverMode = 'auto' }
+    $coverComic = if ($null -ne $Parsed.PSObject.Properties['coverComic']) { [string]$Parsed.coverComic } else { '' }
+    $coverFile = if ($null -ne $Parsed.PSObject.Properties['coverFile']) { [string]$Parsed.coverFile } else { '' }
+    return [pscustomobject][ordered]@{
+        Id = $id
+        Title = $title.Trim()
+        Description = $description.Trim()
+        Members = @($members)
+        HideMembersOnRoot = $hideMembers
+        CoverMode = $coverMode
+        CoverComic = $coverComic.Trim()
+        CoverFile = $coverFile.Trim()
+        CoverSourcePath = ''
+    }
+}
+
+function ConvertTo-PersistedCollection {
+    param([object]$Collection)
+    return [pscustomobject][ordered]@{
+        id = [string]$Collection.Id
+        title = [string]$Collection.Title
+        description = [string]$Collection.Description
+        members = @($Collection.Members)
+        hideMembersOnRoot = [bool]$Collection.HideMembersOnRoot
+        coverMode = [string]$Collection.CoverMode
+        coverComic = [string]$Collection.CoverComic
+        coverFile = [string]$Collection.CoverFile
+    }
+}
+
+function ConvertTo-ChapterCoverOverrideMap {
+    param([AllowNull()][object]$Value)
+    $result = @{}
+    if ($null -eq $Value) { return $result }
+    $convertMode = {
+        param([AllowNull()][object]$Item)
+        if ($null -eq $Item) { return 'metadata' }
+        if ($Item -is [bool]) { return $(if ([bool]$Item) { 'first' } else { 'none' }) }
+        if ($Item -isnot [string] -and $null -ne $Item.PSObject.Properties['mode']) {
+            $Item = $Item.mode
+        }
+        $mode = ([string]$Item).Trim().ToLowerInvariant()
+        if ($mode -in @('first', 'show', 'true')) { return 'first' }
+        if ($mode -in @('custom', 'selected')) { return 'custom' }
+        if ($mode -in @('none', 'hide', 'false')) { return 'none' }
+        return 'metadata'
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Value.Keys)) {
+            $name = ([string]$key).Trim()
+            $mode = & $convertMode $Value[$key]
+            if (-not [string]::IsNullOrWhiteSpace($name) -and $mode -ne 'metadata') { $result[$name] = $mode }
+        }
+        return $result
+    }
+    foreach ($property in @($Value.PSObject.Properties)) {
+        $name = ([string]$property.Name).Trim()
+        $mode = & $convertMode $property.Value
+        if (-not [string]::IsNullOrWhiteSpace($name) -and $mode -ne 'metadata') { $result[$name] = $mode }
+    }
+    return $result
+}
+
+function Copy-ChapterCoverOverrideMap {
+    param([AllowNull()][object]$Value)
+    return ConvertTo-ChapterCoverOverrideMap -Value $Value
+}
+
+function ConvertTo-ChapterCustomCoverMap {
+    param([AllowNull()][object]$Value)
+    $result = @{}
+    if ($null -eq $Value) { return $result }
+
+    $comicEntries = if ($Value -is [System.Collections.IDictionary]) {
+        @($Value.Keys | ForEach-Object { [pscustomobject]@{ Name = [string]$_; Value = $Value[$_] } })
+    }
+    else {
+        @($Value.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Value = $_.Value } })
+    }
+    foreach ($comicEntry in $comicEntries) {
+        $comicName = $comicEntry.Name.Trim()
+        if ([string]::IsNullOrWhiteSpace($comicName) -or $null -eq $comicEntry.Value) { continue }
+        $chapterMap = @{}
+        $chapterEntries = if ($comicEntry.Value -is [System.Collections.IDictionary]) {
+            @($comicEntry.Value.Keys | ForEach-Object { [pscustomobject]@{ Name = [string]$_; Value = $comicEntry.Value[$_] } })
+        }
+        else {
+            @($comicEntry.Value.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Value = $_.Value } })
+        }
+        foreach ($chapterEntry in $chapterEntries) {
+            $chapterName = $chapterEntry.Name.Trim()
+            $relativePath = if ($chapterEntry.Value -is [string]) {
+                ([string]$chapterEntry.Value).Trim()
+            }
+            elseif ($null -ne $chapterEntry.Value -and $null -ne $chapterEntry.Value.PSObject.Properties['file']) {
+                ([string]$chapterEntry.Value.file).Trim()
+            }
+            else { '' }
+            if (-not [string]::IsNullOrWhiteSpace($chapterName) -and (Test-SafeRelativePath -Value $relativePath)) {
+                $chapterMap[$chapterName] = $relativePath
+            }
+        }
+        if ($chapterMap.Count -gt 0) { $result[$comicName] = $chapterMap }
+    }
+    return $result
+}
+
+function Copy-ChapterCustomCoverMap {
+    param([AllowNull()][object]$Value)
+    return ConvertTo-ChapterCustomCoverMap -Value $Value
+}
+
+function Test-CollectionDefinitions {
+    param(
+        [object[]]$Collections,
+        [string[]]$AvailableNames
+    )
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $usedIds = @{}
+    $usedTitles = @{}
+    $usedPageFiles = @{}
+    foreach ($collection in @($Collections)) {
+        $title = ([string]$collection.Title).Trim()
+        $id = [string]$collection.Id
+        if ([string]::IsNullOrWhiteSpace($title)) { $errors.Add('存在没有名称的合集。'); continue }
+        if ($usedTitles.ContainsKey($title.ToLowerInvariant())) { $errors.Add(('合集名称重复：' + $title)) } else { $usedTitles[$title.ToLowerInvariant()] = $true }
+        if ($id -notmatch '^[A-Za-z0-9_-]{4,64}$' -or $usedIds.ContainsKey($id)) { $errors.Add(('合集编号无效或重复：' + $title)) } else { $usedIds[$id] = $true }
+        $pageFile = Get-CollectionPageFileName -Collection $collection
+        $pageFileKey = $pageFile.ToLowerInvariant()
+        if ($usedPageFiles.ContainsKey($pageFileKey)) {
+            $errors.Add(('合集名称转换为 Windows 文件名后发生重复：{0}、{1}' -f $usedPageFiles[$pageFileKey], $title))
+        }
+        else { $usedPageFiles[$pageFileKey] = $title }
+        $members = @($collection.Members | Where-Object { $AvailableNames -contains $_ } | Select-Object -Unique)
+        if ($members.Count -eq 0) { $errors.Add(('合集没有有效成员：' + $title)) }
+        if ([string]$collection.CoverMode -eq 'comic' -and $members -notcontains [string]$collection.CoverComic) {
+            $errors.Add(('合集指定的封面漫画不在成员中：' + $title))
+        }
+        if ([string]$collection.CoverMode -eq 'custom') {
+            $hasExisting = Test-SafeRelativePath -Value ([string]$collection.CoverFile)
+            $hasPending = -not [string]::IsNullOrWhiteSpace([string]$collection.CoverSourcePath) -and (Test-Path -LiteralPath ([string]$collection.CoverSourcePath) -PathType Leaf)
+            if (-not $hasExisting -and -not $hasPending) { $errors.Add(('合集尚未选择有效的自定义封面：' + $title)) }
+        }
+    }
+    return @($errors)
+}
+
 function ConvertTo-ConfigurationObject {
     param([object]$Parsed)
     $openAfterGenerate = $true
     if ($null -ne $Parsed.PSObject.Properties['openAfterGenerate']) {
         $openAfterGenerate = [bool]$Parsed.openAfterGenerate
     }
+    $collections = @()
+    if ($null -ne $Parsed.PSObject.Properties['collections']) {
+        foreach ($item in @($Parsed.collections)) {
+            $collection = ConvertTo-CollectionDefinition -Parsed $item
+            if ($null -ne $collection) { $collections += $collection }
+        }
+    }
+    $chapterCoverOverrides = @{}
+    if ($null -ne $Parsed.PSObject.Properties['chapterCoverOverrides']) {
+        $chapterCoverOverrides = ConvertTo-ChapterCoverOverrideMap -Value $Parsed.chapterCoverOverrides
+    }
+    $chapterCustomCovers = @{}
+    if ($null -ne $Parsed.PSObject.Properties['chapterCustomCovers']) {
+        $chapterCustomCovers = ConvertTo-ChapterCustomCoverMap -Value $Parsed.chapterCustomCovers
+    }
     return [pscustomobject]@{
-        schemaVersion = 3
+        schemaVersion = 7
         selected = @($Parsed.selected | ForEach-Object { [string]$_ })
         openAfterGenerate = $openAfterGenerate
+        collections = @($collections)
+        chapterCoverOverrides = $chapterCoverOverrides
+        chapterCustomCovers = $chapterCustomCovers
     }
 }
 
@@ -405,9 +622,12 @@ function Get-Configuration {
         }
     }
     return [pscustomobject]@{
-        schemaVersion = 3
+        schemaVersion = 7
         selected = $selected
         openAfterGenerate = $true
+        collections = @()
+        chapterCoverOverrides = @{}
+        chapterCustomCovers = @{}
     }
 }
 
@@ -436,6 +656,42 @@ function Get-FolderCandidate {
     elseif ($matching.Count -eq 0 -and $rootImages.Count -eq 0) {
         $reasons.Add('没有包含漫画图片的章节文件夹或根目录正文图片')
     }
+    $metadataCoverCounts = @{ first = 0; custom = 0; none = 0 }
+    $metadataCustomDetails = New-Object 'System.Collections.Generic.List[string]'
+    if ($matching.Count -gt 0) {
+        foreach ($chapterDirectory in $matching) {
+            $coverInfo = $null
+            if ($metadata.ChapterCoverMap.ContainsKey($chapterDirectory.Name)) {
+                $coverInfo = $metadata.ChapterCoverMap[$chapterDirectory.Name]
+            }
+            else {
+                $normalizedChapterName = Get-WindowsChapterNameMatchKey -Value $chapterDirectory.Name
+                if ($metadata.ChapterCoverNormalizedMap.ContainsKey($normalizedChapterName)) {
+                    $coverInfo = $metadata.ChapterCoverNormalizedMap[$normalizedChapterName]
+                }
+            }
+            $metadataMode = if ($null -eq $coverInfo) { 'first' } else { [string]$coverInfo.Mode }
+            if ($metadataMode -notin @('first', 'custom', 'none')) { $metadataMode = 'first' }
+            $metadataCoverCounts[$metadataMode]++
+            if ($metadataMode -eq 'custom') {
+                $metadataCustomDetails.Add(('{0} → {1}' -f $chapterDirectory.Name, [string]$coverInfo.File))
+            }
+        }
+    }
+    else {
+        $rootChapterCount = if ($usesRootImages -and $null -ne $rootLayout -and $rootLayout.Recognized) { $rootLayout.Groups.Count } elseif ($usesRootImages) { 1 } else { 0 }
+        $metadataCoverCounts['first'] = $rootChapterCount
+    }
+    $metadataCoverSummary = if (-not [bool]$metadata.ShowChapterCovers) {
+        '跟随元数据＝隐藏（整本总开关关闭）'
+    }
+    else {
+        '跟随元数据＝首图 {0} 话 / 自选 {1} 话 / 隐藏 {2} 话' -f $metadataCoverCounts['first'], $metadataCoverCounts['custom'], $metadataCoverCounts['none']
+    }
+    $metadataCoverDetails = $metadataCoverSummary
+    if ($metadataCustomDetails.Count -gt 0) {
+        $metadataCoverDetails += "`r`n自选封面路径：`r`n" + ($metadataCustomDetails -join "`r`n")
+    }
     return [pscustomobject]@{
         Name = $Directory.Name
         FullName = $Directory.FullName
@@ -444,14 +700,38 @@ function Get-FolderCandidate {
         UsesRootImages = $usesRootImages
         UsesCompositeGroups = ($usesRootImages -and $null -ne $rootLayout -and $rootLayout.Recognized)
         HasCover = ($null -ne $cover)
+        MetadataShowsChapterCovers = [bool]$metadata.ShowChapterCovers
+        MetadataCustomCoverCount = @($metadata.ChapterCoverMap.Values | Where-Object { [string]$_.Mode -eq 'custom' }).Count
+        MetadataCoverSummary = $metadataCoverSummary
+        MetadataCoverDetails = $metadataCoverDetails
+        SourceFingerprint = Get-ComicSourceFingerprint -ComicPath $Directory.FullName
         Reason = ($reasons -join '；')
     }
+}
+
+function Get-ComicSourceFingerprint {
+    param([string]$ComicPath)
+    if (-not (Test-Path -LiteralPath $ComicPath -PathType Container)) { return '' }
+    $root = [IO.Path]::GetFullPath($ComicPath).TrimEnd('\')
+    $entries = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($directory in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction SilentlyContinue)) {
+        $relative = $directory.FullName.Substring($root.Length).TrimStart('\')
+        if (-not [string]::IsNullOrWhiteSpace($relative)) { $entries.Add('D|' + $relative) }
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue)) {
+        $extension = $file.Extension.ToLowerInvariant()
+        if ($script:ImageExtensions -notcontains $extension -and $extension -ne '.json') { continue }
+        $relative = $file.FullName.Substring($root.Length).TrimStart('\')
+        $entries.Add(('F|{0}|{1}|{2}' -f $relative, $file.Length, $file.LastWriteTimeUtc.Ticks))
+    }
+    return Get-StableKey -Value (@($entries | Sort-Object) -join "`n")
 }
 
 function Get-AllCandidates {
     param([string]$LibraryRoot)
     $items = @()
     foreach ($dir in @(Get-ChildItem -LiteralPath $LibraryRoot -Directory | Sort-Object Name)) {
+        if ($dir.Name -ieq $script:ReaderResourceFolderName) { continue }
         if ($dir.Name -ieq 'new' -and (
             (Test-Path -LiteralPath (Join-Path $dir.FullName 'comic-organizer.ps1') -PathType Leaf) -or
             (Test-Path -LiteralPath (Join-Path $dir.FullName '漫画整理器.bat') -PathType Leaf) -or
@@ -519,11 +799,579 @@ function Get-MetadataFieldText {
     return ''
 }
 
+function Copy-CollectionDefinition {
+    param([object]$Collection)
+    if ($null -eq $Collection) { return $null }
+    $copy = ConvertTo-CollectionDefinition -Parsed (ConvertTo-PersistedCollection -Collection $Collection)
+    if ($null -ne $Collection.PSObject.Properties['CoverSourcePath']) {
+        $copy.CoverSourcePath = [string]$Collection.CoverSourcePath
+    }
+    return $copy
+}
+
+function Show-CollectionEditor {
+    param(
+        [AllowNull()][object]$Collection,
+        [string[]]$AvailableNames,
+        [System.Windows.Forms.IWin32Window]$Owner
+    )
+    $working = if ($null -eq $Collection) {
+        [pscustomobject][ordered]@{
+            Id = 'collection-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+            Title = ''
+            Description = ''
+            Members = @()
+            HideMembersOnRoot = $true
+            CoverMode = 'auto'
+            CoverComic = ''
+            CoverFile = ''
+            CoverSourcePath = ''
+        }
+    }
+    else { Copy-CollectionDefinition -Collection $Collection }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = if ($null -eq $Collection) { '新建漫画合集' } else { '编辑漫画合集' }
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.Size = New-Object System.Drawing.Size(760, 690)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(680, 610)
+    $dialog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = '合集名称：'
+    $titleLabel.AutoSize = $true
+    $titleLabel.Location = New-Object System.Drawing.Point(20, 22)
+    $dialog.Controls.Add($titleLabel)
+
+    $titleBox = New-Object System.Windows.Forms.TextBox
+    $titleBox.Location = New-Object System.Drawing.Point(112, 18)
+    $titleBox.Size = New-Object System.Drawing.Size(610, 30)
+    $titleBox.Anchor = 'Top,Left,Right'
+    $titleBox.Text = [string]$working.Title
+    $dialog.Controls.Add($titleBox)
+
+    $descriptionLabel = New-Object System.Windows.Forms.Label
+    $descriptionLabel.Text = '合集简介：'
+    $descriptionLabel.AutoSize = $true
+    $descriptionLabel.Location = New-Object System.Drawing.Point(20, 64)
+    $dialog.Controls.Add($descriptionLabel)
+
+    $descriptionBox = New-Object System.Windows.Forms.TextBox
+    $descriptionBox.Location = New-Object System.Drawing.Point(112, 60)
+    $descriptionBox.Size = New-Object System.Drawing.Size(610, 70)
+    $descriptionBox.Anchor = 'Top,Left,Right'
+    $descriptionBox.Multiline = $true
+    $descriptionBox.ScrollBars = 'Vertical'
+    $descriptionBox.Text = [string]$working.Description
+    $dialog.Controls.Add($descriptionBox)
+
+    $membersLabel = New-Object System.Windows.Forms.Label
+    $membersLabel.Text = '成员漫画（勾选并可调整显示顺序）：'
+    $membersLabel.AutoSize = $true
+    $membersLabel.Location = New-Object System.Drawing.Point(20, 145)
+    $dialog.Controls.Add($membersLabel)
+
+    $memberList = New-Object System.Windows.Forms.CheckedListBox
+    $memberList.CheckOnClick = $true
+    $memberList.Location = New-Object System.Drawing.Point(20, 174)
+    $memberList.Size = New-Object System.Drawing.Size(620, 250)
+    $memberList.Anchor = 'Top,Bottom,Left,Right'
+    $orderedNames = @($working.Members | Where-Object { $AvailableNames -contains $_ })
+    $orderedNames += @($AvailableNames | Where-Object { $orderedNames -notcontains $_ } | Sort-Object)
+    foreach ($name in @($orderedNames | Select-Object -Unique)) {
+        $index = $memberList.Items.Add($name)
+        $memberList.SetItemChecked($index, ($working.Members -contains $name))
+    }
+    $dialog.Controls.Add($memberList)
+
+    $moveUp = New-Object System.Windows.Forms.Button
+    $moveUp.Text = '上移'
+    $moveUp.Location = New-Object System.Drawing.Point(650, 174)
+    $moveUp.Size = New-Object System.Drawing.Size(72, 34)
+    $moveUp.Anchor = 'Top,Right'
+    $moveUp.add_Click({
+        $index = $memberList.SelectedIndex
+        if ($index -le 0) { return }
+        $text = [string]$memberList.Items[$index]
+        $checked = $memberList.GetItemChecked($index)
+        $memberList.Items.RemoveAt($index)
+        $memberList.Items.Insert($index - 1, $text)
+        $memberList.SetItemChecked($index - 1, $checked)
+        $memberList.SelectedIndex = $index - 1
+    })
+    $dialog.Controls.Add($moveUp)
+
+    $moveDown = New-Object System.Windows.Forms.Button
+    $moveDown.Text = '下移'
+    $moveDown.Location = New-Object System.Drawing.Point(650, 216)
+    $moveDown.Size = New-Object System.Drawing.Size(72, 34)
+    $moveDown.Anchor = 'Top,Right'
+    $moveDown.add_Click({
+        $index = $memberList.SelectedIndex
+        if ($index -lt 0 -or $index -ge $memberList.Items.Count - 1) { return }
+        $text = [string]$memberList.Items[$index]
+        $checked = $memberList.GetItemChecked($index)
+        $memberList.Items.RemoveAt($index)
+        $memberList.Items.Insert($index + 1, $text)
+        $memberList.SetItemChecked($index + 1, $checked)
+        $memberList.SelectedIndex = $index + 1
+    })
+    $dialog.Controls.Add($moveDown)
+
+    $hideMembers = New-Object System.Windows.Forms.CheckBox
+    $hideMembers.Text = '成员漫画只在合集页显示，不在总书架重复显示'
+    $hideMembers.AutoSize = $true
+    $hideMembers.Checked = [bool]$working.HideMembersOnRoot
+    $hideMembers.Location = New-Object System.Drawing.Point(20, 438)
+    $hideMembers.Anchor = 'Bottom,Left'
+    $dialog.Controls.Add($hideMembers)
+
+    $coverLabel = New-Object System.Windows.Forms.Label
+    $coverLabel.Text = '合集封面：'
+    $coverLabel.AutoSize = $true
+    $coverLabel.Location = New-Object System.Drawing.Point(20, 478)
+    $coverLabel.Anchor = 'Bottom,Left'
+    $dialog.Controls.Add($coverLabel)
+
+    $coverMode = New-Object System.Windows.Forms.ComboBox
+    $coverMode.DropDownStyle = 'DropDownList'
+    $coverMode.Items.AddRange(@('自动采用首位成员封面', '指定成员漫画封面', '自选本地图片'))
+    $coverMode.Location = New-Object System.Drawing.Point(112, 474)
+    $coverMode.Size = New-Object System.Drawing.Size(235, 30)
+    $coverMode.Anchor = 'Bottom,Left'
+    $coverMode.SelectedIndex = switch ([string]$working.CoverMode) { 'comic' { 1 } 'custom' { 2 } default { 0 } }
+    $dialog.Controls.Add($coverMode)
+
+    $coverComic = New-Object System.Windows.Forms.ComboBox
+    $coverComic.DropDownStyle = 'DropDownList'
+    $coverComic.Location = New-Object System.Drawing.Point(357, 474)
+    $coverComic.Size = New-Object System.Drawing.Size(365, 30)
+    $coverComic.Anchor = 'Bottom,Left,Right'
+    foreach ($name in $AvailableNames) { [void]$coverComic.Items.Add($name) }
+    if (-not [string]::IsNullOrWhiteSpace([string]$working.CoverComic)) { $coverComic.SelectedItem = [string]$working.CoverComic }
+    if ($coverComic.SelectedIndex -lt 0 -and $coverComic.Items.Count -gt 0) { $coverComic.SelectedIndex = 0 }
+    $dialog.Controls.Add($coverComic)
+
+    $customCoverBox = New-Object System.Windows.Forms.TextBox
+    $customCoverBox.Location = New-Object System.Drawing.Point(112, 514)
+    $customCoverBox.Size = New-Object System.Drawing.Size(500, 30)
+    $customCoverBox.Anchor = 'Bottom,Left,Right'
+    $customCoverBox.ReadOnly = $true
+    $customCoverBox.Text = if (-not [string]::IsNullOrWhiteSpace([string]$working.CoverSourcePath)) { [string]$working.CoverSourcePath } elseif (-not [string]::IsNullOrWhiteSpace([string]$working.CoverFile)) { '已保存：' + [string]$working.CoverFile } else { '' }
+    $dialog.Controls.Add($customCoverBox)
+
+    $browseCover = New-Object System.Windows.Forms.Button
+    $browseCover.Text = '浏览…'
+    $browseCover.Location = New-Object System.Drawing.Point(620, 512)
+    $browseCover.Size = New-Object System.Drawing.Size(102, 34)
+    $browseCover.Anchor = 'Bottom,Right'
+    $browseCover.add_Click({
+        $picker = New-Object System.Windows.Forms.OpenFileDialog
+        $picker.Title = '选择合集封面图片'
+        $picker.Filter = '图片文件|*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp;*.avif|所有文件|*.*'
+        if ($picker.ShowDialog($dialog) -eq [System.Windows.Forms.DialogResult]::OK) {
+            $working.CoverSourcePath = $picker.FileName
+            $customCoverBox.Text = $picker.FileName
+            $coverMode.SelectedIndex = 2
+        }
+    })
+    $dialog.Controls.Add($browseCover)
+
+    $syncCoverControls = {
+        $coverComic.Enabled = ($coverMode.SelectedIndex -eq 1)
+        $customCoverBox.Enabled = ($coverMode.SelectedIndex -eq 2)
+        $browseCover.Enabled = ($coverMode.SelectedIndex -eq 2)
+    }
+    $coverMode.add_SelectedIndexChanged({ & $syncCoverControls })
+    & $syncCoverControls
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '确定'
+    $ok.Location = New-Object System.Drawing.Point(542, 586)
+    $ok.Size = New-Object System.Drawing.Size(86, 38)
+    $ok.Anchor = 'Bottom,Right'
+    $ok.add_Click({
+        $members = @()
+        for ($index = 0; $index -lt $memberList.Items.Count; $index++) {
+            if ($memberList.GetItemChecked($index)) { $members += [string]$memberList.Items[$index] }
+        }
+        if ([string]::IsNullOrWhiteSpace($titleBox.Text)) {
+            [System.Windows.Forms.MessageBox]::Show('请填写合集名称。', '合集设置', 'OK', 'Information') | Out-Null
+            return
+        }
+        if ($members.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('请至少勾选一部成员漫画。', '合集设置', 'OK', 'Information') | Out-Null
+            return
+        }
+        $selectedMode = @('auto', 'comic', 'custom')[$coverMode.SelectedIndex]
+        if ($selectedMode -eq 'comic' -and $members -notcontains [string]$coverComic.SelectedItem) {
+            [System.Windows.Forms.MessageBox]::Show('指定为封面的漫画必须同时是合集成员。', '合集设置', 'OK', 'Information') | Out-Null
+            return
+        }
+        if ($selectedMode -eq 'custom' -and [string]::IsNullOrWhiteSpace([string]$working.CoverSourcePath) -and [string]::IsNullOrWhiteSpace([string]$working.CoverFile)) {
+            [System.Windows.Forms.MessageBox]::Show('请选择一张本地图片作为合集封面。', '合集设置', 'OK', 'Information') | Out-Null
+            return
+        }
+        $working.Title = $titleBox.Text.Trim()
+        $working.Description = $descriptionBox.Text.Trim()
+        $working.Members = @($members)
+        $working.HideMembersOnRoot = [bool]$hideMembers.Checked
+        $working.CoverMode = $selectedMode
+        $working.CoverComic = if ($selectedMode -eq 'comic') { [string]$coverComic.SelectedItem } else { '' }
+        $dialog.Tag = $working
+        $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dialog.Close()
+    })
+    $dialog.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = '取消'
+    $cancel.Location = New-Object System.Drawing.Point(636, 586)
+    $cancel.Size = New-Object System.Drawing.Size(86, 38)
+    $cancel.Anchor = 'Bottom,Right'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancel)
+    $dialog.AcceptButton = $ok
+    $dialog.CancelButton = $cancel
+
+    if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return $dialog.Tag
+}
+
+function Show-CollectionManager {
+    param(
+        [object[]]$Collections,
+        [string[]]$AvailableNames,
+        [System.Windows.Forms.IWin32Window]$Owner
+    )
+    $workingCollections = New-Object System.Collections.ArrayList
+    foreach ($collection in @($Collections)) { [void]$workingCollections.Add((Copy-CollectionDefinition -Collection $collection)) }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = '管理漫画合集'
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.Size = New-Object System.Drawing.Size(860, 560)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(720, 480)
+    $dialog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '合集是虚拟目录，不会移动漫画文件夹；同一部漫画可以加入多个合集。'
+    $hint.AutoSize = $true
+    $hint.ForeColor = [System.Drawing.Color]::DimGray
+    $hint.Location = New-Object System.Drawing.Point(18, 16)
+    $dialog.Controls.Add($hint)
+
+    $list = New-Object System.Windows.Forms.ListView
+    $list.Location = New-Object System.Drawing.Point(20, 50)
+    $list.Size = New-Object System.Drawing.Size(800, 350)
+    $list.Anchor = 'Top,Bottom,Left,Right'
+    $list.View = 'Details'
+    $list.FullRowSelect = $true
+    $list.GridLines = $true
+    [void]$list.Columns.Add('合集名称', 330)
+    [void]$list.Columns.Add('成员', 90)
+    [void]$list.Columns.Add('总书架显示方式', 330)
+    $dialog.Controls.Add($list)
+
+    $refresh = {
+        $list.Items.Clear()
+        foreach ($collection in $workingCollections) {
+            $item = New-Object System.Windows.Forms.ListViewItem([string]$collection.Title)
+            [void]$item.SubItems.Add(('{0} 部' -f @($collection.Members).Count))
+            $displayModeText = if ($collection.HideMembersOnRoot) { '显示合集卡片，隐藏成员卡片' } else { '合集卡片与成员卡片同时显示' }
+            [void]$item.SubItems.Add($displayModeText)
+            $item.Tag = $collection
+            [void]$list.Items.Add($item)
+        }
+    }
+    & $refresh
+
+    $add = New-Object System.Windows.Forms.Button
+    $add.Text = '新建合集'
+    $add.Location = New-Object System.Drawing.Point(20, 416)
+    $add.Size = New-Object System.Drawing.Size(105, 36)
+    $add.Anchor = 'Bottom,Left'
+    $add.add_Click({
+        $created = Show-CollectionEditor -Collection $null -AvailableNames $AvailableNames -Owner $dialog
+        if ($null -ne $created) { [void]$workingCollections.Add($created); & $refresh; $list.Items[$list.Items.Count - 1].Selected = $true }
+    })
+    $dialog.Controls.Add($add)
+
+    $edit = New-Object System.Windows.Forms.Button
+    $edit.Text = '编辑'
+    $edit.Location = New-Object System.Drawing.Point(133, 416)
+    $edit.Size = New-Object System.Drawing.Size(82, 36)
+    $edit.Anchor = 'Bottom,Left'
+    $edit.add_Click({
+        if ($list.SelectedIndices.Count -eq 0) { return }
+        $index = $list.SelectedIndices[0]
+        $updated = Show-CollectionEditor -Collection $workingCollections[$index] -AvailableNames $AvailableNames -Owner $dialog
+        if ($null -ne $updated) { $workingCollections[$index] = $updated; & $refresh; $list.Items[$index].Selected = $true }
+    })
+    $dialog.Controls.Add($edit)
+    $list.add_DoubleClick({ $edit.PerformClick() })
+
+    $delete = New-Object System.Windows.Forms.Button
+    $delete.Text = '删除'
+    $delete.Location = New-Object System.Drawing.Point(223, 416)
+    $delete.Size = New-Object System.Drawing.Size(82, 36)
+    $delete.Anchor = 'Bottom,Left'
+    $delete.add_Click({ if ($list.SelectedIndices.Count -gt 0) { $workingCollections.RemoveAt($list.SelectedIndices[0]); & $refresh } })
+    $dialog.Controls.Add($delete)
+
+    $up = New-Object System.Windows.Forms.Button
+    $up.Text = '上移'
+    $up.Location = New-Object System.Drawing.Point(313, 416)
+    $up.Size = New-Object System.Drawing.Size(82, 36)
+    $up.Anchor = 'Bottom,Left'
+    $up.add_Click({
+        if ($list.SelectedIndices.Count -eq 0) { return }
+        $index = $list.SelectedIndices[0]
+        if ($index -le 0) { return }
+        $item = $workingCollections[$index]
+        $workingCollections.RemoveAt($index)
+        $workingCollections.Insert($index - 1, $item)
+        & $refresh
+        $list.Items[$index - 1].Selected = $true
+    })
+    $dialog.Controls.Add($up)
+
+    $down = New-Object System.Windows.Forms.Button
+    $down.Text = '下移'
+    $down.Location = New-Object System.Drawing.Point(403, 416)
+    $down.Size = New-Object System.Drawing.Size(82, 36)
+    $down.Anchor = 'Bottom,Left'
+    $down.add_Click({
+        if ($list.SelectedIndices.Count -eq 0) { return }
+        $index = $list.SelectedIndices[0]
+        if ($index -lt 0 -or $index -ge $workingCollections.Count - 1) { return }
+        $item = $workingCollections[$index]
+        $workingCollections.RemoveAt($index)
+        $workingCollections.Insert($index + 1, $item)
+        & $refresh
+        $list.Items[$index + 1].Selected = $true
+    })
+    $dialog.Controls.Add($down)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '保存合集设置'
+    $ok.Location = New-Object System.Drawing.Point(660, 416)
+    $ok.Size = New-Object System.Drawing.Size(160, 38)
+    $ok.Anchor = 'Bottom,Right'
+    $ok.add_Click({
+        $errors = @(Test-CollectionDefinitions -Collections @($workingCollections) -AvailableNames $AvailableNames)
+        if ($errors.Count -gt 0) {
+            [System.Windows.Forms.MessageBox]::Show(($errors -join "`r`n"), '合集设置有误', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $dialog.Tag = [pscustomobject]@{ Collections = @($workingCollections | ForEach-Object { Copy-CollectionDefinition -Collection $_ }) }
+        $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dialog.Close()
+    })
+    $dialog.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = '取消'
+    $cancel.Location = New-Object System.Drawing.Point(566, 416)
+    $cancel.Size = New-Object System.Drawing.Size(86, 38)
+    $cancel.Anchor = 'Bottom,Right'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancel)
+    $dialog.AcceptButton = $ok
+    $dialog.CancelButton = $cancel
+
+    if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return $dialog.Tag
+}
+
+function Show-UpdaterCustomCoverEditor {
+    param(
+        [string]$LibraryRoot,
+        [string]$ComicName,
+        [AllowNull()][object]$ExistingMap,
+        [System.Windows.Forms.IWin32Window]$Owner,
+        [switch]$SmokeTest
+    )
+    $comicPath = Join-Path $LibraryRoot $ComicName
+    if (-not (Test-Path -LiteralPath $comicPath -PathType Container)) { return $null }
+    $comicDirectory = Get-Item -LiteralPath $comicPath
+    $audit = Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCoverOverrideMode 'none'
+    if (@($audit.Chapters).Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show($Owner, '这部漫画没有可供设置封面的章节。', '逐话自选封面', 'OK', 'Warning') | Out-Null
+        return $null
+    }
+    $existing = @{}
+    if ($null -ne $ExistingMap) {
+        $converted = ConvertTo-ChapterCustomCoverMap -Value @{ $ComicName = $ExistingMap }
+        if ($converted.ContainsKey($ComicName)) { $existing = $converted[$ComicName] }
+    }
+    if ($SmokeTest) { return $existing }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = '逐话自选本地封面 · ' + $ComicName
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.Size = New-Object System.Drawing.Size(900, 640)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(720, 520)
+    $dialog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '可选择一行或多行，再指定任意本地图片。图片会复制到漫画自身的“漫画阅读器资源\章节封面”，原图不改动。未指定的话会先采用元数据自选封面，否则回退首图。'
+    $hint.AutoSize = $false
+    $hint.Location = New-Object System.Drawing.Point(16, 14)
+    $hint.Size = New-Object System.Drawing.Size(850, 48)
+    $hint.Anchor = 'Top,Left,Right'
+    $dialog.Controls.Add($hint)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Location = New-Object System.Drawing.Point(16, 66)
+    $grid.Size = New-Object System.Drawing.Size(850, 430)
+    $grid.Anchor = 'Top,Bottom,Left,Right'
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.RowHeadersVisible = $false
+    $grid.ReadOnly = $true
+    $grid.MultiSelect = $true
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    [void]$grid.Columns.Add('Chapter', '章节')
+    [void]$grid.Columns.Add('Cover', '更新器自选图片')
+    $grid.Columns['Chapter'].Width = 330
+    $grid.Columns['Cover'].AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    foreach ($chapter in @($audit.Chapters)) {
+        $relativePath = if ($existing.ContainsKey([string]$chapter.Name)) { [string]$existing[[string]$chapter.Name] } else { '' }
+        $display = if ([string]::IsNullOrWhiteSpace($relativePath)) { '未单独指定（采用元数据自选或首图）' } else { $relativePath }
+        $rowIndex = $grid.Rows.Add([string]$chapter.Name, $display)
+        $grid.Rows[$rowIndex].Tag = [pscustomobject]@{
+            ChapterName = [string]$chapter.Name
+            ExistingRelativePath = $relativePath
+            PendingSourcePath = ''
+        }
+    }
+    $dialog.Controls.Add($grid)
+
+    $choose = New-Object System.Windows.Forms.Button
+    $choose.Text = '为选中话选择本地图片…'
+    $choose.Location = New-Object System.Drawing.Point(16, 510)
+    $choose.Size = New-Object System.Drawing.Size(210, 36)
+    $choose.Anchor = 'Bottom,Left'
+    $choose.add_Click({
+        $rows = @($grid.SelectedRows | Sort-Object Index)
+        if ($rows.Count -eq 0 -and $null -ne $grid.CurrentRow) { $rows = @($grid.CurrentRow) }
+        if ($rows.Count -eq 0) { return }
+        $picker = New-Object System.Windows.Forms.OpenFileDialog
+        $picker.Title = if ($rows.Count -gt 1) { '选择统一用于所选章节的本地图片' } else { '选择这一话的本地图片' }
+        $picker.InitialDirectory = $LibraryRoot
+        $picker.Filter = '图片文件|*.jpg;*.jpeg;*.png;*.webp;*.gif;*.bmp;*.avif|所有文件|*.*'
+        if ($picker.ShowDialog($dialog) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $pickedFile = Get-Item -LiteralPath $picker.FileName
+        if ($script:ImageExtensions -notcontains $pickedFile.Extension.ToLowerInvariant() -or $pickedFile.Length -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show($dialog, '请选择非空的受支持图片文件。', '图片无效', 'OK', 'Error') | Out-Null
+            return
+        }
+        if ($rows.Count -gt 1) {
+            $answer = [System.Windows.Forms.MessageBox]::Show($dialog, ('将同一张图片设为所选 {0} 话的封面，是否继续？' -f $rows.Count), '批量自选封面', 'YesNo', 'Question')
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        }
+        foreach ($row in $rows) {
+            $row.Tag.PendingSourcePath = $pickedFile.FullName
+            $row.Tag.ExistingRelativePath = ''
+            $row.Cells['Cover'].Value = '待复制：' + $pickedFile.Name
+        }
+    })
+    $dialog.Controls.Add($choose)
+
+    $clear = New-Object System.Windows.Forms.Button
+    $clear.Text = '清除选中话自选'
+    $clear.Location = New-Object System.Drawing.Point(236, 510)
+    $clear.Size = New-Object System.Drawing.Size(150, 36)
+    $clear.Anchor = 'Bottom,Left'
+    $clear.add_Click({
+        $rows = @($grid.SelectedRows | Sort-Object Index)
+        if ($rows.Count -eq 0 -and $null -ne $grid.CurrentRow) { $rows = @($grid.CurrentRow) }
+        foreach ($row in $rows) {
+            $row.Tag.PendingSourcePath = ''
+            $row.Tag.ExistingRelativePath = ''
+            $row.Cells['Cover'].Value = '未单独指定（采用元数据自选或首图）'
+        }
+    })
+    $dialog.Controls.Add($clear)
+
+    $clearAll = New-Object System.Windows.Forms.Button
+    $clearAll.Text = '清除全部自选'
+    $clearAll.Location = New-Object System.Drawing.Point(396, 510)
+    $clearAll.Size = New-Object System.Drawing.Size(140, 36)
+    $clearAll.Anchor = 'Bottom,Left'
+    $clearAll.add_Click({
+        $answer = [System.Windows.Forms.MessageBox]::Show($dialog, '确定清除这部漫画在更新器中保存的全部逐话自选封面吗？', '清除全部自选', 'YesNo', 'Question')
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        foreach ($row in $grid.Rows) {
+            $row.Tag.PendingSourcePath = ''
+            $row.Tag.ExistingRelativePath = ''
+            $row.Cells['Cover'].Value = '未单独指定（采用元数据自选或首图）'
+        }
+    })
+    $dialog.Controls.Add($clearAll)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '确定'
+    $ok.Location = New-Object System.Drawing.Point(690, 552)
+    $ok.Size = New-Object System.Drawing.Size(84, 34)
+    $ok.Anchor = 'Bottom,Right'
+    $ok.add_Click({
+        try {
+            $resultMap = @{}
+            $resourceRelative = $script:ReaderResourceFolderName + '\' + $script:ChapterCoverFolderName
+            $resourcePath = Join-Path $comicPath $resourceRelative
+            foreach ($row in $grid.Rows) {
+                $chapterName = [string]$row.Tag.ChapterName
+                $pendingSource = [string]$row.Tag.PendingSourcePath
+                $existingRelative = [string]$row.Tag.ExistingRelativePath
+                if (-not [string]::IsNullOrWhiteSpace($pendingSource)) {
+                    $sourceInfo = Get-Item -LiteralPath $pendingSource
+                    [void][IO.Directory]::CreateDirectory($resourcePath)
+                    $targetName = 'updater-' + (Get-StableKey -Value ($ComicName + '/' + $chapterName)).Substring(0, 16) + $sourceInfo.Extension.ToLowerInvariant()
+                    $targetPath = Join-Path $resourcePath $targetName
+                    [IO.File]::Copy($sourceInfo.FullName, $targetPath, $true)
+                    $resultMap[$chapterName] = $resourceRelative + '\' + $targetName
+                }
+                elseif (-not [string]::IsNullOrWhiteSpace($existingRelative)) {
+                    $resolvedExisting = Resolve-SafeChildPath -Root $comicPath -RelativePath $existingRelative
+                    if (-not [string]::IsNullOrWhiteSpace($resolvedExisting) -and (Test-Path -LiteralPath $resolvedExisting -PathType Leaf)) {
+                        $resultMap[$chapterName] = $existingRelative
+                    }
+                }
+            }
+            $dialog.Tag = $resultMap
+            $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $dialog.Close()
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $_.Exception.Message, '保存自选封面失败', 'OK', 'Error') | Out-Null
+        }
+    })
+    $dialog.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = '取消'
+    $cancel.Location = New-Object System.Drawing.Point(782, 552)
+    $cancel.Size = New-Object System.Drawing.Size(84, 34)
+    $cancel.Anchor = 'Bottom,Right'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancel)
+    $dialog.AcceptButton = $ok
+    $dialog.CancelButton = $cancel
+    if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return $dialog.Tag
+}
+
 function Show-ComicSelector {
     param(
         [string]$LibraryRoot,
         [object[]]$Candidates,
         [string[]]$SelectedNames,
+        [object[]]$Collections,
+        [hashtable]$ChapterCoverOverrides,
+        [hashtable]$ChapterCustomCovers,
         [bool]$OpenAfterGenerate,
         [switch]$SkipOpen,
         [switch]$SmokeTest
@@ -534,8 +1382,8 @@ function Show-ComicSelector {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '本地漫画网页生成器'
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(820, 665)
-    $form.MinimumSize = New-Object System.Drawing.Size(680, 540)
+    $form.Size = New-Object System.Drawing.Size(1040, 760)
+    $form.MinimumSize = New-Object System.Drawing.Size(860, 660)
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
 
     $title = New-Object System.Windows.Forms.Label
@@ -546,128 +1394,468 @@ function Show-ComicSelector {
     $form.Controls.Add($title)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = '勾上新漫画即可加入；旧漫画先取消再重新勾上即可更新。其他书架内容保持不动。'
+    $hint.Text = '“本次操作”决定这次处理谁；“加入书架”决定总目录长期保留谁。章节封面可直接用每行下拉框修改。'
     $hint.AutoSize = $true
     $hint.ForeColor = [System.Drawing.Color]::DimGray
     $hint.Location = New-Object System.Drawing.Point(20, 52)
     $form.Controls.Add($hint)
 
-    $list = New-Object System.Windows.Forms.ListView
-    $list.Location = New-Object System.Drawing.Point(20, 82)
-    $list.Size = New-Object System.Drawing.Size(762, 365)
-    $list.Anchor = 'Top,Bottom,Left,Right'
-    $list.View = [System.Windows.Forms.View]::Details
-    $list.CheckBoxes = $true
-    $list.FullRowSelect = $true
-    $list.GridLines = $true
-    [void]$list.Columns.Add('漫画文件夹', 510)
-    [void]$list.Columns.Add('状态', 225)
+    $chapterCoverOverrideMap = Copy-ChapterCoverOverrideMap -Value $ChapterCoverOverrides
+    $chapterCustomCoverMap = Copy-ChapterCustomCoverMap -Value $ChapterCustomCovers
+
+    $coverDisplayByMode = @{ metadata = '跟随元数据'; first = '首图'; custom = '自选'; none = '隐藏' }
+    $getCoverModeFromDisplay = {
+        param([string]$Display)
+        switch ($Display) { '首图' { 'first' } '自选' { 'custom' } '隐藏' { 'none' } default { 'metadata' } }
+    }
+    $getCandidateStatus = {
+        param([object]$Candidate, [bool]$OnShelf, [string]$CoverMode = 'metadata')
+        if (-not $Candidate.Eligible) { return '不可生成：' + $Candidate.Reason }
+        $membership = if ($OnShelf) { '已在书架；' } else { '尚未加入；' }
+        $candidateStatus = $membership + ('可生成，共 {0} 话' -f $Candidate.ChapterCount)
+        if ($Candidate.UsesRootImages) { $candidateStatus += '；根目录按单话' }
+        if ($Candidate.UsesCompositeGroups) { $candidateStatus = $membership + ('可生成，共 {0} 话；按文件名前缀自动分组' -f $Candidate.ChapterCount) }
+        if (-not $Candidate.HasCover) { $candidateStatus += '；自动封面' }
+        return $candidateStatus
+    }
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Location = New-Object System.Drawing.Point(20, 82)
+    $grid.Size = New-Object System.Drawing.Size(982, 405)
+    $grid.Anchor = 'Top,Bottom,Left,Right'
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.RowHeadersVisible = $false
+    $grid.MultiSelect = $true
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::None
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::None
+    $grid.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
+    $grid.EditMode = [System.Windows.Forms.DataGridViewEditMode]::EditOnEnter
+    $shelfColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $shelfColumn.Name = 'Shelf'
+    $shelfColumn.HeaderText = '加入书架'
+    $shelfColumn.ToolTipText = '长期决定漫画是否出现在总目录；取消不会删除原漫画文件或已经生成的章节网页'
+    $shelfColumn.Width = 72
+    [void]$grid.Columns.Add($shelfColumn)
+    $targetColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $targetColumn.Name = 'Target'
+    $targetColumn.HeaderText = '本次操作'
+    $targetColumn.ToolTipText = '只在本次“加入 / 更新本次勾选”中处理；新漫画勾上后会自动加入书架'
+    $targetColumn.Width = 72
+    [void]$grid.Columns.Add($targetColumn)
+    [void]$grid.Columns.Add('ComicName', '漫画文件夹')
+    [void]$grid.Columns.Add('Status', '状态')
+    $coverColumn = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+    $coverColumn.Name = 'ChapterCover'
+    $coverColumn.HeaderText = '章节封面 ▼'
+    $coverColumn.ToolTipText = '首图：每话第一张；自选：优先采用更新器中逐话选择的任意本地图片，再采用元数据自选，最后回退首图；隐藏：不显示；跟随元数据：完全采用整理器设置'
+    $coverColumn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    foreach ($choice in @('跟随元数据', '首图', '自选', '隐藏')) { [void]$coverColumn.Items.Add($choice) }
+    [void]$grid.Columns.Add($coverColumn)
+    [void]$grid.Columns.Add('MetadataCoverInfo', '元数据实际指向')
+    $grid.Columns['ComicName'].Width = 340
+    $grid.Columns['ComicName'].ReadOnly = $true
+    $grid.Columns['Status'].AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::None
+    $grid.Columns['Status'].Width = 220
+    $grid.Columns['Status'].ReadOnly = $true
+    $grid.Columns['ChapterCover'].Width = 125
+    $grid.Columns['MetadataCoverInfo'].Width = 310
+    $grid.Columns['MetadataCoverInfo'].ReadOnly = $true
+    $grid.Columns['MetadataCoverInfo'].ToolTipText = '显示来源元数据在“跟随元数据”模式下最终会采用首图、自选图片还是隐藏；自选图片完整路径可悬停查看'
+    $grid.Columns['MetadataCoverInfo'].DisplayIndex = $grid.Columns['ChapterCover'].DisplayIndex + 1
+
+    $applyCandidateToRow = {
+        param(
+            [System.Windows.Forms.DataGridViewRow]$Row,
+            [object]$Candidate,
+            [bool]$OnShelf,
+            [bool]$Targeted,
+            [string]$CoverDisplay
+        )
+        $mode = & $getCoverModeFromDisplay $CoverDisplay
+        $Row.Tag = $Candidate
+        $Row.Cells['Shelf'].Value = $OnShelf
+        $Row.Cells['Target'].Value = $Targeted
+        $Row.Cells['ComicName'].Value = [string]$Candidate.Name
+        $Row.Cells['Status'].Value = & $getCandidateStatus $Candidate $OnShelf $mode
+        $Row.Cells['ChapterCover'].Value = $CoverDisplay
+        $Row.Cells['MetadataCoverInfo'].Value = [string]$Candidate.MetadataCoverSummary
+        $Row.Cells['ChapterCover'].ToolTipText = [string]$Candidate.MetadataCoverDetails
+        $Row.Cells['MetadataCoverInfo'].ToolTipText = [string]$Candidate.MetadataCoverDetails
+        $Row.DefaultCellStyle.ForeColor = $grid.DefaultCellStyle.ForeColor
+        foreach ($cell in $Row.Cells) { $cell.ReadOnly = $false }
+        $Row.Cells['ComicName'].ReadOnly = $true
+        $Row.Cells['Status'].ReadOnly = $true
+        $Row.Cells['MetadataCoverInfo'].ReadOnly = $true
+        if (-not $Candidate.Eligible) {
+            $Row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
+            foreach ($cell in $Row.Cells) { $cell.ReadOnly = $true }
+            $Row.Cells['ChapterCover'].Value = '跟随元数据'
+        }
+    }
+    $addCandidateRow = {
+        param([object]$Candidate, [bool]$OnShelf = $false, [bool]$Targeted = $false)
+        $mode = if ($chapterCoverOverrideMap.ContainsKey([string]$Candidate.Name)) { [string]$chapterCoverOverrideMap[[string]$Candidate.Name] } else { 'metadata' }
+        $display = if ($coverDisplayByMode.ContainsKey($mode)) { [string]$coverDisplayByMode[$mode] } else { '跟随元数据' }
+        $rowIndex = $grid.Rows.Add()
+        $row = $grid.Rows[$rowIndex]
+        & $applyCandidateToRow $row $Candidate $OnShelf $Targeted $display
+        return $row
+    }
 
     foreach ($candidate in $Candidates) {
-        $item = New-Object System.Windows.Forms.ListViewItem($candidate.Name)
-        if ($candidate.Eligible) {
-            $membership = if ($SelectedNames -contains $candidate.Name) { '已在书架；' } else { '尚未加入；' }
-            $candidateStatus = $membership + ('可生成，共 {0} 话' -f $candidate.ChapterCount)
-            if ($candidate.UsesRootImages) {
-                $candidateStatus += '；根目录按单话'
-            }
-            if ($candidate.UsesCompositeGroups) {
-                $candidateStatus = $membership + ('可生成，共 {0} 话；按文件名前缀自动分组' -f $candidate.ChapterCount)
-            }
-            if (-not $candidate.HasCover) {
-                $candidateStatus += '；自动封面'
-            }
-            [void]$item.SubItems.Add($candidateStatus)
-            $item.Tag = $candidate
-            $item.Checked = ($SelectedNames -contains $candidate.Name)
-        }
-        else {
-            [void]$item.SubItems.Add(('不可生成：' + $candidate.Reason))
-            $item.ForeColor = [System.Drawing.Color]::Gray
-            $item.Tag = $null
-        }
-        [void]$list.Items.Add($item)
+        $onShelf = $SelectedNames -contains $candidate.Name
+        [void](& $addCandidateRow $candidate $onShelf $false)
     }
     $selectionState = [pscustomobject]@{
         PreviousSelectedNames = @($SelectedNames)
-        TargetNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        SuppressTargetTracking = $false
+        Collections = @($Collections | ForEach-Object { Copy-CollectionDefinition -Collection $_ })
+        CollectionsDirty = $false
+        ChapterCoverOverrides = $chapterCoverOverrideMap
+        ChapterCustomCovers = $chapterCustomCoverMap
+        SuppressGridEvents = $false
         IsRunning = $false
         ExitCode = 0
     }
-    $list.add_ItemCheck({
-        param($sender, $eventArgs)
-        $changedItem = $sender.Items[$eventArgs.Index]
-        if ($null -eq $changedItem.Tag) {
-            $eventArgs.NewValue = $eventArgs.CurrentValue
-            return
-        }
-        if ($selectionState.SuppressTargetTracking) { return }
-        $changedName = [string]$changedItem.Text
-        if ($eventArgs.NewValue -eq [System.Windows.Forms.CheckState]::Checked) {
-            [void]$selectionState.TargetNames.Add($changedName)
-        }
-        else {
-            [void]$selectionState.TargetNames.Remove($changedName)
+    $grid.add_DataError({ param($sender, $eventArgs); $eventArgs.ThrowException = $false })
+    $grid.add_CurrentCellDirtyStateChanged({
+        if ($grid.IsCurrentCellDirty -and $null -ne $grid.CurrentCell -and $grid.CurrentCell.OwningColumn.Name -in @('Target', 'Shelf', 'ChapterCover')) {
+            [void]$grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
         }
     })
-    $form.Controls.Add($list)
+    $grid.add_CellValueChanged({
+        param($sender, $eventArgs)
+        if ($selectionState.SuppressGridEvents -or $eventArgs.RowIndex -lt 0 -or $eventArgs.ColumnIndex -lt 0) { return }
+        $row = $grid.Rows[$eventArgs.RowIndex]
+        if ($null -eq $row.Tag -or -not $row.Tag.Eligible) { return }
+        $columnName = $grid.Columns[$eventArgs.ColumnIndex].Name
+        $selectionState.SuppressGridEvents = $true
+        try {
+            if ($columnName -eq 'Target' -and $row.Cells['Target'].Value -eq $true) {
+                $row.Cells['Shelf'].Value = $true
+            }
+            elseif ($columnName -eq 'Shelf') {
+                if ($row.Cells['Shelf'].Value -eq $true) {
+                    $row.Cells['Target'].Value = $true
+                }
+                elseif ($row.Cells['Shelf'].Value -ne $true) {
+                    $row.Cells['Target'].Value = $false
+                }
+                $currentCoverMode = & $getCoverModeFromDisplay ([string]$row.Cells['ChapterCover'].Value)
+                $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag ($row.Cells['Shelf'].Value -eq $true) $currentCoverMode
+            }
+            elseif ($columnName -eq 'ChapterCover') {
+                $display = [string]$row.Cells['ChapterCover'].Value
+                $mode = & $getCoverModeFromDisplay $display
+                $name = [string]$row.Cells['ComicName'].Value
+                if ($mode -eq 'metadata') { [void]$selectionState.ChapterCoverOverrides.Remove($name) }
+                else { $selectionState.ChapterCoverOverrides[$name] = $mode }
+                $row.Cells['Target'].Value = $true
+                $row.Cells['Shelf'].Value = $true
+                $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag $true $mode
+            }
+        }
+        finally { $selectionState.SuppressGridEvents = $false }
+        if ($columnName -eq 'ChapterCover') {
+            $name = [string]$row.Cells['ComicName'].Value
+            $hasUpdaterCustom = $selectionState.ChapterCustomCovers.ContainsKey($name) -and $selectionState.ChapterCustomCovers[$name].Count -gt 0
+            $currentMode = & $getCoverModeFromDisplay ([string]$row.Cells['ChapterCover'].Value)
+            $status.Text = if ($currentMode -eq 'metadata') {
+                [string]$row.Tag.MetadataCoverDetails
+            }
+            elseif ([string]$row.Cells['ChapterCover'].Value -eq '自选' -and -not $hasUpdaterCustom) {
+                '已切换为“自选”。如需指定任意本地图片，请选中这行后点击“编辑当前漫画自选封面…”；未指定章节会采用元数据自选或首图。'
+            }
+            else { '章节封面设置已改变，并已自动勾入本次操作。' }
+        }
+    })
+    $form.Controls.Add($grid)
 
     $openAfter = New-Object System.Windows.Forms.CheckBox
     $openAfter.Text = '更新完成后自动打开漫画阅读器'
     $openAfter.AutoSize = $true
     $openAfter.Checked = $OpenAfterGenerate
-    $openAfter.Location = New-Object System.Drawing.Point(20, 466)
+    $openAfter.Location = New-Object System.Drawing.Point(20, 504)
     $openAfter.Anchor = 'Bottom,Left'
     $form.Controls.Add($openAfter)
 
+    $chapterCoverSettings = New-Object System.Windows.Forms.Button
+    $chapterCoverSettings.Text = '本次勾选章节封面 ▼'
+    $chapterCoverSettings.Location = New-Object System.Drawing.Point(780, 496)
+    $chapterCoverSettings.Size = New-Object System.Drawing.Size(222, 34)
+    $chapterCoverSettings.Anchor = 'Bottom,Right'
+    $chapterCoverMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $firstChapterCoversItem = $chapterCoverMenu.Items.Add('首图')
+    $customChapterCoversItem = $chapterCoverMenu.Items.Add('自选（更新器自选 → 元数据自选 → 首图）')
+    $hideChapterCoversItem = $chapterCoverMenu.Items.Add('隐藏')
+    $autoChapterCoversItem = $chapterCoverMenu.Items.Add('跟随元数据')
+    $applyChapterCoverSetting = {
+        param([string]$Mode)
+        $targetRows = @($grid.Rows | Where-Object { $null -ne $_.Tag -and $_.Tag.Eligible -and $_.Cells['Target'].Value -eq $true })
+        if ($targetRows.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('请先在“本次操作”列勾选一部或多部漫画。', '章节封面设置', 'OK', 'Information') | Out-Null
+            return
+        }
+        $selectionState.SuppressGridEvents = $true
+        try {
+            foreach ($row in $targetRows) {
+                $name = [string]$row.Cells['ComicName'].Value
+                if ($Mode -eq 'metadata') { [void]$selectionState.ChapterCoverOverrides.Remove($name) }
+                else { $selectionState.ChapterCoverOverrides[$name] = $Mode }
+                $row.Cells['ChapterCover'].Value = $coverDisplayByMode[$Mode]
+                $row.Cells['Shelf'].Value = $true
+                $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag $true $Mode
+            }
+        }
+        finally { $selectionState.SuppressGridEvents = $false }
+        $status.Text = ('已把 {0} 部“本次操作”漫画的章节封面设为：{1}。' -f $targetRows.Count, $coverDisplayByMode[$Mode])
+    }
+    $firstChapterCoversItem.add_Click({ & $applyChapterCoverSetting 'first' })
+    $customChapterCoversItem.add_Click({ & $applyChapterCoverSetting 'custom' })
+    $hideChapterCoversItem.add_Click({ & $applyChapterCoverSetting 'none' })
+    $autoChapterCoversItem.add_Click({ & $applyChapterCoverSetting 'metadata' })
+    $chapterCoverSettings.add_Click({ $chapterCoverMenu.Show($chapterCoverSettings, 0, $chapterCoverSettings.Height) })
+    $form.Controls.Add($chapterCoverSettings)
+
+    $editCustomCovers = New-Object System.Windows.Forms.Button
+    $editCustomCovers.Text = '编辑当前漫画自选封面…'
+    $editCustomCovers.Location = New-Object System.Drawing.Point(550, 496)
+    $editCustomCovers.Size = New-Object System.Drawing.Size(220, 34)
+    $editCustomCovers.Anchor = 'Bottom,Right'
+    $editCustomCovers.add_Click({
+        if ($null -eq $grid.CurrentRow -or $null -eq $grid.CurrentRow.Tag -or -not $grid.CurrentRow.Tag.Eligible) {
+            [System.Windows.Forms.MessageBox]::Show('请先点中一部结构合格的漫画。', '逐话自选封面', 'OK', 'Information') | Out-Null
+            return
+        }
+        $row = $grid.CurrentRow
+        $name = [string]$row.Cells['ComicName'].Value
+        $existingMap = if ($selectionState.ChapterCustomCovers.ContainsKey($name)) { $selectionState.ChapterCustomCovers[$name] } else { @{} }
+        $editedMap = Show-UpdaterCustomCoverEditor -LibraryRoot $LibraryRoot -ComicName $name -ExistingMap $existingMap -Owner $form
+        if ($null -eq $editedMap) { return }
+        $selectionState.SuppressGridEvents = $true
+        try {
+            if ($editedMap.Count -gt 0) { $selectionState.ChapterCustomCovers[$name] = $editedMap }
+            else { [void]$selectionState.ChapterCustomCovers.Remove($name) }
+            $selectionState.ChapterCoverOverrides[$name] = 'custom'
+            $row.Cells['ChapterCover'].Value = '自选'
+            $row.Cells['Target'].Value = $true
+            $row.Cells['Shelf'].Value = $true
+            $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag $true 'custom'
+        }
+        finally { $selectionState.SuppressGridEvents = $false }
+        $status.Text = ('已保存“{0}”的 {1} 个更新器逐话自选封面，并勾入本次操作。' -f $name, $editedMap.Count)
+    })
+    $form.Controls.Add($editCustomCovers)
+
     $selectAll = New-Object System.Windows.Forms.Button
-    $selectAll.Text = '全选合格项目'
-    $selectAll.Location = New-Object System.Drawing.Point(20, 505)
+    $selectAll.Text = '本次操作全选'
+    $selectAll.Location = New-Object System.Drawing.Point(312, 543)
     $selectAll.Size = New-Object System.Drawing.Size(145, 36)
     $selectAll.Anchor = 'Bottom,Left'
     $selectAll.add_Click({
-        $selectionState.SuppressTargetTracking = $true
+        $selectionState.SuppressGridEvents = $true
         try {
-            foreach ($item in $list.Items) {
-                if ($null -ne $item.Tag) {
-                    $item.Checked = $true
-                    [void]$selectionState.TargetNames.Add([string]$item.Text)
+            foreach ($row in $grid.Rows) {
+                if ($null -ne $row.Tag -and $row.Tag.Eligible) {
+                    $row.Cells['Target'].Value = $true
+                    $row.Cells['Shelf'].Value = $true
+                    $currentCoverMode = & $getCoverModeFromDisplay ([string]$row.Cells['ChapterCover'].Value)
+                    $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag $true $currentCoverMode
                 }
             }
         }
-        finally { $selectionState.SuppressTargetTracking = $false }
+        finally { $selectionState.SuppressGridEvents = $false }
     })
     $form.Controls.Add($selectAll)
 
     $clearAll = New-Object System.Windows.Forms.Button
-    $clearAll.Text = '全部取消'
-    $clearAll.Location = New-Object System.Drawing.Point(174, 505)
-    $clearAll.Size = New-Object System.Drawing.Size(110, 36)
+    $clearAll.Text = '本次操作清空'
+    $clearAll.Location = New-Object System.Drawing.Point(465, 543)
+    $clearAll.Size = New-Object System.Drawing.Size(130, 36)
     $clearAll.Anchor = 'Bottom,Left'
     $clearAll.add_Click({
-        $selectionState.SuppressTargetTracking = $true
+        $selectionState.SuppressGridEvents = $true
         try {
-            foreach ($item in $list.Items) {
-                if ($null -ne $item.Tag) { $item.Checked = $false }
-            }
-            $selectionState.TargetNames.Clear()
+            foreach ($row in $grid.Rows) { if ($null -ne $row.Tag -and $row.Tag.Eligible) { $row.Cells['Target'].Value = $false } }
         }
-        finally { $selectionState.SuppressTargetTracking = $false }
+        finally { $selectionState.SuppressGridEvents = $false }
     })
     $form.Controls.Add($clearAll)
 
+    $shelfSelectAll = New-Object System.Windows.Forms.Button
+    $shelfSelectAll.Text = '加入书架全选'
+    $shelfSelectAll.Location = New-Object System.Drawing.Point(20, 543)
+    $shelfSelectAll.Size = New-Object System.Drawing.Size(145, 36)
+    $shelfSelectAll.Anchor = 'Bottom,Left'
+    $shelfSelectAll.add_Click({
+        $addedToTarget = 0
+        $selectionState.SuppressGridEvents = $true
+        try {
+            foreach ($row in $grid.Rows) {
+                if ($null -eq $row.Tag -or -not $row.Tag.Eligible) { continue }
+                if ($row.Cells['Shelf'].Value -ne $true) {
+                    $row.Cells['Target'].Value = $true
+                    $addedToTarget++
+                }
+                $row.Cells['Shelf'].Value = $true
+                $currentCoverMode = & $getCoverModeFromDisplay ([string]$row.Cells['ChapterCover'].Value)
+                $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag $true $currentCoverMode
+            }
+        }
+        finally { $selectionState.SuppressGridEvents = $false }
+        $status.Text = ('已勾选全部可用漫画加入书架；其中 {0} 部新勾选漫画也已加入本次操作。' -f $addedToTarget)
+    })
+    $form.Controls.Add($shelfSelectAll)
+
+    $shelfClearAll = New-Object System.Windows.Forms.Button
+    $shelfClearAll.Text = '加入书架清空'
+    $shelfClearAll.Location = New-Object System.Drawing.Point(174, 543)
+    $shelfClearAll.Size = New-Object System.Drawing.Size(130, 36)
+    $shelfClearAll.Anchor = 'Bottom,Left'
+    $shelfClearAll.add_Click({
+        $selectionState.SuppressGridEvents = $true
+        try {
+            foreach ($row in $grid.Rows) {
+                if ($null -eq $row.Tag -or -not $row.Tag.Eligible) { continue }
+                $row.Cells['Shelf'].Value = $false
+                $row.Cells['Target'].Value = $false
+                $currentCoverMode = & $getCoverModeFromDisplay ([string]$row.Cells['ChapterCover'].Value)
+                $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag $false $currentCoverMode
+            }
+        }
+        finally { $selectionState.SuppressGridEvents = $false }
+        $status.Text = '已清空“加入书架”和“本次操作”；可重新勾选需要保留或更新的漫画。'
+    })
+    $form.Controls.Add($shelfClearAll)
+
+    $manageCollections = New-Object System.Windows.Forms.Button
+    $manageCollections.Text = '管理合集…'
+    $manageCollections.Location = New-Object System.Drawing.Point(603, 543)
+    $manageCollections.Size = New-Object System.Drawing.Size(136, 36)
+    $manageCollections.Anchor = 'Bottom,Left'
+    $manageCollections.add_Click({
+        $availableNames = @($grid.Rows | Where-Object { $null -ne $_.Tag -and $_.Tag.Eligible -and $_.Cells['Shelf'].Value -eq $true } | ForEach-Object { [string]$_.Cells['ComicName'].Value })
+        if ($availableNames.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('请先勾选准备放在书架中的漫画，再管理合集。', '漫画合集', 'OK', 'Information') | Out-Null
+            return
+        }
+        $collectionResult = Show-CollectionManager -Collections @($selectionState.Collections) -AvailableNames $availableNames -Owner $form
+        if ($null -ne $collectionResult) {
+            $selectionState.Collections = @($collectionResult.Collections)
+            $selectionState.CollectionsDirty = $true
+            $status.Text = '已配置 {0} 个合集；执行更新后写入总书架与合集目录页。' -f $selectionState.Collections.Count
+        }
+    })
+    $form.Controls.Add($manageCollections)
+
+    $rescanButton = New-Object System.Windows.Forms.Button
+    $rescanButton.Text = '重新扫描'
+    $rescanButton.Location = New-Object System.Drawing.Point(744, 543)
+    $rescanButton.Size = New-Object System.Drawing.Size(92, 36)
+    $rescanButton.Anchor = 'Bottom,Left'
+    $rescanButton.add_Click({
+        $status.Text = '正在重新扫描漫画文件夹；现有勾选与章节封面设置会保留……'
+        $form.UseWaitCursor = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            $existingRows = @{}
+            foreach ($row in $grid.Rows) {
+                if ($null -ne $row.Tag) { $existingRows[[string]$row.Cells['ComicName'].Value] = $row }
+            }
+            $rescannedCandidates = @(Get-AllCandidates -LibraryRoot $LibraryRoot)
+            $rescannedByName = @{}
+            foreach ($candidate in $rescannedCandidates) { $rescannedByName[[string]$candidate.Name] = $candidate }
+            $newCandidates = @($rescannedCandidates | Where-Object { -not $existingRows.ContainsKey([string]$_.Name) })
+            $changedItems = @()
+            foreach ($candidate in $rescannedCandidates) {
+                $name = [string]$candidate.Name
+                if (-not $existingRows.ContainsKey($name)) { continue }
+                $oldCandidate = $existingRows[$name].Tag
+                if ([string]$oldCandidate.SourceFingerprint -cne [string]$candidate.SourceFingerprint) {
+                    $changedItems += [pscustomobject]@{ Row = $existingRows[$name]; Candidate = $candidate }
+                }
+            }
+
+            $selectionState.SuppressGridEvents = $true
+            try {
+                foreach ($candidate in $newCandidates) { [void](& $addCandidateRow $candidate $false $false) }
+            }
+            finally { $selectionState.SuppressGridEvents = $false }
+
+            $reloadedCount = 0
+            if ($changedItems.Count -gt 0) {
+                $changedNames = @($changedItems | ForEach-Object { [string]$_.Candidate.Name })
+                $preview = @($changedNames | Select-Object -First 18) -join "`r`n"
+                if ($changedNames.Count -gt 18) { $preview += "`r`n……另有 " + ($changedNames.Count - 18) + ' 部' }
+                $answer = [System.Windows.Forms.MessageBox]::Show(
+                    $form,
+                    ("检测到以下已载入漫画的图片、元数据或文件夹结构发生变化：`r`n`r`n{0}`r`n`r`n是否重新导入这些漫画的信息？现有【加入书架】【本次操作】和章节封面选择都会保留。" -f $preview),
+                    '二次确认：重新导入发生变化的漫画',
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Question
+                )
+                if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    $selectionState.SuppressGridEvents = $true
+                    try {
+                        foreach ($item in $changedItems) {
+                            $row = $item.Row
+                            $onShelf = ($row.Cells['Shelf'].Value -eq $true)
+                            $targeted = ($row.Cells['Target'].Value -eq $true)
+                            $coverDisplay = [string]$row.Cells['ChapterCover'].Value
+                            & $applyCandidateToRow $row $item.Candidate $onShelf $targeted $coverDisplay
+                            $reloadedCount++
+                        }
+                    }
+                    finally { $selectionState.SuppressGridEvents = $false }
+                }
+            }
+            $missingCount = @($existingRows.Keys | Where-Object { -not $rescannedByName.ContainsKey([string]$_) }).Count
+            $status.Text = '重新扫描完成：新增 {0} 部，重新导入 {1} 部，保留原操作；{2} 部已载入项目当前未扫描到。' -f $newCandidates.Count, $reloadedCount, $missingCount
+        }
+        catch {
+            $status.Text = '重新扫描失败：' + $_.Exception.Message
+            [System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, '重新扫描失败', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+        finally {
+            $form.UseWaitCursor = $false
+            $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        }
+    })
+    $form.Controls.Add($rescanButton)
+
+    $helpButton = New-Object System.Windows.Forms.Button
+    $helpButton.Text = '使用说明'
+    $helpButton.Location = New-Object System.Drawing.Point(478, 585)
+    $helpButton.Size = New-Object System.Drawing.Size(90, 36)
+    $helpButton.Anchor = 'Bottom,Right'
+    $helpButton.add_Click({
+        $helpText = @'
+1. “加入书架”决定漫画是否长期显示在总目录；“本次操作”只决定这一次要加入或更新哪些漫画。
+2. 勾选“本次操作”会自动加入书架；取消加入书架会同步取消本次操作，重新勾选加入书架会重新加入本次操作。
+3. “加入 / 更新本次勾选”只处理本次操作列中的漫画；“全部更新”处理所有已加入书架的漫画。
+4. 章节封面可选“跟随元数据、首图、自选、隐藏”。执行更新后，非“跟随元数据”的设置也会写入漫画自身的元数据；“元数据实际指向”列可查看最终结果和完整路径。
+5. “编辑当前漫画自选封面”允许逐话选择任意本地图片；原图不会改动，所需图片会复制进漫画阅读器资源目录。
+6. “管理合集”只改变总书架和合集目录的归类，不会移动或改名原漫画文件夹。
+7. “重新扫描”会追加新漫画且不重置现有操作；已载入漫画发生变化时会先二次确认，再保留勾选和封面设置重新导入。
+8. 更新过程会在底部显示进度；任务完成前请不要关闭窗口。
+'@
+        [System.Windows.Forms.MessageBox]::Show($form, $helpText, '漫画更新器使用说明', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    })
+    $form.Controls.Add($helpButton)
+
     $closeButton = New-Object System.Windows.Forms.Button
     $closeButton.Text = '关闭'
-    $closeButton.Location = New-Object System.Drawing.Point(438, 505)
+    $closeButton.Location = New-Object System.Drawing.Point(576, 585)
     $closeButton.Size = New-Object System.Drawing.Size(80, 36)
     $closeButton.Anchor = 'Bottom,Right'
     $form.Controls.Add($closeButton)
 
     $status = New-Object System.Windows.Forms.Label
     $status.AutoSize = $false
-    $status.Location = New-Object System.Drawing.Point(20, 552)
-    $status.Size = New-Object System.Drawing.Size(762, 54)
+    $status.Location = New-Object System.Drawing.Point(20, 632)
+    $status.Size = New-Object System.Drawing.Size(982, 65)
     $status.Anchor = 'Bottom,Left,Right'
     $status.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $status.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 0)
@@ -679,7 +1867,7 @@ function Show-ComicSelector {
     $setBusy = {
         param([bool]$Busy)
         $selectionState.IsRunning = $Busy
-        foreach ($control in @($list, $openAfter, $selectAll, $clearAll, $closeButton, $updateSelected, $updateAll)) {
+        foreach ($control in @($grid, $openAfter, $chapterCoverSettings, $editCustomCovers, $selectAll, $clearAll, $shelfSelectAll, $shelfClearAll, $manageCollections, $rescanButton, $helpButton, $closeButton, $updateSelected, $updateAll)) {
             $control.Enabled = -not $Busy
         }
         $form.UseWaitCursor = $Busy
@@ -688,16 +1876,15 @@ function Show-ComicSelector {
     }
     $runUpdate = {
         param([string]$UpdateMode)
-        $checked = @($list.Items | Where-Object { $_.Checked -and $null -ne $_.Tag })
-        $checkedNames = if ($UpdateMode -eq 'Selected') {
-            @($checked | Where-Object { $selectionState.TargetNames.Contains([string]$_.Text) } | ForEach-Object { [string]$_.Text })
-        }
-        else {
-            @($checked | ForEach-Object { [string]$_.Text })
-        }
-        if ($checkedNames.Count -eq 0) {
+        [string[]]$shelfNames = @($grid.Rows | Where-Object { $null -ne $_.Tag -and $_.Tag.Eligible -and $_.Cells['Shelf'].Value -eq $true } | ForEach-Object { [string]$_.Cells['ComicName'].Value })
+        [string[]]$checkedNames = if ($UpdateMode -eq 'Selected') {
+            @($grid.Rows | Where-Object { $null -ne $_.Tag -and $_.Tag.Eligible -and $_.Cells['Target'].Value -eq $true -and $_.Cells['Shelf'].Value -eq $true } | ForEach-Object { [string]$_.Cells['ComicName'].Value })
+        } else { @($shelfNames) }
+        $membershipChanged = (@($shelfNames | Sort-Object) -join "`n") -cne (@($selectionState.PreviousSelectedNames | Sort-Object) -join "`n")
+        $catalogOnly = ($UpdateMode -eq 'Selected' -and $checkedNames.Count -eq 0 -and ($selectionState.CollectionsDirty -or $membershipChanged))
+        if ($checkedNames.Count -eq 0 -and -not $catalogOnly) {
             $emptyMessage = if ($UpdateMode -eq 'Selected') {
-                '请勾选要加入的新漫画；若要更新已在书架中的旧漫画，请先取消再重新勾上。'
+                '请在“本次操作”列勾选要加入或更新的漫画。'
             }
             else { '请至少勾选一部结构合格的漫画。' }
             [System.Windows.Forms.MessageBox]::Show(
@@ -713,16 +1900,33 @@ function Show-ComicSelector {
         $status.Text = if ($UpdateMode -eq 'Selected') { '正在准备加入 / 更新勾选的漫画……' } else { '正在准备全部更新……' }
         [System.Windows.Forms.Application]::DoEvents()
         try {
-            $result = Invoke-ComicUpdate -LibraryRoot $LibraryRoot -PreviousSelectedNames @($selectionState.PreviousSelectedNames) -CheckedNames $checkedNames -UpdateMode $UpdateMode -OpenAfterGenerate ([bool]$openAfter.Checked)
+            $result = Invoke-ComicUpdate -LibraryRoot $LibraryRoot -PreviousSelectedNames @($selectionState.PreviousSelectedNames) -DesiredSelectedNames $shelfNames -CheckedNames $checkedNames -UpdateMode $UpdateMode -OpenAfterGenerate ([bool]$openAfter.Checked) -Collections @($selectionState.Collections) -ChapterCoverOverrides $selectionState.ChapterCoverOverrides -ChapterCustomCovers $selectionState.ChapterCustomCovers -CatalogOnly:$catalogOnly
             $selectionState.PreviousSelectedNames = @($result.PersistedSelectedNames)
-            $selectionState.SuppressTargetTracking = $true
+            $selectionState.Collections = @($result.Collections)
+            $selectionState.ChapterCoverOverrides = Copy-ChapterCoverOverrideMap -Value $result.ChapterCoverOverrides
+            $selectionState.ChapterCustomCovers = Copy-ChapterCustomCoverMap -Value $result.ChapterCustomCovers
+            $selectionState.CollectionsDirty = $false
+            $selectionState.SuppressGridEvents = $true
             try {
-                foreach ($item in $list.Items) {
-                    if ($null -ne $item.Tag) { $item.Checked = $selectionState.PreviousSelectedNames -contains [string]$item.Text }
+                $generatedNames = @($result.Generated | ForEach-Object { [string]$_.Name })
+                foreach ($row in $grid.Rows) {
+                    if ($null -eq $row.Tag -or -not $row.Tag.Eligible) { continue }
+                    $name = [string]$row.Cells['ComicName'].Value
+                    $onShelf = $selectionState.PreviousSelectedNames -contains $name
+                    $coverDisplay = [string]$row.Cells['ChapterCover'].Value
+                    if ($generatedNames -contains $name -and (Test-Path -LiteralPath (Join-Path $LibraryRoot $name) -PathType Container)) {
+                        $refreshedCandidate = Get-FolderCandidate -Directory (Get-Item -LiteralPath (Join-Path $LibraryRoot $name))
+                        & $applyCandidateToRow $row $refreshedCandidate $onShelf $false $coverDisplay
+                    }
+                    else {
+                        $row.Cells['Target'].Value = $false
+                        $row.Cells['Shelf'].Value = $onShelf
+                        $currentCoverMode = & $getCoverModeFromDisplay $coverDisplay
+                        $row.Cells['Status'].Value = & $getCandidateStatus $row.Tag $onShelf $currentCoverMode
+                    }
                 }
-                $selectionState.TargetNames.Clear()
             }
-            finally { $selectionState.SuppressTargetTracking = $false }
+            finally { $selectionState.SuppressGridEvents = $false }
             $summaryText = '更新完成：本次生成 {0} 部漫画、{1} 话、{2} 张图片；书架共 {3} 部。' -f $result.GeneratedCount, $result.ChapterCount, $result.ImageCount, $result.LauncherCount
             $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Information
             $selectionState.ExitCode = 0
@@ -750,7 +1954,7 @@ function Show-ComicSelector {
 
     $updateSelected = New-Object System.Windows.Forms.Button
     $updateSelected.Text = '加入 / 更新本次勾选'
-    $updateSelected.Location = New-Object System.Drawing.Point(526, 505)
+    $updateSelected.Location = New-Object System.Drawing.Point(664, 585)
     $updateSelected.Size = New-Object System.Drawing.Size(160, 36)
     $updateSelected.Anchor = 'Bottom,Right'
     $updateSelected.add_Click({ & $runUpdate 'Selected' })
@@ -758,8 +1962,8 @@ function Show-ComicSelector {
 
     $updateAll = New-Object System.Windows.Forms.Button
     $updateAll.Text = '全部更新'
-    $updateAll.Location = New-Object System.Drawing.Point(694, 505)
-    $updateAll.Size = New-Object System.Drawing.Size(88, 36)
+    $updateAll.Location = New-Object System.Drawing.Point(832, 585)
+    $updateAll.Size = New-Object System.Drawing.Size(170, 36)
     $updateAll.Anchor = 'Bottom,Right'
     $updateAll.BackColor = [System.Drawing.Color]::FromArgb(35, 105, 160)
     $updateAll.ForeColor = [System.Drawing.Color]::White
@@ -777,6 +1981,32 @@ function Show-ComicSelector {
     })
 
     if ($SmokeTest) {
+        $smokeRow = @($grid.Rows | Where-Object { $null -ne $_.Tag -and $_.Tag.Eligible } | Select-Object -First 1)
+        if ($smokeRow.Count -eq 0) { throw '更新器 UI 冒烟测试找不到合格漫画行。' }
+        $row = $smokeRow[0]
+        $originalShelf = ($row.Cells['Shelf'].Value -eq $true)
+        $name = [string]$row.Cells['ComicName'].Value
+        $row.Cells['Target'].Value = $true
+        if ($row.Cells['Shelf'].Value -ne $true) { throw '勾选“本次操作”后没有自动加入书架。' }
+        $row.Cells['ChapterCover'].Value = '首图'
+        if (-not $selectionState.ChapterCoverOverrides.ContainsKey($name) -or [string]$selectionState.ChapterCoverOverrides[$name] -ne 'first') { throw '章节封面下拉框没有写入“首图”模式。' }
+        $row.Cells['ChapterCover'].Value = '跟随元数据'
+        if ($selectionState.ChapterCoverOverrides.ContainsKey($name)) { throw '章节封面下拉框没有恢复“跟随元数据”。' }
+        if ([string]::IsNullOrWhiteSpace([string]$row.Cells['MetadataCoverInfo'].Value)) { throw '更新器没有把“跟随元数据”的实际结果放进独立列。' }
+        if ([string]::IsNullOrWhiteSpace([string]$row.Cells['MetadataCoverInfo'].ToolTipText)) { throw '元数据实际指向列没有显示完整封面模式与路径提示。' }
+        if ($grid.Columns['Status'].AutoSizeMode -ne [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::None -or $grid.Columns['MetadataCoverInfo'].Width -lt 280) { throw '章节封面与元数据列仍会随窗口边框改变位置，或元数据列宽度不足。' }
+        if ($rescanButton.Text -ne '重新扫描' -or [string]::IsNullOrWhiteSpace([string]$row.Tag.SourceFingerprint)) { throw '更新器重新扫描功能没有准备好来源指纹。' }
+        if ($helpButton.Text -ne '使用说明') { throw '更新器缺少“使用说明”按钮。' }
+        $row.Cells['Shelf'].Value = $false
+        if ($row.Cells['Target'].Value -eq $true) { throw '取消“加入书架”后没有同步取消本次操作。' }
+        $row.Cells['Shelf'].Value = $true
+        if ($row.Cells['Target'].Value -ne $true) { throw '取消后重新勾选“加入书架”没有自动加入本次操作。' }
+        $selectionState.SuppressGridEvents = $true
+        try {
+            $row.Cells['Target'].Value = $false
+            $row.Cells['Shelf'].Value = $originalShelf
+        }
+        finally { $selectionState.SuppressGridEvents = $false }
         $timer = New-Object System.Windows.Forms.Timer
         $timer.Interval = 350
         $timer.add_Tick({ $timer.Stop(); $form.Close() })
@@ -810,6 +2040,9 @@ function Get-ComicMetadata {
         ReadingOrderMap = @{}
         ReadingOrderNormalizedMap = @{}
         ReadingOrderError = ''
+        ShowChapterCovers = $false
+        ChapterCoverMap = @{}
+        ChapterCoverNormalizedMap = @{}
     }
     if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
         return [pscustomobject]$result
@@ -821,6 +2054,10 @@ function Get-ComicMetadata {
         $authorText = Get-MetadataFieldText -Metadata $meta -Names @('author', 'authors', 'artist', 'artists')
         $result.Author = ([regex]::Replace($authorText, '\s*\r?\n\s*', '、')).Trim('、')
         $result.Description = Get-MetadataFieldText -Metadata $meta -Names @('description', 'intro', 'summary', 'desc', '简介', '簡介')
+        if ($null -ne $meta.PSObject.Properties['readerOptions'] -and $null -ne $meta.readerOptions -and
+            $null -ne $meta.readerOptions.PSObject.Properties['showChapterCovers']) {
+            $result.ShowChapterCovers = [bool]$meta.readerOptions.showChapterCovers
+        }
         $organizerSchema = 0
         if ($null -ne $meta.PSObject.Properties['organizer'] -and
             $null -ne $meta.organizer -and
@@ -835,6 +2072,8 @@ function Get-ComicMetadata {
             $orderErrors = New-Object 'System.Collections.Generic.List[string]'
             $orderMap = @{}
             $normalizedOrderMap = @{}
+            $chapterCoverMap = @{}
+            $chapterCoverNormalizedMap = @{}
             $usedOrders = @{}
             if ($chapterInfos.Count -eq 0) {
                 $orderErrors.Add('新版整理器元数据中没有 chapterInfos。')
@@ -875,8 +2114,16 @@ function Get-ComicMetadata {
                         continue
                     }
                 }
+                $coverMode = 'first'
+                if ($null -ne $chapterInfo.PSObject.Properties['coverMode']) { $coverMode = ([string]$chapterInfo.coverMode).Trim().ToLowerInvariant() }
+                if ($coverMode -notin @('first', 'custom', 'none')) { $coverMode = 'first' }
+                $coverFile = ''
+                if ($null -ne $chapterInfo.PSObject.Properties['coverFile']) { $coverFile = ([string]$chapterInfo.coverFile).Trim() }
+                $coverInfo = [pscustomobject]@{ Folder = $chapterFolder; Mode = $coverMode; File = $coverFile }
                 $orderMap[$chapterFolder] = $readingOrder
                 $normalizedOrderMap[$normalizedKey] = [pscustomobject]@{ Folder = $chapterFolder; Order = $readingOrder }
+                $chapterCoverMap[$chapterFolder] = $coverInfo
+                $chapterCoverNormalizedMap[$normalizedKey] = $coverInfo
                 $usedOrders[[string]$readingOrder] = $true
             }
             if ($orderErrors.Count -gt 0) {
@@ -886,6 +2133,8 @@ function Get-ComicMetadata {
                 $result.ReadingOrderEnabled = $true
                 $result.ReadingOrderMap = $orderMap
                 $result.ReadingOrderNormalizedMap = $normalizedOrderMap
+                $result.ChapterCoverMap = $chapterCoverMap
+                $result.ChapterCoverNormalizedMap = $chapterCoverNormalizedMap
             }
         }
     }
@@ -895,8 +2144,118 @@ function Get-ComicMetadata {
     return [pscustomobject]$result
 }
 
+function Set-JsonObjectProperty {
+    param([object]$Object, [string]$Name, [AllowNull()][object]$Value)
+    if ($null -eq $Object.PSObject.Properties[$Name]) {
+        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+    else {
+        $Object.$Name = $Value
+    }
+}
+
+function Write-JsonFileAtomic {
+    param([string]$Path, [object]$Value)
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    $temporaryPath = Join-Path $directory ('.metadata-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $json = $Value | ConvertTo-Json -Depth 20
+        [IO.File]::WriteAllText($temporaryPath, $json, $script:Utf8NoBom)
+        [IO.File]::Copy($temporaryPath, $Path, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) { Remove-Item -LiteralPath $temporaryPath -Force }
+    }
+}
+
+function Sync-ChapterCoverSettingsToMetadata {
+    param(
+        [object]$Comic,
+        [ValidateSet('first', 'custom', 'none')][string]$Mode,
+        [hashtable]$ChapterCustomCoverMap = @{}
+    )
+    $metadataPath = Join-Path $Comic.FullName '元数据.json'
+    if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
+        try {
+            $metadata = [IO.File]::ReadAllText($metadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        }
+        catch {
+            throw ('为保护原内容，章节封面设置未写入无法解析的元数据：{0}。{1}' -f $metadataPath, $_.Exception.Message)
+        }
+    }
+    else {
+        $metadata = [pscustomobject][ordered]@{
+            name = [string]$Comic.Name
+            author = @()
+            description = [string]$Comic.Description
+        }
+    }
+
+    $existingInfos = @()
+    if ($null -ne $metadata.PSObject.Properties['chapterInfos']) { $existingInfos = @($metadata.chapterInfos) }
+    $existingByKey = @{}
+    foreach ($info in $existingInfos) {
+        $folder = if ($null -ne $info.PSObject.Properties['chapterFolder']) { [string]$info.chapterFolder } elseif ($null -ne $info.PSObject.Properties['chapterTitle']) { [string]$info.chapterTitle } else { '' }
+        $key = Get-WindowsChapterNameMatchKey -Value $folder
+        if (-not [string]::IsNullOrWhiteSpace($key) -and -not $existingByKey.ContainsKey($key)) { $existingByKey[$key] = $info }
+    }
+    $customByKey = @{}
+    foreach ($chapterName in @($ChapterCustomCoverMap.Keys)) {
+        $relativePath = ([string]$ChapterCustomCoverMap[$chapterName]).Trim()
+        $key = Get-WindowsChapterNameMatchKey -Value ([string]$chapterName)
+        if (-not [string]::IsNullOrWhiteSpace($key) -and (Test-SafeRelativePath -Value $relativePath)) { $customByKey[$key] = $relativePath }
+    }
+
+    $chapterInfos = New-Object 'System.Collections.Generic.List[object]'
+    for ($index = 0; $index -lt $Comic.Chapters.Count; $index++) {
+        $chapter = $Comic.Chapters[$index]
+        $key = Get-WindowsChapterNameMatchKey -Value ([string]$chapter.Name)
+        $info = if ($existingByKey.ContainsKey($key)) { $existingByKey[$key] } else { [pscustomobject][ordered]@{} }
+        Set-JsonObjectProperty -Object $info -Name 'chapterTitle' -Value ([string]$chapter.Name)
+        Set-JsonObjectProperty -Object $info -Name 'chapterFolder' -Value ([string]$chapter.Name)
+        Set-JsonObjectProperty -Object $info -Name 'displayNumber' -Value ([string]$chapter.Number)
+        Set-JsonObjectProperty -Object $info -Name 'displayLabel' -Value ([string]$chapter.ChapterLabel)
+        Set-JsonObjectProperty -Object $info -Name 'order' -Value ($index + 1)
+
+        $coverMode = $Mode
+        $coverFile = ''
+        if ($Mode -eq 'custom') {
+            if ($customByKey.ContainsKey($key)) {
+                $coverMode = 'custom'
+                $coverFile = [string]$customByKey[$key]
+            }
+            else {
+                $existingMode = if ($null -ne $info.PSObject.Properties['coverMode']) { ([string]$info.coverMode).Trim().ToLowerInvariant() } else { 'first' }
+                $existingFile = if ($null -ne $info.PSObject.Properties['coverFile']) { ([string]$info.coverFile).Trim() } else { '' }
+                if ($existingMode -eq 'custom' -and (Test-SafeRelativePath -Value $existingFile)) {
+                    $coverMode = 'custom'
+                    $coverFile = $existingFile
+                }
+                else { $coverMode = 'first' }
+            }
+        }
+        Set-JsonObjectProperty -Object $info -Name 'coverMode' -Value $coverMode
+        Set-JsonObjectProperty -Object $info -Name 'coverFile' -Value $coverFile
+        $chapterInfos.Add($info)
+    }
+
+    $readerOptions = if ($null -ne $metadata.PSObject.Properties['readerOptions'] -and $null -ne $metadata.readerOptions) { $metadata.readerOptions } else { [pscustomobject][ordered]@{} }
+    Set-JsonObjectProperty -Object $readerOptions -Name 'showChapterCovers' -Value ($Mode -ne 'none')
+    Set-JsonObjectProperty -Object $metadata -Name 'readerOptions' -Value $readerOptions
+    # Windows PowerShell 5.1 may throw "Argument types do not match" when a
+    # generic List[object] is expanded through @(...). Convert it explicitly.
+    Set-JsonObjectProperty -Object $metadata -Name 'chapterInfos' -Value ([object[]]$chapterInfos.ToArray())
+    Set-JsonObjectProperty -Object $metadata -Name 'name' -Value ([string]$Comic.Name)
+    Write-JsonFileAtomic -Path $metadataPath -Value $metadata
+}
+
 function Get-ComicAudit {
-    param([System.IO.DirectoryInfo]$ComicDirectory)
+    param(
+        [System.IO.DirectoryInfo]$ComicDirectory,
+        [AllowNull()][Nullable[bool]]$ShowChapterCoversOverride = $null,
+        [ValidateSet('', 'metadata', 'first', 'custom', 'none')][string]$ChapterCoverOverrideMode = '',
+        [hashtable]$ChapterCustomCoverMap = @{}
+    )
 
     $errors = New-Object 'System.Collections.Generic.List[string]'
     $warnings = New-Object 'System.Collections.Generic.List[string]'
@@ -915,8 +2274,22 @@ function Get-ComicAudit {
     }
 
     $metadata = Get-ComicMetadata -ComicPath $ComicDirectory.FullName
+    $normalizedUpdaterCustomCovers = @{}
+    foreach ($customChapterName in @($ChapterCustomCoverMap.Keys)) {
+        $relativeCustomCover = ([string]$ChapterCustomCoverMap[$customChapterName]).Trim()
+        if (-not (Test-SafeRelativePath -Value $relativeCustomCover)) { continue }
+        $normalizedCustomName = Get-WindowsChapterNameMatchKey -Value ([string]$customChapterName)
+        if (-not [string]::IsNullOrWhiteSpace($normalizedCustomName)) {
+            $normalizedUpdaterCustomCovers[$normalizedCustomName] = $relativeCustomCover
+        }
+    }
+    $chapterCoverPolicy = if ([string]::IsNullOrWhiteSpace($ChapterCoverOverrideMode)) { 'metadata' } else { $ChapterCoverOverrideMode }
+    if ($null -ne $ShowChapterCoversOverride) {
+        $chapterCoverPolicy = if ([bool]$ShowChapterCoversOverride) { 'first' } else { 'none' }
+    }
+    $showChapterCovers = if ($chapterCoverPolicy -eq 'metadata') { [bool]$metadata.ShowChapterCovers } else { $chapterCoverPolicy -ne 'none' }
     $chapterDrafts = @()
-    $allDirs = @(Get-ChildItem -LiteralPath $ComicDirectory.FullName -Directory)
+    $allDirs = @(Get-ChildItem -LiteralPath $ComicDirectory.FullName -Directory | Where-Object { $_.Name -ine $script:ReaderResourceFolderName })
     foreach ($dir in $allDirs) {
         $hasChapterImages = @(Get-ChildItem -LiteralPath $dir.FullName -File -ErrorAction SilentlyContinue | Where-Object {
             $script:ImageExtensions -contains $_.Extension.ToLowerInvariant() -and $_.BaseName -ine 'cover'
@@ -1067,6 +2440,8 @@ function Get-ComicAudit {
             Key = Get-StableKey -Value ($ComicDirectory.Name + '/' + $draft.Name)
             Images = $sortedImages
             ImageCount = $sortedImages.Count
+            DirectoryCoverMode = 'none'
+            DirectoryCoverHref = ''
         }
     }
 
@@ -1123,6 +2498,68 @@ function Get-ComicAudit {
         $chapters = @($chapters | Sort-Object NaturalSortKey, Name)
     }
 
+    if ($showChapterCovers) {
+        foreach ($chapter in $chapters) {
+            $coverInfo = $null
+            if ($metadata.ChapterCoverMap.ContainsKey($chapter.Name)) {
+                $coverInfo = $metadata.ChapterCoverMap[$chapter.Name]
+            }
+            else {
+                $normalizedChapterName = Get-WindowsChapterNameMatchKey -Value $chapter.Name
+                if ($metadata.ChapterCoverNormalizedMap.ContainsKey($normalizedChapterName)) {
+                    $coverInfo = $metadata.ChapterCoverNormalizedMap[$normalizedChapterName]
+                }
+            }
+            $updaterCustomCoverFile = ''
+            if ($ChapterCustomCoverMap.ContainsKey($chapter.Name)) {
+                $updaterCustomCoverFile = ([string]$ChapterCustomCoverMap[$chapter.Name]).Trim()
+            }
+            elseif ($chapterCoverPolicy -eq 'custom') {
+                $normalizedChapterName = Get-WindowsChapterNameMatchKey -Value $chapter.Name
+                if ($normalizedUpdaterCustomCovers.ContainsKey($normalizedChapterName)) {
+                    $updaterCustomCoverFile = [string]$normalizedUpdaterCustomCovers[$normalizedChapterName]
+                }
+            }
+            $directoryCoverMode = switch ($chapterCoverPolicy) {
+                'first' { 'first' }
+                'custom' {
+                    if (-not [string]::IsNullOrWhiteSpace($updaterCustomCoverFile)) { 'custom' }
+                    elseif ($null -ne $coverInfo -and [string]$coverInfo.Mode -eq 'custom') { 'custom' }
+                    else { 'first' }
+                }
+                default { if ($null -eq $coverInfo) { 'first' } else { [string]$coverInfo.Mode } }
+            }
+            if ($directoryCoverMode -eq 'none') {
+                $chapter.DirectoryCoverMode = 'none'
+                continue
+            }
+            if ($directoryCoverMode -eq 'custom') {
+                $relativeCoverFile = if (-not [string]::IsNullOrWhiteSpace($updaterCustomCoverFile)) {
+                    $updaterCustomCoverFile
+                }
+                elseif ($null -eq $coverInfo) { '' }
+                else { [string]$coverInfo.File }
+                $resolvedCoverFile = Resolve-SafeChildPath -Root $ComicDirectory.FullName -RelativePath $relativeCoverFile
+                if ([string]::IsNullOrWhiteSpace($resolvedCoverFile) -or -not (Test-Path -LiteralPath $resolvedCoverFile -PathType Leaf)) {
+                    $errors.Add(('{0}：自定义章节封面不存在或路径不安全：{1}' -f $chapter.Name, $relativeCoverFile))
+                    continue
+                }
+                $coverFileInfo = Get-Item -LiteralPath $resolvedCoverFile
+                if ($script:ImageExtensions -notcontains $coverFileInfo.Extension.ToLowerInvariant() -or $coverFileInfo.Length -eq 0) {
+                    $errors.Add(('{0}：自定义章节封面不是有效图片：{1}' -f $chapter.Name, $relativeCoverFile))
+                    continue
+                }
+                $chapter.DirectoryCoverMode = 'custom'
+                $chapter.DirectoryCoverHref = ConvertTo-RelativeUrlPath -Value $relativeCoverFile
+                continue
+            }
+            if ($chapter.Images.Count -gt 0) {
+                $chapter.DirectoryCoverMode = 'first'
+                $chapter.DirectoryCoverHref = Get-ChapterImageHref -Chapter $chapter -Image $chapter.Images[0]
+            }
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace($coverRelativeHref)) {
         if ($chapters.Count -gt 0 -and $chapters[0].Images.Count -gt 0) {
             $coverChapter = $chapters[0]
@@ -1155,6 +2592,7 @@ function Get-ComicAudit {
         TotalImages = $totalImages
         Author = $metadata.Author
         Description = $metadata.Description
+        ShowChapterCovers = $showChapterCovers
         Errors = @($errors)
         Warnings = @($warnings)
         IsValid = ($errors.Count -eq 0)
@@ -1446,17 +2884,18 @@ function Get-RootTemplate {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>本地漫画阅读器</title>
+<title>__PAGE_TITLE__</title>
 <style>
   :root { color-scheme:dark; --bg:#17191f; --panel:#22252a; --line:#484a50; --text:#f2f3f5; --muted:#a7a8ac; --accent:#7cc4ff; --control-bg:#303238; --control-hover:#41444b; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei UI",sans-serif; }
-  .wrap { width:min(1180px,100%); margin:0 auto; padding:28px 18px 54px; }
-  .top { position:sticky; top:0; z-index:30; display:flex; gap:18px; align-items:flex-end; justify-content:space-between; flex-wrap:wrap; margin:-12px -12px 0; padding:12px; background:var(--bg); border-bottom:1px solid var(--line); box-shadow:0 8px 18px rgba(0,0,0,.2); }
+  .wrap { width:min(1180px,calc(100% - 24px)); margin:0 auto; padding:24px 0 54px; }
+  .top { position:sticky; top:0; z-index:30; display:flex; gap:18px; align-items:flex-end; justify-content:space-between; flex-wrap:wrap; margin:-12px 0 0; padding:12px 14px; background:var(--bg); border-bottom:1px solid var(--line); box-shadow:0 8px 18px rgba(0,0,0,.2); }
   h1 { margin:0; font-size:clamp(28px,5vw,44px); }
   .sub { margin:9px 0 0; color:var(--muted); line-height:1.7; }
   .tools { display:flex; gap:10px; flex-wrap:wrap; }
-  button,.button,.theme-select { border:1px solid var(--line); border-radius:11px; padding:10px 14px; background:var(--control-bg); color:var(--text); text-decoration:none; cursor:pointer; font:inherit; }
+  button,.button,.theme-select,.search-input { border:1px solid var(--line); border-radius:11px; padding:10px 14px; background:var(--control-bg); color:var(--text); text-decoration:none; cursor:pointer; font:inherit; }
+  .search-input { width:min(260px,70vw); cursor:text; }
   button:hover,.button:hover,.theme-select:hover { background:var(--control-hover); }
   .color-tool { display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:11px; padding:6px 10px; background:var(--control-bg); color:var(--text); cursor:pointer; }
   .color-tool input { width:30px; height:26px; padding:0; border:0; background:transparent; cursor:pointer; }
@@ -1472,19 +2911,23 @@ function Get-RootTemplate {
   .theme-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:9px; }
   .theme-hint { display:block; margin-top:12px; color:var(--muted); line-height:1.55; }
   .continue { border-color:var(--accent); color:var(--accent); background:var(--control-bg); }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:18px; margin-top:26px; }
-  .card { overflow:hidden; border:1px solid var(--line); border-radius:18px; background:var(--panel); box-shadow:0 14px 30px rgba(0,0,0,.22); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:16px; margin-top:24px; }
+  .card { min-width:0; overflow:hidden; border:1px solid var(--line); border-radius:14px; background:var(--panel); box-shadow:0 10px 24px rgba(0,0,0,.2); }
   .cover-link { display:block; aspect-ratio:3/4; background:#111; overflow:hidden; }
   .cover { display:block; width:100%; height:100%; object-fit:cover; transition:transform .25s ease; }
   .cover-link:hover .cover { transform:scale(1.025); }
-  .card-body { padding:16px; }
-  h2 { margin:0 0 8px; font-size:20px; line-height:1.35; }
-  .meta { color:var(--muted); font-size:14px; margin:0 0 9px; }
-  .progress { color:var(--accent); min-height:1.5em; margin:0 0 14px; line-height:1.5; }
-  .actions { display:flex; gap:9px; flex-wrap:wrap; }
+  .card-body { padding:9px 10px 10px; }
+  h2 { display:-webkit-box; min-height:4.05em; margin:0 0 4px; overflow:hidden; font-size:15px; line-height:1.35; -webkit-line-clamp:3; -webkit-box-orient:vertical; }
+  .meta { overflow:hidden; color:var(--muted); font-size:11px; margin:0 0 4px; text-overflow:ellipsis; white-space:nowrap; }
+  .progress { min-height:1.35em; margin:0 0 6px; overflow:hidden; color:var(--accent); font-size:11px; line-height:1.35; text-overflow:ellipsis; white-space:nowrap; }
+  .actions { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+  .actions .button { min-width:0; padding:7px 5px; overflow:hidden; font-size:11px; text-align:center; text-overflow:ellipsis; white-space:nowrap; }
   .primary { color:#101419; background:#f1f3f5; border-color:#f1f3f5; }
+  .collection-badge { display:inline-block; margin:0 0 7px; padding:3px 8px; border:1px solid var(--accent); border-radius:999px; color:var(--accent); font-size:11px; }
+  .collection-description { display:-webkit-box; min-height:2.8em; margin:0 0 10px; overflow:hidden; color:var(--muted); font-size:12px; line-height:1.4; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
   .note { margin-top:28px; padding:15px 17px; border:1px solid var(--line); border-radius:14px; background:var(--panel); color:var(--muted); line-height:1.75; }
-  @media (max-width:540px) { .wrap{padding:20px 12px 40px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card-body{padding:12px}h2{font-size:16px}.cover-link{aspect-ratio:3/4}.actions{display:block}.actions .button{display:block;text-align:center;margin-top:8px} }
+  @media (max-width:720px) { .wrap{width:100%;padding:18px 10px 40px}.top{margin:-8px 0 0}.grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.card-body{padding:8px}h2{font-size:14px}.actions{grid-template-columns:1fr}.actions .button{font-size:11px}.collection-description{display:none} }
+  @media (max-width:460px) { .grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
 </style>
 </head>
 <body>
@@ -1492,10 +2935,12 @@ function Get-RootTemplate {
 <main class="wrap">
   <div class="top">
     <div>
-      <h1>本地漫画阅读器</h1>
-      <p class="sub">按漫画名称排列，共 __COMIC_COUNT__ 部。阅读进度只保存在当前浏览器。</p>
+      <h1>__HEADING__</h1>
+      <p class="sub">__SUBTITLE__</p>
     </div>
     <div class="tools">
+__BACK_LINK__
+      <input id="catalogSearch" class="search-input" type="search" placeholder="搜索漫画或合集" aria-label="搜索漫画或合集">
 __THEME_CONTROLS__
       <button id="continueLast" class="continue" type="button">继续上次阅读</button>
       <button id="clearProgress" type="button">清除全部进度</button>
@@ -1504,17 +2949,18 @@ __THEME_CONTROLS__
   <section class="grid">
 __CARDS__
   </section>
-  <div class="note">生成时间：__GENERATED_AT__。以后下载新漫画后，双击根目录的“漫画更新器.vbs”，勾选需要加入的文件夹即可同步更新。</div>
+  <div class="note">__NOTE__</div>
 </main>
 <script>
 (() => {
 __THEME_RUNTIME__
+  const generatorConfig = (() => { try { return JSON.parse(document.getElementById('local-comic-generator-config').textContent || '{}'); } catch (_) { return {}; } })();
   const STORAGE_KEY = 'local_comic_reader_progress_v1';
   const readState = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch (_) { return {}; } };
   const state = readState();
   const pages = state.pages || {};
   const lastByComic = state.lastByComic || {};
-  document.querySelectorAll('.card').forEach(card => {
+  document.querySelectorAll('.card[data-comic-key]').forEach(card => {
     const comicKey = card.dataset.comicKey;
     const chapterKey = lastByComic[comicKey];
     const saved = chapterKey && pages[comicKey + '/' + chapterKey];
@@ -1532,14 +2978,25 @@ __THEME_RUNTIME__
       link.textContent = '开始阅读';
     }
   });
+  const searchInput = document.getElementById('catalogSearch');
+  searchInput.addEventListener('input', () => {
+    const query = searchInput.value.trim().toLocaleLowerCase();
+    document.querySelectorAll('.card').forEach(card => {
+      const searchable = (card.dataset.search || card.textContent || '').toLocaleLowerCase();
+      card.hidden = query && !searchable.includes(query);
+    });
+  });
   document.getElementById('continueLast').addEventListener('click', () => {
     const last = state.last || {};
     const saved = last.comicKey && last.chapterKey && pages[last.comicKey + '/' + last.chapterKey];
     const card = last.comicKey && document.querySelector('.card[data-comic-key="' + last.comicKey + '"]');
-    let readerMap = {};
-    try { readerMap = card ? JSON.parse(card.dataset.readerMap || '{}') : {}; } catch (_) {}
-    const target = saved && (readerMap[last.chapterKey] || saved.rootHref);
-    location.href = saved ? (target + '#' + saved.pageId) : document.querySelector('.card').dataset.firstHref;
+    let readerData = card ? { firstHref: card.dataset.firstHref, readerMap: {} } : ((generatorConfig.readers || {})[last.comicKey] || null);
+    if (card) { try { readerData.readerMap = JSON.parse(card.dataset.readerMap || '{}'); } catch (_) {} }
+    const target = saved && readerData && ((readerData.readerMap || {})[last.chapterKey] || saved.rootHref);
+    const firstComicCard = document.querySelector('.card[data-comic-key]');
+    if (saved && target) location.href = target + '#' + saved.pageId;
+    else if (readerData && readerData.firstHref) location.href = readerData.firstHref;
+    else if (firstComicCard) location.href = firstComicCard.dataset.firstHref;
   });
   document.getElementById('clearProgress').addEventListener('click', () => {
     if (!confirm('确定清除全部漫画的阅读进度吗？')) return;
@@ -1566,9 +3023,9 @@ function Get-ComicTemplate {
   :root { color-scheme:dark; --bg:#17191f; --panel:#22252a; --line:#484a50; --text:#f2f3f5; --muted:#a7a8ac; --accent:#7cc4ff; --control-bg:#303238; --control-hover:#41444b; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei UI",sans-serif; }
-  .wrap { width:min(1080px,100%); margin:auto; padding:22px 16px 50px; }
+  .wrap { width:min(1180px,calc(100% - 24px)); margin:auto; padding:22px 0 50px; }
   a { color:inherit; }
-  .page-toolbar { position:sticky; top:0; z-index:30; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:-10px -10px 17px; padding:10px; background:var(--bg); border-bottom:1px solid var(--line); box-shadow:0 8px 18px rgba(0,0,0,.2); }
+  .page-toolbar { position:sticky; top:0; z-index:30; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:-10px 0 17px; padding:10px 14px; background:var(--bg); border-bottom:1px solid var(--line); box-shadow:0 8px 18px rgba(0,0,0,.2); }
   .back { display:inline-block; color:var(--muted); text-decoration:none; }
   .theme-tools { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
   .hero { display:grid; grid-template-columns:190px 1fr; gap:24px; align-items:start; }
@@ -1595,12 +3052,17 @@ function Get-ComicTemplate {
   .primary { color:#101419; background:#f1f3f5; border-color:#f1f3f5; }
   h2 { margin:32px 0 15px; }
   .chapters { display:grid; grid-template-columns:repeat(auto-fit,minmax(290px,1fr)); gap:10px; }
-  .chapter { display:block; padding:14px 15px; background:var(--panel); border:1px solid var(--line); border-radius:12px; text-decoration:none; }
+  .chapter { display:block; padding:14px 15px; background:var(--panel); border:1px solid var(--line); border-radius:12px; text-decoration:none; overflow:hidden; }
+  .chapter.has-cover { display:grid; grid-template-columns:92px minmax(0,1fr); align-items:stretch; min-height:123px; padding:0; }
+  .chapter-cover-frame { display:block; width:92px; aspect-ratio:3/4; overflow:hidden; background:#111; border-right:1px solid var(--line); }
+  .chapter-cover { display:block; width:100%; height:100%; object-fit:contain; }
+  .chapter-body { display:block; }
+  .chapter.has-cover .chapter-body { display:flex; min-width:0; flex-direction:column; justify-content:center; padding:14px 15px; }
   .chapter:hover { border-color:var(--accent); background:var(--control-hover); }
   .chapter-title { display:block; line-height:1.45; }
   .chapter-meta { display:block; margin-top:7px; color:var(--muted); font-size:13px; }
   .chapter-progress { display:block; margin-top:5px; min-height:1.35em; color:var(--accent); font-size:13px; }
-  @media (max-width:620px) { .hero{grid-template-columns:105px 1fr;gap:15px}.desc{grid-column:1/-1}.chapters{grid-template-columns:1fr}.wrap{padding:16px 12px 40px} }
+  @media (max-width:620px) { .hero{grid-template-columns:105px 1fr;gap:15px}.desc{grid-column:1/-1}.chapters{grid-template-columns:1fr}.wrap{width:100%;padding:16px 12px 40px}.chapter.has-cover{grid-template-columns:72px minmax(0,1fr);min-height:96px}.chapter-cover-frame{width:72px} }
 </style>
 </head>
 <body>
@@ -1674,8 +3136,8 @@ function Get-ReaderTemplate {
   * { box-sizing:border-box; }
   html { scroll-behavior:smooth; scroll-padding-top:64px; background:var(--bg); }
   body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei UI",sans-serif; }
-  .intro { position:sticky; top:0; z-index:30; width:100%; padding:7px 10px; background:var(--bg); border-bottom:1px solid var(--line); box-shadow:0 6px 15px rgba(0,0,0,.24); }
-  .reader-bar { display:flex; align-items:center; gap:10px; width:min(1500px,100%); margin:0 auto; overflow-x:auto; white-space:nowrap; scrollbar-width:thin; }
+  .intro { position:sticky; top:0; z-index:30; width:min(1180px,calc(100% - 24px)); margin:0 auto; padding:7px 14px; background:var(--bg); border-bottom:1px solid var(--line); box-shadow:0 6px 15px rgba(0,0,0,.24); }
+  .reader-bar { display:flex; align-items:center; gap:10px; width:100%; margin:0 auto; overflow-x:auto; white-space:nowrap; scrollbar-width:thin; }
   .chapter-info { flex:0 0 auto; color:var(--muted); font-size:14px; font-weight:700; }
   .nav { display:flex; flex-wrap:wrap; gap:8px; }
   .intro .nav { flex:0 0 auto; flex-wrap:nowrap; align-items:center; }
@@ -1698,10 +3160,24 @@ function Get-ReaderTemplate {
   img.page { display:block; width:100%; max-width:none; height:auto; margin:0; padding:0; border:0; vertical-align:top; scroll-margin-top:64px; background:#111; }
   .image-error { display:flex; align-items:center; justify-content:center; width:100%; min-height:180px; padding:20px; background:#3a1111; color:#ffd2d2; font:16px/1.6 sans-serif; text-align:center; }
   .ending { width:min(980px,100%); margin:0 auto; padding:18px 14px 72px; background:var(--panel); }
-  .hud { position:fixed; right:10px; bottom:10px; z-index:20; display:flex; gap:8px; align-items:center; padding:7px 9px; border:1px solid var(--line); border-radius:12px; background:var(--panel); color:var(--text); font-size:13px; line-height:1; }
+  .hud { position:fixed; right:10px; bottom:10px; z-index:20; display:flex; gap:7px; align-items:center; padding:7px 9px; border:1px solid var(--line); border-radius:12px; background:var(--panel); color:var(--text); font-size:13px; line-height:1; }
   .hud button { border:0; border-radius:8px; padding:7px 9px; background:var(--control-bg); color:var(--text); cursor:pointer; }
+  .hud input { width:58px; border:1px solid var(--line); border-radius:8px; padding:6px 7px; background:var(--control-bg); color:var(--text); text-align:center; font:13px/1 inherit; }
+  .side-tools { position:fixed; top:50%; right:12px; z-index:22; display:flex; flex-direction:column; gap:7px; transform:translateY(-50%); padding:8px; border:1px solid var(--line); border-radius:13px; background:var(--panel); box-shadow:0 10px 26px rgba(0,0,0,.28); }
+  .side-tools a,.side-tools button { min-width:56px; border:0; border-radius:8px; padding:8px 7px; background:var(--control-bg); color:var(--text); text-align:center; text-decoration:none; cursor:pointer; font:12px/1.2 inherit; }
+  .side-tools a:hover,.side-tools button:hover { background:var(--control-hover); }
+  .side-tools button:disabled { opacity:.4; cursor:not-allowed; }
+  .side-toc[hidden] { display:none!important; }
+  .side-toc { position:fixed; top:50%; right:88px; z-index:24; width:min(310px,calc(100vw - 112px)); max-height:min(72vh,680px); overflow:hidden; transform:translateY(-50%); border:1px solid var(--line); border-radius:14px; background:var(--panel); box-shadow:0 16px 42px rgba(0,0,0,.42); }
+  .side-toc-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px; border-bottom:1px solid var(--line); }
+  .side-toc-head a,.side-toc-head button { border:0; border-radius:8px; padding:8px 10px; background:var(--control-bg); color:var(--text); text-decoration:none; cursor:pointer; font:13px/1.2 inherit; }
+  .side-toc-list { max-height:calc(min(72vh,680px) - 58px); overflow:auto; padding:8px; }
+  .side-toc-list a { display:block; overflow:hidden; margin:2px 0; border-radius:8px; padding:9px 10px; color:var(--text); text-decoration:none; text-overflow:ellipsis; white-space:nowrap; }
+  .side-toc-list a:hover { background:var(--control-hover); }
+  .side-toc-list a.current { background:var(--control-bg); color:var(--accent); font-weight:700; }
   .ending { padding-bottom:72px; }
-  @media (max-width:600px) { .intro{padding:6px}.reader-bar{gap:7px}.chapter-info{font-size:13px}.hud{right:6px;bottom:6px} }
+  @media (max-width:1120px) { .side-tools,.side-toc{display:none!important} }
+  @media (max-width:600px) { .intro{padding:6px 10px}.reader-bar{gap:7px}.chapter-info{font-size:13px}.hud{right:6px;bottom:6px} }
 </style>
 </head>
 <body>
@@ -1728,17 +3204,31 @@ __IMAGES__
   <nav class="nav">
     __PREV_BOTTOM__
     <a href="index.html">章节目录</a>
+    <a href="../__LAUNCHER_URL__">全部漫画</a>
     __NEXT_BOTTOM__
     <button id="goTop" type="button">回到顶部</button>
   </nav>
 </footer>
-<div class="hud"><span id="pageStatus">1 / __TOTAL__</span><button id="hudTop" type="button">顶部</button></div>
+<div class="hud"><input id="pageJump" type="number" min="1" max="__TOTAL__" value="1" inputmode="numeric" aria-label="输入当前页码"><span>/ __TOTAL__</span><button id="pageJumpButton" type="button">跳转</button></div>
+<aside class="side-tools" aria-label="阅读快捷工具">
+  <button id="sidePrev" type="button">上一话</button>
+  <button id="sideTocButton" type="button" aria-expanded="false" aria-controls="sideTocPanel">目录</button>
+  <button id="sideNext" type="button">下一话</button>
+  <button id="sideZoomOut" type="button">缩小</button>
+  <button id="sideZoomIn" type="button">放大</button>
+  <button id="sideTop" type="button">顶部</button>
+  <button id="sideBottom" type="button">底部</button>
+</aside>
+<section id="sideTocPanel" class="side-toc" aria-label="章节列表" hidden>
+  <div class="side-toc-head"><a href="index.html">回到漫画目录页</a><button id="sideTocClose" type="button" aria-label="关闭章节列表">关闭</button></div>
+  <div id="sideTocList" class="side-toc-list"></div>
+</section>
 <script>
 (() => {
   const config = __READER_CONFIG__;
   const STORAGE_KEY = 'local_comic_reader_progress_v1';
   const images = [...document.querySelectorAll('img.page')];
-  const pageStatus = document.getElementById('pageStatus');
+  const pageJump = document.getElementById('pageJump');
   const reader = document.getElementById('reader');
 __THEME_RUNTIME__
   const PREF_KEY = 'local_comic_reader_pref_v1';
@@ -1796,7 +3286,13 @@ __THEME_RUNTIME__
     state.lastByComic[config.comicKey] = config.chapterKey;
     state.last = { comicKey: config.comicKey, chapterKey: config.chapterKey };
     writeState(state);
-    pageStatus.textContent = `${pageIndex} / ${config.totalPages}`;
+    if (document.activeElement !== pageJump) pageJump.value = String(pageIndex);
+  };
+  const jumpToPage = smooth => {
+    const requested = Math.max(1, Math.min(config.totalPages, Math.round(Number(pageJump.value) || 1)));
+    pageJump.value = String(requested);
+    const target = images[requested - 1];
+    if (target) target.scrollIntoView({behavior:smooth ? 'smooth' : 'auto', block:'start'});
   };
   const jumpSaved = smooth => {
     const saved = ((readState().pages || {})[storageId]);
@@ -1820,7 +3316,38 @@ __THEME_RUNTIME__
   }));
   document.getElementById('resumeTop').addEventListener('click', () => jumpSaved(true));
   document.getElementById('goTop').addEventListener('click', () => scrollTo({top:0,behavior:'smooth'}));
-  document.getElementById('hudTop').addEventListener('click', () => scrollTo({top:0,behavior:'smooth'}));
+  document.getElementById('sideTop').addEventListener('click', () => scrollTo({top:0,behavior:'smooth'}));
+  document.getElementById('sideBottom').addEventListener('click', () => scrollTo({top:document.documentElement.scrollHeight,behavior:'smooth'}));
+  const sidePrev = document.getElementById('sidePrev');
+  const sideNext = document.getElementById('sideNext');
+  sidePrev.disabled = !config.previousHref;
+  sideNext.disabled = !config.nextHref;
+  sidePrev.addEventListener('click', () => { if (config.previousHref) location.href = config.previousHref; });
+  sideNext.addEventListener('click', () => { if (config.nextHref) location.href = config.nextHref; });
+  const sideTocButton = document.getElementById('sideTocButton');
+  const sideTocPanel = document.getElementById('sideTocPanel');
+  const sideTocList = document.getElementById('sideTocList');
+  for (const chapter of (config.chapters || [])) {
+    const link = document.createElement('a');
+    link.href = chapter.href;
+    link.textContent = chapter.title;
+    if (chapter.current) { link.className = 'current'; link.setAttribute('aria-current', 'page'); }
+    sideTocList.appendChild(link);
+  }
+  const setSideTocOpen = open => {
+    sideTocPanel.hidden = !open;
+    sideTocButton.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) sideTocList.querySelector('.current')?.scrollIntoView({block:'center'});
+  };
+  sideTocButton.addEventListener('click', event => { event.stopPropagation(); setSideTocOpen(sideTocPanel.hidden); });
+  document.getElementById('sideTocClose').addEventListener('click', () => setSideTocOpen(false));
+  sideTocPanel.addEventListener('click', event => event.stopPropagation());
+  document.addEventListener('click', () => setSideTocOpen(false));
+  pageJump.addEventListener('change', () => jumpToPage(true));
+  document.getElementById('pageJumpButton').addEventListener('click', () => jumpToPage(true));
+  pageJump.addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); jumpToPage(true); pageJump.blur(); }
+  });
   const savedZoom = Number(readPrefs().zoomPercent);
   let zoomIndex = applyZoom(zoomLevels.indexOf(savedZoom), false);
   document.getElementById('zoomOutBtn').addEventListener('click', () => {
@@ -1832,8 +3359,12 @@ __THEME_RUNTIME__
   document.getElementById('zoomResetBtn').addEventListener('click', () => {
     zoomIndex = applyZoom(zoomLevels.indexOf(100), true);
   });
+  document.getElementById('sideZoomOut').addEventListener('click', () => document.getElementById('zoomOutBtn').click());
+  document.getElementById('sideZoomIn').addEventListener('click', () => document.getElementById('zoomInBtn').click());
   addEventListener('resize', () => applyZoom(zoomIndex, false));
   document.addEventListener('keydown', event => {
+    if (event.target && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(event.target.tagName)) return;
+    if (event.key === 'Escape') setSideTocOpen(false);
     if (event.key === 'Home') scrollTo({top:0,behavior:'smooth'});
     if (event.key === 'End') scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
     if (event.key === 'ArrowLeft' && config.previousHref) location.href = config.previousHref;
@@ -1867,7 +3398,8 @@ function New-RootCardHtml {
     $coverHref = $comicSegment + '/' + $Comic.CoverRelativeHref
     $title = ConvertTo-HtmlText $Comic.Name
     $meta = ('{0} 话 · {1} 张图片' -f $Comic.ChapterCount, $Comic.TotalImages)
-    [void]$card.AppendLine(('    <article class="card" data-comic-key="{0}" data-first-href="{1}" data-reader-map="{2}">' -f $Comic.Key, (ConvertTo-HtmlText $firstHref), (ConvertTo-HtmlText $readerMapJson)))
+    $searchText = ($Comic.Name + ' ' + $Comic.Author).Trim()
+    [void]$card.AppendLine(('    <article class="card" data-comic-key="{0}" data-first-href="{1}" data-reader-map="{2}" data-search="{3}">' -f $Comic.Key, (ConvertTo-HtmlText $firstHref), (ConvertTo-HtmlText $readerMapJson), (ConvertTo-HtmlText $searchText)))
     [void]$card.AppendLine(('      <a class="cover-link" href="{0}"><img class="cover" src="{1}" alt="{2} 封面"></a>' -f (ConvertTo-HtmlText $indexHref), (ConvertTo-HtmlText $coverHref), $title))
     [void]$card.AppendLine('      <div class="card-body">')
     [void]$card.AppendLine(('        <h2>{0}</h2>' -f $title))
@@ -1882,20 +3414,176 @@ function New-RootCardHtml {
     return $card.ToString().TrimEnd()
 }
 
+function Get-CardAttributeValue {
+    param(
+        [string]$Html,
+        [string]$AttributeName
+    )
+    $match = [regex]::Match($Html, [regex]::Escape($AttributeName) + '="([^"]*)"', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { return '' }
+    return [Net.WebUtility]::HtmlDecode($match.Groups[1].Value)
+}
+
+function Get-CardCoverHref {
+    param([string]$Html)
+    $match = [regex]::Match($Html, '<img class="cover"\s+src="([^"]+)"', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { return '' }
+    return [Net.WebUtility]::HtmlDecode($match.Groups[1].Value)
+}
+
+function Get-CollectionPageFileName {
+    param([object]$Collection)
+    $title = ([string]$Collection.Title).Trim()
+    $safeTitle = [regex]::Replace($title, '[<>:"/\\|?*\x00-\x1F]', '＿').Trim()
+    $safeTitle = $safeTitle.TrimEnd([char[]]@(' ', '.'))
+    if ([string]::IsNullOrWhiteSpace($safeTitle)) { $safeTitle = '未命名合集' }
+    if ($safeTitle -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { $safeTitle = '_' + $safeTitle }
+    if ($safeTitle.Length -gt 100) {
+        $suffix = (Get-StableKey -Value $title).Substring(0, 10)
+        $safeTitle = $safeTitle.Substring(0, 88).TrimEnd() + '~' + $suffix
+    }
+    return $script:CollectionPagePrefix + $safeTitle + '.html'
+}
+
+function Resolve-CollectionDefinitionsForGeneration {
+    param(
+        [string]$LibraryRoot,
+        [object[]]$Collections,
+        [string[]]$SelectedNames,
+        [hashtable]$CardsByName
+    )
+    $resolved = @()
+    foreach ($collection in @($Collections)) {
+        $members = @($collection.Members | Where-Object { $SelectedNames -contains $_ -and $CardsByName.ContainsKey([string]$_) } | Select-Object -Unique)
+        if ($members.Count -eq 0) {
+            Write-Host ('  警告：合集没有仍在书架中的成员，已暂时忽略：' + $collection.Title) -ForegroundColor Yellow
+            continue
+        }
+        $collection.Members = @($members)
+        if ([string]$collection.CoverMode -eq 'custom' -and -not [string]::IsNullOrWhiteSpace([string]$collection.CoverSourcePath)) {
+            $sourceCover = [string]$collection.CoverSourcePath
+            if (-not (Test-Path -LiteralPath $sourceCover -PathType Leaf)) { throw ('合集自定义封面不存在：' + $sourceCover) }
+            $sourceFile = Get-Item -LiteralPath $sourceCover
+            if ($script:ImageExtensions -notcontains $sourceFile.Extension.ToLowerInvariant() -or $sourceFile.Length -eq 0) {
+                throw ('合集自定义封面不是有效图片：' + $sourceCover)
+            }
+            $coverDirectory = Join-Path (Join-Path $LibraryRoot $script:ReaderResourceFolderName) $script:CollectionCoverFolderName
+            if (-not (Test-Path -LiteralPath $coverDirectory -PathType Container)) { [void](New-Item -ItemType Directory -Path $coverDirectory -Force) }
+            $coverName = ([string]$collection.Id) + $sourceFile.Extension.ToLowerInvariant()
+            Copy-Item -LiteralPath $sourceFile.FullName -Destination (Join-Path $coverDirectory $coverName) -Force
+            $collection.CoverFile = $script:ReaderResourceFolderName + '/' + $script:CollectionCoverFolderName + '/' + $coverName
+            $collection.CoverSourcePath = ''
+        }
+        $coverHref = ''
+        if ([string]$collection.CoverMode -eq 'custom') {
+            $resolvedCoverPath = Resolve-SafeChildPath -Root $LibraryRoot -RelativePath ([string]$collection.CoverFile)
+            if ([string]::IsNullOrWhiteSpace($resolvedCoverPath) -or -not (Test-Path -LiteralPath $resolvedCoverPath -PathType Leaf)) {
+                throw ('合集自定义封面文件丢失：' + $collection.Title)
+            }
+            $coverHref = ConvertTo-RelativeUrlPath -Value ([string]$collection.CoverFile)
+        }
+        else {
+            $coverMember = if ([string]$collection.CoverMode -eq 'comic' -and $members -contains [string]$collection.CoverComic) { [string]$collection.CoverComic } else { [string]$members[0] }
+            $collection.CoverComic = $coverMember
+            $coverHref = Get-CardCoverHref -Html ([string]$CardsByName[$coverMember])
+        }
+        if ([string]::IsNullOrWhiteSpace($coverHref)) { throw ('无法取得合集封面：' + $collection.Title) }
+        $resolved += [pscustomobject]@{
+            Definition = $collection
+            Members = @($members)
+            CoverHref = $coverHref
+            PageFile = Get-CollectionPageFileName -Collection $collection
+        }
+    }
+    return @($resolved)
+}
+
+function New-CollectionCardHtml {
+    param([object]$ResolvedCollection)
+    $collection = $ResolvedCollection.Definition
+    $title = ConvertTo-HtmlText $collection.Title
+    $description = [string]$collection.Description
+    if ([string]::IsNullOrWhiteSpace($description)) { $description = '打开合集查看其中的漫画。' }
+    $searchText = (($collection.Title + ' ' + $collection.Description + ' ' + ($ResolvedCollection.Members -join ' '))).Trim()
+    $card = New-Object System.Text.StringBuilder
+    [void]$card.AppendLine(('    <article class="card collection-card" data-collection-key="{0}" data-search="{1}">' -f (ConvertTo-HtmlText $collection.Id), (ConvertTo-HtmlText $searchText)))
+    [void]$card.AppendLine(('      <a class="cover-link" href="{0}"><img class="cover" src="{1}" alt="{2} 封面"></a>' -f (ConvertTo-HtmlText $ResolvedCollection.PageFile), (ConvertTo-HtmlText $ResolvedCollection.CoverHref), $title))
+    [void]$card.AppendLine('      <div class="card-body">')
+    [void]$card.AppendLine(('        <span class="collection-badge">合集 · {0} 部</span>' -f $ResolvedCollection.Members.Count))
+    [void]$card.AppendLine(('        <h2>{0}</h2>' -f $title))
+    [void]$card.AppendLine(('        <p class="collection-description">{0}</p>' -f (ConvertTo-HtmlText $description)))
+    [void]$card.AppendLine(('        <div class="actions"><a class="button primary" href="{0}">打开合集</a></div>' -f (ConvertTo-HtmlText $ResolvedCollection.PageFile)))
+    [void]$card.AppendLine('      </div>')
+    [void]$card.AppendLine('    </article>')
+    return $card.ToString().TrimEnd()
+}
+
+function Get-ReaderDataFromCards {
+    param([hashtable]$CardsByName)
+    $readers = [ordered]@{}
+    foreach ($name in @($CardsByName.Keys | Sort-Object)) {
+        $html = [string]$CardsByName[$name]
+        $comicKey = Get-CardAttributeValue -Html $html -AttributeName 'data-comic-key'
+        if ([string]::IsNullOrWhiteSpace($comicKey)) { continue }
+        $readerMap = [ordered]@{}
+        $readerMapText = Get-CardAttributeValue -Html $html -AttributeName 'data-reader-map'
+        if (-not [string]::IsNullOrWhiteSpace($readerMapText)) {
+            try {
+                $parsedMap = $readerMapText | ConvertFrom-Json
+                foreach ($property in @($parsedMap.PSObject.Properties)) { $readerMap[$property.Name] = [string]$property.Value }
+            }
+            catch {}
+        }
+        $readers[$comicKey] = [ordered]@{
+            firstHref = Get-CardAttributeValue -Html $html -AttributeName 'data-first-href'
+            readerMap = $readerMap
+        }
+    }
+    return $readers
+}
+
+function New-CatalogPage {
+    param(
+        [string]$Path,
+        [string]$Heading,
+        [string]$Subtitle,
+        [string]$CardsHtml,
+        [object]$EmbeddedConfig,
+        [string]$BackLinkHtml,
+        [string]$Note
+    )
+    $template = Get-RootTemplate
+    $content = $template.Replace('__PAGE_TITLE__', (ConvertTo-HtmlText $Heading))
+    $content = $content.Replace('__HEADING__', (ConvertTo-HtmlText $Heading))
+    $content = $content.Replace('__SUBTITLE__', (ConvertTo-HtmlText $Subtitle))
+    $content = $content.Replace('__CARDS__', $CardsHtml)
+    $content = $content.Replace('__BACK_LINK__', $BackLinkHtml)
+    $content = $content.Replace('__NOTE__', (ConvertTo-HtmlText $Note))
+    $content = $content.Replace('__GENERATOR_CONFIG__', (ConvertTo-SafeJson -Value $EmbeddedConfig -Depth 15))
+    $content = $content.Replace('__THEME_CONTROLS__', (Get-ThemeControls).TrimEnd())
+    $content = $content.Replace('__THEME_RUNTIME__', (Get-ThemeRuntime).TrimEnd())
+    Write-GeneratedFile -Path $Path -Content $content
+}
+
 function Get-ExistingRootCards {
     param(
         [string]$LibraryRoot,
         [string[]]$ComicNames
     )
     if (@($ComicNames).Count -eq 0) { return @{} }
-    $path = Join-Path $LibraryRoot $script:LauncherFileName
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    $launcherPath = Join-Path $LibraryRoot $script:LauncherFileName
+    if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
         throw '找不到现有漫画阅读器，无法在“加入 / 更新勾选”模式下保留旧书架；请先使用一次“全部更新”。'
     }
-    $html = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
     $cardsByKey = @{}
-    foreach ($match in [regex]::Matches($html, '<article class="card"\s+data-comic-key="([^"]+)".*?</article>', [Text.RegularExpressions.RegexOptions]::Singleline)) {
-        $cardsByKey[$match.Groups[1].Value] = $match.Value
+    $catalogFiles = @($launcherPath)
+    $catalogFiles += @(Get-ChildItem -LiteralPath $LibraryRoot -File -Filter ($script:CollectionPagePrefix + '*.html') -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    foreach ($catalogFile in @($catalogFiles | Select-Object -Unique)) {
+        $html = [IO.File]::ReadAllText($catalogFile, [Text.Encoding]::UTF8)
+        if (-not $html.StartsWith($script:GeneratorMarker)) { continue }
+        foreach ($match in [regex]::Matches($html, '<article class="card"\s+data-comic-key="([^"]+)".*?</article>', [Text.RegularExpressions.RegexOptions]::Singleline)) {
+            $cardsByKey[$match.Groups[1].Value] = $match.Value
+        }
     }
     $result = @{}
     foreach ($name in @($ComicNames)) {
@@ -1914,39 +3602,87 @@ function New-RootPage {
         [string]$LibraryRoot,
         [string[]]$SelectedNames,
         [bool]$OpenAfterGenerate,
-        [hashtable]$PreservedCards = @{}
+        [hashtable]$PreservedCards = @{},
+        [object[]]$Collections = @(),
+        [hashtable]$ChapterCoverOverrides = @{},
+        [hashtable]$ChapterCustomCovers = @{}
     )
-    $cards = New-Object System.Text.StringBuilder
-    $cardEntries = @()
+    $cardsByName = @{}
     $generatedNames = @{}
     foreach ($comic in @($Comics)) {
         $generatedNames[$comic.Name] = $true
-        $cardEntries += [pscustomobject]@{ Name = $comic.Name; Html = New-RootCardHtml -Comic $comic }
+        $cardsByName[$comic.Name] = New-RootCardHtml -Comic $comic
     }
     foreach ($name in @($PreservedCards.Keys)) {
         if (-not $generatedNames.ContainsKey($name)) {
-            $cardEntries += [pscustomobject]@{ Name = [string]$name; Html = [string]$PreservedCards[$name] }
+            $cardsByName[[string]$name] = [string]$PreservedCards[$name]
         }
     }
-    foreach ($entry in @($cardEntries | Sort-Object Name)) {
-        [void]$cards.AppendLine($entry.Html.TrimEnd())
+    foreach ($selectedName in @($SelectedNames)) {
+        if (-not $cardsByName.ContainsKey($selectedName)) { throw ('缺少书架卡片，无法生成目录：' + $selectedName) }
     }
-
-    $template = Get-RootTemplate
-    $content = $template.Replace('__COMIC_COUNT__', [string]$cardEntries.Count)
-    $content = $content.Replace('__CARDS__', $cards.ToString().TrimEnd())
-    $content = $content.Replace('__GENERATED_AT__', (ConvertTo-HtmlText (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
+    $collectionErrors = @(Test-CollectionDefinitions -Collections $Collections -AvailableNames $SelectedNames)
+    if ($collectionErrors.Count -gt 0) { throw ('合集配置无效：' + ($collectionErrors -join '；')) }
+    $resolvedCollections = @(Resolve-CollectionDefinitionsForGeneration -LibraryRoot $LibraryRoot -Collections $Collections -SelectedNames $SelectedNames -CardsByName $cardsByName)
+    $hiddenNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($resolvedCollection in $resolvedCollections) {
+        if ($resolvedCollection.Definition.HideMembersOnRoot) {
+            foreach ($member in $resolvedCollection.Members) { [void]$hiddenNames.Add([string]$member) }
+        }
+    }
+    $rootCards = New-Object System.Text.StringBuilder
+    foreach ($resolvedCollection in $resolvedCollections) { [void]$rootCards.AppendLine((New-CollectionCardHtml -ResolvedCollection $resolvedCollection)) }
+    foreach ($name in @($SelectedNames | Sort-Object)) {
+        if (-not $hiddenNames.Contains($name)) { [void]$rootCards.AppendLine(([string]$cardsByName[$name]).TrimEnd()) }
+    }
+    $readerData = Get-ReaderDataFromCards -CardsByName $cardsByName
+    $persistedChapterCoverOverrides = [ordered]@{}
+    foreach ($name in $SelectedNames) {
+        if ($ChapterCoverOverrides.ContainsKey($name)) {
+            $mode = [string]$ChapterCoverOverrides[$name]
+            if ($mode -in @('first', 'custom', 'none')) { $persistedChapterCoverOverrides[$name] = $mode }
+        }
+    }
+    $persistedChapterCustomCovers = [ordered]@{}
+    foreach ($name in $SelectedNames) {
+        if (-not $ChapterCustomCovers.ContainsKey($name)) { continue }
+        $safeChapterMap = [ordered]@{}
+        foreach ($chapterName in @($ChapterCustomCovers[$name].Keys | Sort-Object)) {
+            $relativePath = ([string]$ChapterCustomCovers[$name][$chapterName]).Trim()
+            if (Test-SafeRelativePath -Value $relativePath) { $safeChapterMap[[string]$chapterName] = $relativePath }
+        }
+        if ($safeChapterMap.Count -gt 0) { $persistedChapterCustomCovers[$name] = $safeChapterMap }
+    }
     $embeddedConfig = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 7
         selected = @($SelectedNames)
         openAfterGenerate = $OpenAfterGenerate
+        collections = @($resolvedCollections | ForEach-Object { ConvertTo-PersistedCollection -Collection $_.Definition })
+        chapterCoverOverrides = $persistedChapterCoverOverrides
+        chapterCustomCovers = $persistedChapterCustomCovers
+        readers = $readerData
         updatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     }
-    $content = $content.Replace('__GENERATOR_CONFIG__', (ConvertTo-SafeJson -Value $embeddedConfig -Depth 5))
-    $content = $content.Replace('__THEME_CONTROLS__', (Get-ThemeControls).TrimEnd())
-    $content = $content.Replace('__THEME_RUNTIME__', (Get-ThemeRuntime).TrimEnd())
     $path = Join-Path $LibraryRoot $script:LauncherFileName
-    Write-GeneratedFile -Path $path -Content $content
+    $subtitle = '共 {0} 部漫画 · {1} 个合集；合集成员默认只在合集页显示。阅读进度只保存在当前浏览器。' -f $SelectedNames.Count, $resolvedCollections.Count
+    $note = '生成时间：{0}。以后下载新漫画后，双击根目录的“漫画更新器.vbs”即可同步更新。' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    New-CatalogPage -Path $path -Heading '本地漫画阅读器' -Subtitle $subtitle -CardsHtml $rootCards.ToString().TrimEnd() -EmbeddedConfig $embeddedConfig -BackLinkHtml '' -Note $note
+
+    $activeCollectionFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($resolvedCollection in $resolvedCollections) {
+        [void]$activeCollectionFiles.Add($resolvedCollection.PageFile)
+        $collectionCards = New-Object System.Text.StringBuilder
+        foreach ($member in $resolvedCollection.Members) { [void]$collectionCards.AppendLine(([string]$cardsByName[$member]).TrimEnd()) }
+        $collectionPath = Join-Path $LibraryRoot $resolvedCollection.PageFile
+        $backLink = '      <a class="button" href="' + (ConvertTo-HtmlText (ConvertTo-UrlSegment $script:LauncherFileName)) + '">← 返回全部漫画</a>'
+        $collectionSubtitle = '{0} 部漫画。{1}' -f $resolvedCollection.Members.Count, ([string]$resolvedCollection.Definition.Description)
+        New-CatalogPage -Path $collectionPath -Heading ([string]$resolvedCollection.Definition.Title) -Subtitle $collectionSubtitle -CardsHtml $collectionCards.ToString().TrimEnd() -EmbeddedConfig $embeddedConfig -BackLinkHtml $backLink -Note $note
+    }
+    foreach ($oldCollectionPage in @(Get-ChildItem -LiteralPath $LibraryRoot -File -Filter ($script:CollectionPagePrefix + '*.html') -ErrorAction SilentlyContinue)) {
+        if ($activeCollectionFiles.Contains($oldCollectionPage.Name)) { continue }
+        $oldHtml = [IO.File]::ReadAllText($oldCollectionPage.FullName, [Text.Encoding]::UTF8)
+        if ($oldHtml.StartsWith($script:GeneratorMarker)) { Remove-Item -LiteralPath $oldCollectionPage.FullName }
+    }
     return $path
 }
 
@@ -1955,10 +3691,16 @@ function New-ComicIndexPage {
     $chapterHtml = New-Object System.Text.StringBuilder
     foreach ($chapter in $Comic.Chapters) {
         $href = ConvertTo-UrlSegment $chapter.ReaderFile
-        [void]$chapterHtml.AppendLine(('    <a class="chapter" data-chapter-key="{0}" href="{1}">' -f $chapter.Key, (ConvertTo-HtmlText $href)))
+        $chapterClass = if (-not [string]::IsNullOrWhiteSpace([string]$chapter.DirectoryCoverHref)) { 'chapter has-cover' } else { 'chapter' }
+        [void]$chapterHtml.AppendLine(('    <a class="{0}" data-chapter-key="{1}" href="{2}">' -f $chapterClass, $chapter.Key, (ConvertTo-HtmlText $href)))
+        if (-not [string]::IsNullOrWhiteSpace([string]$chapter.DirectoryCoverHref)) {
+            [void]$chapterHtml.AppendLine(('      <span class="chapter-cover-frame"><img class="chapter-cover" loading="lazy" decoding="async" src="{0}" alt="{1} 封面"></span>' -f (ConvertTo-HtmlText $chapter.DirectoryCoverHref), (ConvertTo-HtmlText $chapter.Name)))
+        }
+        [void]$chapterHtml.AppendLine('      <span class="chapter-body">')
         [void]$chapterHtml.AppendLine(('      <span class="chapter-title">{0}</span>' -f (ConvertTo-HtmlText $chapter.Name)))
         [void]$chapterHtml.AppendLine(('      <span class="chapter-meta">{0} 张图片</span>' -f $chapter.ImageCount))
         [void]$chapterHtml.AppendLine('      <span class="chapter-progress">尚未开始</span>')
+        [void]$chapterHtml.AppendLine('      </span>')
         [void]$chapterHtml.AppendLine('    </a>')
     }
 
@@ -2022,6 +3764,13 @@ function New-ChapterReaderPage {
     }
 
     $comicSegment = ConvertTo-UrlSegment $Comic.Name
+    $chapterMenuItems = @($Comic.Chapters | ForEach-Object {
+        [ordered]@{
+            title = [string]$_.Name
+            href = ConvertTo-UrlSegment ([string]$_.ReaderFile)
+            current = ([string]$_.Key -ceq [string]$Chapter.Key)
+        }
+    })
     $readerConfig = [ordered]@{
         comicKey = $Comic.Key
         chapterKey = $Chapter.Key
@@ -2032,6 +3781,7 @@ function New-ChapterReaderPage {
         comicHref = ConvertTo-UrlSegment $Chapter.ReaderFile
         previousHref = $previousHref
         nextHref = $nextHref
+        chapters = $chapterMenuItems
     }
 
     $template = Get-ReaderTemplate
@@ -2068,6 +3818,19 @@ function New-ComicPages {
 function Remove-LegacyChapterPages {
     param([object]$Comic)
     $removed = 0
+    $activeRootPages = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    [void]$activeRootPages.Add('index.html')
+    foreach ($chapter in $Comic.Chapters) { [void]$activeRootPages.Add([string]$chapter.ReaderFile) }
+    foreach ($rootHtmlFile in @(Get-ChildItem -LiteralPath $Comic.FullName -File -Filter '*.html' -ErrorAction SilentlyContinue)) {
+        if ($activeRootPages.Contains($rootHtmlFile.Name)) { continue }
+        $rootHtml = [System.IO.File]::ReadAllText($rootHtmlFile.FullName, [System.Text.Encoding]::UTF8)
+        if (-not $rootHtml.StartsWith($script:GeneratorMarker)) {
+            Write-Host ('  警告：保留非本工具生成的 HTML：' + $rootHtmlFile.FullName) -ForegroundColor Yellow
+            continue
+        }
+        Remove-Item -LiteralPath $rootHtmlFile.FullName
+        $removed++
+    }
     foreach ($chapter in $Comic.Chapters) {
         if ($chapter.IsRootChapter) {
             continue
@@ -2100,6 +3863,17 @@ function Test-GeneratedComic {
         if (-not $indexHtml.Contains($expectedCover)) {
             $problems.Add(('章节目录没有引用核验通过的封面：' + $Comic.CoverRelativeHref))
         }
+        $expectedChapterCovers = @($Comic.Chapters | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.DirectoryCoverHref) })
+        $actualChapterCoverCount = ([regex]::Matches($indexHtml, '<img class="chapter-cover" ')).Count
+        if ($actualChapterCoverCount -ne $expectedChapterCovers.Count) {
+            $problems.Add(('章节目录封面数量不符：应有 {0} 张，实际 {1} 张' -f $expectedChapterCovers.Count, $actualChapterCoverCount))
+        }
+        foreach ($chapterWithCover in $expectedChapterCovers) {
+            $expectedChapterCoverSrc = 'src="' + (ConvertTo-HtmlText $chapterWithCover.DirectoryCoverHref) + '"'
+            if (-not $indexHtml.Contains($expectedChapterCoverSrc)) {
+                $problems.Add(('{0}：章节目录遗漏封面 {1}' -f $chapterWithCover.Name, $chapterWithCover.DirectoryCoverHref))
+            }
+        }
     }
     foreach ($chapter in $Comic.Chapters) {
         $readerPath = Join-Path $Comic.FullName $chapter.ReaderFile
@@ -2127,23 +3901,47 @@ function Invoke-ComicUpdate {
     param(
         [string]$LibraryRoot,
         [string[]]$PreviousSelectedNames,
+        [AllowNull()][string[]]$DesiredSelectedNames = $null,
         [string[]]$CheckedNames,
         [ValidateSet('All', 'Selected')][string]$UpdateMode,
         [bool]$OpenAfterGenerate,
+        [object[]]$Collections = @(),
+        [hashtable]$ChapterCoverOverrides = @{},
+        [hashtable]$ChapterCustomCovers = @{},
+        [switch]$CatalogOnly,
         [switch]$AuditOnlyMode
     )
-    $selectionPlan = Resolve-UpdateSelection -PreviousNames $PreviousSelectedNames -CheckedNames $CheckedNames -UpdateMode $UpdateMode
-    $selectedNames = @($selectionPlan.SelectedNames)
-    $namesToGenerate = @($selectionPlan.NamesToGenerate)
+    $hasDesiredSelection = $PSBoundParameters.ContainsKey('DesiredSelectedNames')
+    if ($hasDesiredSelection) {
+        [string[]]$selectedNames = @($DesiredSelectedNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        [string[]]$namesToGenerate = @()
+        if ($UpdateMode -eq 'All') { $namesToGenerate = @($selectedNames) }
+        else { $namesToGenerate = @($CheckedNames | Where-Object { $selectedNames -contains $_ } | Select-Object -Unique) }
+    }
+    else {
+        $selectionPlan = Resolve-UpdateSelection -PreviousNames $PreviousSelectedNames -CheckedNames $CheckedNames -UpdateMode $UpdateMode
+        $selectedNames = @($selectionPlan.SelectedNames)
+        $namesToGenerate = @($selectionPlan.NamesToGenerate)
+    }
     if ($selectedNames.Count -eq 0) { throw '没有选择任何漫画。' }
-    if ($UpdateMode -eq 'Selected' -and $namesToGenerate.Count -eq 0) { throw '没有可加入或更新的勾选漫画。' }
+    if ($CatalogOnly -and $UpdateMode -ne 'Selected') { throw '仅更新合集目录只能用于“加入 / 更新本次勾选”模式。' }
+    if ($UpdateMode -eq 'Selected' -and $namesToGenerate.Count -eq 0 -and -not $CatalogOnly) { throw '没有可加入或更新的勾选漫画。' }
 
     $preservedCards = @{}
     $namesToAudit = @($selectedNames)
     if ($UpdateMode -eq 'Selected') {
-        $preservedCards = Get-ExistingRootCards -LibraryRoot $LibraryRoot -ComicNames $PreviousSelectedNames
+        $preservedNames = if ($hasDesiredSelection) {
+            @($PreviousSelectedNames | Where-Object { $selectedNames -contains $_ } | Select-Object -Unique)
+        }
+        else { @($PreviousSelectedNames) }
+        $preservedCards = Get-ExistingRootCards -LibraryRoot $LibraryRoot -ComicNames $preservedNames
         $namesToAudit = @($namesToGenerate)
-        Write-Info ('勾选更新模式：保留其他既有漫画，核验并生成 {0} 部勾选漫画（新漫画加入，旧漫画更新）。' -f $namesToAudit.Count)
+        if ($CatalogOnly) {
+            Write-Info '合集配置更新模式：保留全部既有漫画网页，只重建总书架与合集目录页。'
+        }
+        else {
+            Write-Info ('勾选更新模式：保留其他既有漫画，核验并生成 {0} 部勾选漫画（新漫画加入，旧漫画更新）。' -f $namesToAudit.Count)
+        }
     }
 
     $audited = @()
@@ -2157,7 +3955,12 @@ function Invoke-ComicUpdate {
             continue
         }
         Write-Info ('正在核验 {0}/{1}：{2}' -f ($auditIndex + 1), $namesToAudit.Count, $name)
-        $audit = Get-ComicAudit -ComicDirectory (Get-Item -LiteralPath $path)
+        $comicDirectory = Get-Item -LiteralPath $path
+        $comicCustomCovers = if ($ChapterCustomCovers.ContainsKey($name)) { $ChapterCustomCovers[$name] } else { @{} }
+        $audit = if ($ChapterCoverOverrides.ContainsKey($name)) {
+            Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCoverOverrideMode ([string]$ChapterCoverOverrides[$name]) -ChapterCustomCoverMap $comicCustomCovers
+        }
+        else { Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCustomCoverMap $comicCustomCovers }
         if ($audit.IsValid) {
             Write-Good ('核验通过：{0} 话，{1} 张图片' -f $audit.ChapterCount, $audit.TotalImages)
             foreach ($warning in $audit.Warnings) { Write-Host ('  警告：' + $warning) -ForegroundColor Yellow }
@@ -2182,11 +3985,26 @@ function Invoke-ComicUpdate {
             ImageCount = 0
             LauncherCount = 0
             LauncherPath = ''
+            Collections = @($Collections | ForEach-Object { Copy-CollectionDefinition -Collection $_ })
+            ChapterCoverOverrides = Copy-ChapterCoverOverrideMap -Value $ChapterCoverOverrides
+            ChapterCustomCovers = Copy-ChapterCustomCoverMap -Value $ChapterCustomCovers
         }
     }
-    if ($audited.Count -eq 0) { throw '没有任何漫画通过核验，未生成网页。' }
-    $generationTargets = @($audited | Where-Object { $namesToGenerate -contains $_.Name })
-    if ($generationTargets.Count -eq 0) { throw '本次需要生成的漫画均未通过核验，未修改网页。' }
+    if (-not $CatalogOnly -and $audited.Count -eq 0) { throw '没有任何漫画通过核验，未生成网页。' }
+    $generationTargets = @()
+    if (-not $CatalogOnly) { $generationTargets = @($audited | Where-Object { $namesToGenerate -contains $_.Name }) }
+    if (-not $CatalogOnly -and $generationTargets.Count -eq 0) { throw '本次需要生成的漫画均未通过核验，未修改网页。' }
+
+    if (-not $CatalogOnly) {
+        foreach ($comic in $generationTargets) {
+            if (-not $ChapterCoverOverrides.ContainsKey([string]$comic.Name)) { continue }
+            $metadataMode = [string]$ChapterCoverOverrides[[string]$comic.Name]
+            if ($metadataMode -notin @('first', 'custom', 'none')) { continue }
+            $comicCustomCovers = if ($ChapterCustomCovers.ContainsKey([string]$comic.Name)) { $ChapterCustomCovers[[string]$comic.Name] } else { @{} }
+            Write-Info ('正在把章节封面设置写入元数据：' + [string]$comic.Name)
+            Sync-ChapterCoverSettingsToMetadata -Comic $comic -Mode $metadataMode -ChapterCustomCoverMap $comicCustomCovers
+        }
+    }
 
     $generated = @()
     for ($generationIndex = 0; $generationIndex -lt $generationTargets.Count; $generationIndex++) {
@@ -2197,7 +4015,7 @@ function Invoke-ComicUpdate {
             $verifyProblems = @(Test-GeneratedComic -Comic $comic)
             if ($verifyProblems.Count -gt 0) { throw ('生成后复核失败：' + ($verifyProblems -join '；')) }
             $removedLegacyPages = Remove-LegacyChapterPages -Comic $comic
-            if ($removedLegacyPages -gt 0) { Write-Info ('已移除旧位置的章节 index.html：' + $removedLegacyPages + ' 个') }
+            if ($removedLegacyPages -gt 0) { Write-Info ('已移除不再使用的旧版章节网页：' + $removedLegacyPages + ' 个') }
             $generated += $comic
             Write-Good ('生成并复核完成：' + $comic.Name)
         }
@@ -2207,21 +4025,49 @@ function Invoke-ComicUpdate {
         }
     }
 
-    if ($generated.Count -eq 0) { throw '没有任何漫画成功生成，未更新总打开器。' }
+    if (-not $CatalogOnly -and $generated.Count -eq 0) { throw '没有任何漫画成功生成，未更新总打开器。' }
     $launcherComics = @($generated | Group-Object Name | ForEach-Object { $_.Group[0] })
-    $persistedSelectedNames = if ($UpdateMode -eq 'Selected') {
-        @($PreviousSelectedNames + @($generated | ForEach-Object { $_.Name }) | Select-Object -Unique)
+    $persistedSelectedNames = if ($CatalogOnly) {
+        if ($hasDesiredSelection) { @($selectedNames) } else { @($PreviousSelectedNames | Select-Object -Unique) }
+    }
+    elseif ($UpdateMode -eq 'Selected') {
+        if ($hasDesiredSelection) {
+            $existingDesired = @($PreviousSelectedNames | Where-Object { $selectedNames -contains $_ })
+            @($existingDesired + @($generated | ForEach-Object { $_.Name }) | Select-Object -Unique)
+        }
+        else { @($PreviousSelectedNames + @($generated | ForEach-Object { $_.Name }) | Select-Object -Unique) }
     }
     else { @($launcherComics | ForEach-Object { $_.Name }) }
     $launcherCount = @($persistedSelectedNames | Select-Object -Unique).Count
     Write-Info '正在更新并复核总打开器……'
-    $launcherPath = New-RootPage -Comics $launcherComics -LibraryRoot $LibraryRoot -SelectedNames $persistedSelectedNames -OpenAfterGenerate $OpenAfterGenerate -PreservedCards $preservedCards
+    $launcherPath = New-RootPage -Comics $launcherComics -LibraryRoot $LibraryRoot -SelectedNames $persistedSelectedNames -OpenAfterGenerate $OpenAfterGenerate -PreservedCards $preservedCards -Collections $Collections -ChapterCoverOverrides $ChapterCoverOverrides -ChapterCustomCovers $ChapterCustomCovers
     $launcherHtml = [System.IO.File]::ReadAllText($launcherPath, [System.Text.Encoding]::UTF8)
-    $rootCardCount = ([regex]::Matches($launcherHtml, '<article class="card" ')).Count
-    if ($rootCardCount -ne $launcherCount) { throw "总打开器复核失败：应有 $launcherCount 部漫画，实际有 $rootCardCount 个卡片。" }
+    $rootCardCount = ([regex]::Matches($launcherHtml, '<article class="card(?:\s+[^"]+)?"\s')).Count
+    $activeCollections = @($Collections | Where-Object { @($_.Members | Where-Object { $persistedSelectedNames -contains $_ }).Count -gt 0 })
+    $hiddenNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($collection in $activeCollections) {
+        if ([bool]$collection.HideMembersOnRoot) {
+            foreach ($member in @($collection.Members | Where-Object { $persistedSelectedNames -contains $_ })) { [void]$hiddenNames.Add([string]$member) }
+        }
+    }
+    $expectedRootCardCount = $activeCollections.Count + @($persistedSelectedNames | Where-Object { -not $hiddenNames.Contains([string]$_) }).Count
+    if ($rootCardCount -ne $expectedRootCardCount) { throw "总打开器复核失败：应有 $expectedRootCardCount 个漫画/合集卡片，实际有 $rootCardCount 个。" }
+    foreach ($collection in $activeCollections) {
+        $collectionPath = Join-Path $LibraryRoot (Get-CollectionPageFileName -Collection $collection)
+        if (-not (Test-Path -LiteralPath $collectionPath -PathType Leaf)) { throw ('合集目录页缺失：' + $collection.Title) }
+        $collectionHtml = [IO.File]::ReadAllText($collectionPath, [Text.Encoding]::UTF8)
+        $expectedMemberCount = @($collection.Members | Where-Object { $persistedSelectedNames -contains $_ } | Select-Object -Unique).Count
+        $actualMemberCount = ([regex]::Matches($collectionHtml, '<article class="card"\s+data-comic-key=')).Count
+        if ($actualMemberCount -ne $expectedMemberCount) { throw ('合集“{0}”复核失败：应有 {1} 部，实际有 {2} 部。' -f $collection.Title, $expectedMemberCount, $actualMemberCount) }
+    }
+    $updatedConfiguration = Get-Configuration -LegacyPath '' -LibraryRoot $LibraryRoot
 
-    $chapterCount = [int](($generated | Measure-Object ChapterCount -Sum).Sum)
-    $imageCount = [int](($generated | Measure-Object TotalImages -Sum).Sum)
+    $chapterCount = 0
+    $imageCount = 0
+    if ($generated.Count -gt 0) {
+        $chapterCount = [int](($generated | Measure-Object ChapterCount -Sum).Sum)
+        $imageCount = [int](($generated | Measure-Object TotalImages -Sum).Sum)
+    }
     Write-Good ('总打开器已更新：' + $launcherPath)
     return [pscustomobject]@{
         PersistedSelectedNames = @($persistedSelectedNames)
@@ -2233,6 +4079,9 @@ function Invoke-ComicUpdate {
         ImageCount = $imageCount
         LauncherCount = $launcherCount
         LauncherPath = $launcherPath
+        Collections = @($updatedConfiguration.collections)
+        ChapterCoverOverrides = Copy-ChapterCoverOverrideMap -Value $updatedConfiguration.chapterCoverOverrides
+        ChapterCustomCovers = Copy-ChapterCustomCoverMap -Value $updatedConfiguration.chapterCustomCovers
     }
 }
 
@@ -2287,11 +4136,11 @@ try {
     $previousSelectedNames = @($selectedNames)
     $openAfterGenerate = [bool]$configuration.openAfterGenerate
     if (-not $NonInteractive) {
-        $uiResult = Show-ComicSelector -LibraryRoot $resolvedRoot -Candidates $candidates -SelectedNames $selectedNames -OpenAfterGenerate $openAfterGenerate -SkipOpen:$SkipOpen -SmokeTest:$UiSmokeTest
+        $uiResult = Show-ComicSelector -LibraryRoot $resolvedRoot -Candidates $candidates -SelectedNames $selectedNames -Collections @($configuration.collections) -ChapterCoverOverrides (Copy-ChapterCoverOverrideMap -Value $configuration.chapterCoverOverrides) -ChapterCustomCovers (Copy-ChapterCustomCoverMap -Value $configuration.chapterCustomCovers) -OpenAfterGenerate $openAfterGenerate -SkipOpen:$SkipOpen -SmokeTest:$UiSmokeTest
         exit ([int]$uiResult.ExitCode)
     }
 
-    $result = Invoke-ComicUpdate -LibraryRoot $resolvedRoot -PreviousSelectedNames $previousSelectedNames -CheckedNames $selectedNames -UpdateMode 'All' -OpenAfterGenerate $openAfterGenerate -AuditOnlyMode:$AuditOnly
+    $result = Invoke-ComicUpdate -LibraryRoot $resolvedRoot -PreviousSelectedNames $previousSelectedNames -CheckedNames $selectedNames -UpdateMode 'All' -OpenAfterGenerate $openAfterGenerate -Collections @($configuration.collections) -ChapterCoverOverrides (Copy-ChapterCoverOverrideMap -Value $configuration.chapterCoverOverrides) -ChapterCustomCovers (Copy-ChapterCustomCoverMap -Value $configuration.chapterCustomCovers) -AuditOnlyMode:$AuditOnly
     if ($AuditOnly) {
         if ($result.FailedCount -gt 0) { exit 2 }
         exit 0
