@@ -19,6 +19,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:ImageExtensions = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif')
+$script:ReaderResourceFolderName = '漫画阅读器资源'
 $script:DefaultOutputFolderName = 'CBZ导出'
 $script:SettingsRegistryPath = 'Software\LocalComicTools\ComicExporter'
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -335,7 +336,7 @@ function Get-ImageChapterDirectories {
     $result = New-Object 'System.Collections.Generic.List[object]'
     $warnings = New-Object 'System.Collections.Generic.List[string]'
     $queue = New-Object 'System.Collections.Generic.Queue[System.IO.DirectoryInfo]'
-    foreach ($child in @(Get-ChildItem -LiteralPath $ComicPath -Directory -ErrorAction SilentlyContinue)) { $queue.Enqueue($child) }
+    foreach ($child in @(Get-ChildItem -LiteralPath $ComicPath -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ine $script:ReaderResourceFolderName })) { $queue.Enqueue($child) }
     while ($queue.Count -gt 0) {
         $directory = $queue.Dequeue()
         if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -351,7 +352,7 @@ function Get-ImageChapterDirectories {
                 Files = $files
             })
         }
-        foreach ($child in @(Get-ChildItem -LiteralPath $directory.FullName -Directory -ErrorAction SilentlyContinue)) { $queue.Enqueue($child) }
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory.FullName -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ine $script:ReaderResourceFolderName })) { $queue.Enqueue($child) }
     }
     return [pscustomobject]@{ Chapters = $result.ToArray(); Warnings = $warnings.ToArray() }
 }
@@ -585,6 +586,7 @@ function Get-ComicPlan {
 
 function Test-DirectoryContainsImages {
     param([System.IO.DirectoryInfo]$Directory)
+    if ($Directory.Name -ieq $script:ReaderResourceFolderName) { return $false }
     $queue = New-Object 'System.Collections.Generic.Queue[System.IO.DirectoryInfo]'
     $queue.Enqueue($Directory)
     while ($queue.Count -gt 0) {
@@ -592,7 +594,7 @@ function Test-DirectoryContainsImages {
         if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
         $found = @(Get-ChildItem -LiteralPath $current.FullName -File -ErrorAction SilentlyContinue | Where-Object { Test-ImageFile -File $_ } | Select-Object -First 1)
         if ($found.Count -gt 0) { return $true }
-        foreach ($child in @(Get-ChildItem -LiteralPath $current.FullName -Directory -ErrorAction SilentlyContinue)) { $queue.Enqueue($child) }
+        foreach ($child in @(Get-ChildItem -LiteralPath $current.FullName -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ine $script:ReaderResourceFolderName })) { $queue.Enqueue($child) }
     }
     return $false
 }
@@ -602,7 +604,7 @@ function Get-CandidateComics {
     $result = @()
     foreach ($directory in @(Get-ChildItem -LiteralPath $LibraryRoot -Directory -ErrorAction Stop | Sort-Object { Get-NaturalNameSortKey $_.Name }, Name)) {
         if (-not [string]::IsNullOrWhiteSpace($ResolvedOutputPath) -and $directory.FullName -ieq $ResolvedOutputPath) { continue }
-        if ($directory.Name -in @('.git', 'CBZ导出')) { continue }
+        if ($directory.Name -in @('.git', 'CBZ导出') -or $directory.Name -ieq $script:ReaderResourceFolderName) { continue }
         if ($directory.Name -ieq 'new' -and (
             (Test-Path -LiteralPath (Join-Path $directory.FullName '漫画整理器.vbs') -PathType Leaf) -or
             (Test-Path -LiteralPath (Join-Path $directory.FullName '漫画整理器.bat') -PathType Leaf)
@@ -1478,6 +1480,10 @@ function Show-ExporterWindow {
     $refresh.Text = '重新扫描'
     $refresh.Location = New-Object Drawing.Point(224, 492)
     $refresh.Size = New-Object Drawing.Size(110, 34)
+    $help = New-Object Windows.Forms.Button
+    $help.Text = '使用说明'
+    $help.Location = New-Object Drawing.Point(342, 492)
+    $help.Size = New-Object Drawing.Size(110, 34)
 
     $modeGroup = New-Object Windows.Forms.GroupBox
     $modeGroup.Text = '导出方式'
@@ -1569,11 +1575,11 @@ function Show-ExporterWindow {
     $status.Size = New-Object Drawing.Size(970, 24)
     $status.ForeColor = [Drawing.Color]::DimGray
 
-    foreach ($control in @($header, $sub, $listLabel, $list, $selectAll, $selectNone, $refresh, $modeGroup, $optionsGroup, $outputLabel, $outputBox, $browse, $export, $status)) {
+    foreach ($control in @($header, $sub, $listLabel, $list, $selectAll, $selectNone, $refresh, $help, $modeGroup, $optionsGroup, $outputLabel, $outputBox, $browse, $export, $status)) {
         [void]$form.Controls.Add($control)
     }
 
-    $operationControls = @($list, $selectAll, $selectNone, $refresh, $modeGroup, $optionsGroup, $outputBox, $browse, $export)
+    $operationControls = @($list, $selectAll, $selectNone, $refresh, $help, $modeGroup, $optionsGroup, $outputBox, $browse, $export)
     $setExportBusy = {
         param([bool]$Busy)
         $script:ExporterIsRunning = $Busy
@@ -1668,6 +1674,19 @@ function Show-ExporterWindow {
     })
     $selectNone.Add_Click({ foreach ($item in @($list.Items)) { $item.Checked = $false } })
     $refresh.Add_Click($loadCandidates)
+    $help.Add_Click({
+        $helpText = @'
+1. “每话一个 CBZ”适合在支持文件夹分组的手机漫画阅读器中阅读；每一话会生成独立 CBZ。
+2. “整部漫画一个 CBZ”会把全部图片放进一个文件，但 CBZ 本身没有真正的可点击章节目录。
+3. “整部 EPUB”会生成一整本并带章节目录；具体翻页或连续滚动方式由手机阅读软件决定。
+4. “每话一个 PDF：整话无缝长页”会为每一话生成一个长页 PDF，图片之间不留空隙。
+5. 可选择是否把总封面放在开头、完成后打开输出文件夹，以及是否在输出文件夹名后标注格式。
+6. 默认会阻止同名重复导出；勾选“同名时自动加（1）（2）”后才会保留多个同名结果。
+7. 灰色漫画表示当前输出目录已有同名导出。更换输出目录或启用自动编号后可以再次选择。
+8. 导出只读取图片与章节顺序，不会修改源漫画；JSON、HTML 等网页文件不会写入 CBZ、EPUB 或 PDF 正文。
+'@
+        [Windows.Forms.MessageBox]::Show($form, $helpText, '漫画导出器使用说明', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    })
     foreach ($radio in @($perChapter, $singleBook, $epubBook, $pdfStrip)) {
         $radio.Add_CheckedChanged({ param($sender, $eventArgs) if ($sender.Checked) { & $refreshDuplicateStates } })
     }
@@ -1762,6 +1781,7 @@ function Show-ExporterWindow {
     })
     & $loadCandidates
     if ($SmokeTest) {
+        if ($help.Text -ne '使用说明') { throw '导出器缺少“使用说明”按钮。' }
         $timer = New-Object Windows.Forms.Timer
         $timer.Interval = 350
         $timer.Add_Tick({ $timer.Stop(); $form.Close() })
