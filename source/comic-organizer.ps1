@@ -1132,6 +1132,28 @@ function Test-OrganizerPlan {
     if ([string]::IsNullOrWhiteSpace($coverSource) -and $resolvedChapters.Count -gt 0) {
         $coverSource = $resolvedChapters[0].SourceFolder
     }
+    $coverSourceChapter = ([string](Get-ObjectProperty -Object $Plan -Name 'coverSourceChapter' -Default '')).Trim()
+    $coverSourceStart = 0
+    [void][int]::TryParse(([string](Get-ObjectProperty -Object $Plan -Name 'coverSourceStart' -Default '0')).Trim(), [ref]$coverSourceStart)
+    if ([string]::IsNullOrWhiteSpace($coverSourceChapter) -and -not [string]::IsNullOrWhiteSpace($coverSource)) {
+        $matchingPlanChapter = @($planChapters | Where-Object { [string](Get-ObjectProperty -Object $_ -Name 'sourceFolder' -Default '') -ceq $coverSource } | Select-Object -First 1)
+        if ($matchingPlanChapter.Count -gt 0) {
+            # 兼容只保存了来源漫画、没有保存来源章节的旧方案。按照用户最终排列中
+            # 该来源首次出现的章节取封面，而不是再按来源文件夹名称排序。
+            $coverSourceChapter = [string](Get-ObjectProperty -Object $matchingPlanChapter[0] -Name 'sourceChapter' -Default '')
+            [void][int]::TryParse(([string](Get-ObjectProperty -Object $matchingPlanChapter[0] -Name 'start' -Default '1')).Trim(), [ref]$coverSourceStart)
+        }
+    }
+    if ($coverSourceStart -lt 1) {
+        $matchingCoverRow = @($planChapters | Where-Object {
+            [string](Get-ObjectProperty -Object $_ -Name 'sourceFolder' -Default '') -ceq $coverSource -and
+            [string](Get-ObjectProperty -Object $_ -Name 'sourceChapter' -Default '') -ceq $coverSourceChapter
+        } | Select-Object -First 1)
+        if ($matchingCoverRow.Count -gt 0) {
+            [void][int]::TryParse(([string](Get-ObjectProperty -Object $matchingCoverRow[0] -Name 'start' -Default '1')).Trim(), [ref]$coverSourceStart)
+        }
+    }
+    if ($coverSourceStart -lt 1) { $coverSourceStart = 1 }
     $coverPath = ''
     $coverOutputName = 'cover.jpg'
     $coverIsAutomatic = $false
@@ -1181,12 +1203,24 @@ function Test-OrganizerPlan {
                 if ($coverChapterDirectories.Count -eq 0) {
                     throw '没有可识别的章节文件夹。'
                 }
-                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverChapterDirectories[0].Name -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$coverUsesFilenameOrder
-                $coverImage = $coverChapterInfo.Images[0]
+                $selectedCoverChapter = @($coverChapterDirectories | Where-Object { [string]$_.Name -ceq $coverSourceChapter } | Select-Object -First 1)
+                if ($selectedCoverChapter.Count -eq 0) {
+                    if (-not [string]::IsNullOrWhiteSpace($coverSourceChapter)) {
+                        $warnings.Add(('方案指定的封面来源章节已不存在，已改用该来源当前第一章：{0}\{1}' -f $coverSource, $coverSourceChapter))
+                    }
+                    $selectedCoverChapter = @($coverChapterDirectories[0])
+                    $coverSourceChapter = [string]$selectedCoverChapter[0].Name
+                }
+                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverSourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$coverUsesFilenameOrder
+                if ($coverSourceStart -gt $coverChapterInfo.Count) {
+                    $warnings.Add(('方案指定的封面来源起始图片超出范围，已改用该章首图：{0}\{1}（{2}）' -f $coverSource, $coverSourceChapter, $coverSourceStart))
+                    $coverSourceStart = 1
+                }
+                $coverImage = $coverChapterInfo.Images[$coverSourceStart - 1]
                 $coverPath = $coverImage.FullName
                 $coverOutputName = 'cover' + $coverImage.Extension.ToLowerInvariant()
                 $coverIsAutomatic = $true
-                $warnings.Add(('封面来源没有有效的 cover.jpg，已自动使用第一章首图并输出为 {0}：{1}\{2}\{3}' -f $coverOutputName, $coverSource, $coverChapterDirectories[0].Name, $coverImage.Name))
+                $warnings.Add(('封面来源没有有效的 cover.jpg，已自动使用所选来源章节首图并输出为 {0}：{1}\{2}\{3}' -f $coverOutputName, $coverSource, $coverSourceChapter, $coverImage.Name))
             }
             catch {
                 $errors.Add(('封面来源缺少有效 cover.jpg，且无法取得第一章 0001：{0}（{1}）' -f $coverSource, $_.Exception.Message))
@@ -1235,6 +1269,8 @@ function Test-OrganizerPlan {
         OutputPath = $outputPath
         FilenameOrderSources = @($filenameOrderSources)
         CoverSource = $coverSource
+        CoverSourceChapter = $coverSourceChapter
+        CoverSourceStart = $coverSourceStart
         CoverPath = $coverPath
         CoverOutputName = $coverOutputName
         CoverIsAutomatic = $coverIsAutomatic
@@ -1295,6 +1331,9 @@ function New-OutputMetadata {
         coverFile = $Audit.CoverOutputName
         coverAutomatic = $Audit.CoverIsAutomatic
         coverCustom = $Audit.CoverIsCustom
+        coverSource = $Audit.CoverSource
+        coverSourceChapter = $Audit.CoverSourceChapter
+        coverSourceStart = $Audit.CoverSourceStart
         descriptionSource = $Audit.DescriptionSource
     }
     $metadata | Add-Member -NotePropertyName name -NotePropertyValue $Audit.OutputName -Force
@@ -2683,9 +2722,13 @@ function Show-OrganizerWindow {
     $getPlanFromGrid = {
         $chapters = @()
         $selectedCoverSource = ''
+        $selectedCoverSourceChapter = ''
+        $selectedCoverSourceStart = ''
         foreach ($row in $grid.Rows) {
             if ($row.Cells['Cover'].Value -eq $true) {
                 $selectedCoverSource = [string]$row.Cells['SourceFolder'].Value
+                $selectedCoverSourceChapter = [string]$row.Cells['SourceChapter'].Value
+                $selectedCoverSourceStart = [string]$row.Cells['Start'].Value
             }
             $chapters += [pscustomobject][ordered]@{
                 number = [string]$row.Cells['Number'].Value
@@ -2701,13 +2744,17 @@ function Show-OrganizerWindow {
         }
         if ([string]::IsNullOrWhiteSpace($selectedCoverSource) -and $grid.Rows.Count -gt 0) {
             $selectedCoverSource = [string]$grid.Rows[0].Cells['SourceFolder'].Value
+            $selectedCoverSourceChapter = [string]$grid.Rows[0].Cells['SourceChapter'].Value
+            $selectedCoverSourceStart = [string]$grid.Rows[0].Cells['Start'].Value
         }
         return [pscustomobject][ordered]@{
-            schemaVersion = 9
+            schemaVersion = 10
             outputName = $outputName.Text.Trim()
             outputDirectory = $outputDirectory.Text.Trim()
             filenameOrderSources = @($script:OrganizerFilenameOrderSources.Keys)
             coverSource = $selectedCoverSource
+            coverSourceChapter = $selectedCoverSourceChapter
+            coverSourceStart = $selectedCoverSourceStart
             customCoverPath = $script:OrganizerCustomCoverPath
             showChapterCovers = [bool]$showChapterCovers.Checked
             descriptionSource = $script:OrganizerDescriptionSource
@@ -2743,6 +2790,8 @@ function Show-OrganizerWindow {
             } | Where-Object { $_ } | Select-Object -Unique)
         }
         $requestedCover = [string](Get-ObjectProperty -Object $Plan -Name 'coverSource' -Default '')
+        $requestedCoverChapter = [string](Get-ObjectProperty -Object $Plan -Name 'coverSourceChapter' -Default '')
+        $requestedCoverStart = [string](Get-ObjectProperty -Object $Plan -Name 'coverSourceStart' -Default '')
         $script:OrganizerCustomCoverPath = [string](Get-ObjectProperty -Object $Plan -Name 'customCoverPath' -Default '')
         $showChapterCovers.Checked = [bool](Get-ObjectProperty -Object $Plan -Name 'showChapterCovers' -Default $false)
         & $updateWholeCoverButton
@@ -2799,7 +2848,10 @@ function Show-OrganizerWindow {
         if ($grid.Rows.Count -gt 0) {
             $coverRowIndex = 0
             for ($index = 0; $index -lt $grid.Rows.Count; $index++) {
-                if ([string]$grid.Rows[$index].Cells['SourceFolder'].Value -ceq $requestedCover) {
+                $sourceMatches = [string]$grid.Rows[$index].Cells['SourceFolder'].Value -ceq $requestedCover
+                $chapterMatches = [string]::IsNullOrWhiteSpace($requestedCoverChapter) -or [string]$grid.Rows[$index].Cells['SourceChapter'].Value -ceq $requestedCoverChapter
+                $startMatches = [string]::IsNullOrWhiteSpace($requestedCoverStart) -or [string]$grid.Rows[$index].Cells['Start'].Value -ceq $requestedCoverStart
+                if ($sourceMatches -and $chapterMatches -and $startMatches) {
                     $coverRowIndex = $index
                     break
                 }
@@ -3351,7 +3403,7 @@ function Show-OrganizerWindow {
 8. 第一列“选择”用于批量操作；封面、复制、删除、上移、下移、移到最上和移到最下等按钮优先处理勾选行，未勾选时处理当前行。
 9. “合并所选为同一话”允许所选行不连续；整理器会把它们聚拢到第一条所选行的位置并按原相对顺序合并。并入行会保留原话序、章节名、章节封面和元数据指向并灰显，便于辨认来源，但这些字段逻辑上不会单独生效或占用章节编号。
 10. “按范围拆分选中行”会检查是否连续完整覆盖；1-3,3-10 这类边界重复可自动修正，其他缺口或重叠必须二次确认。
-11. “整本封面”可沿用勾选来源，也可选择任意本地图片；自选图片只会复制，不会改动原文件。
+11. 表格最后一列勾选哪一行，整本封面就会沿用该行来源漫画、来源章节及所选范围的第一张图片；也可通过“整本封面”选择任意本地图片。自选图片只会复制，不会改动原文件。
 12. “漫画目录显示每话封面”是整本总开关：未勾选时目录不显示任何章节缩略图；勾选后，每行设置才会生效。“自选”会复制外部图片到漫画阅读器资源；“本地图片插入为首图”会在整理结果中把外部图片输出为 0001、原正文顺延并把元数据设为首图；“该话其他图片”直接引用本话正文，不会复制。“元数据实际指向”列会显示跟随后的最终结果。
 13. 图片被重复使用不再直接报错中止；整理前会汇总重叠范围并二次确认，疑似简单边界手误会单独标明。
 14. 原文件不会修改；目标文件夹默认是工具同级的“整理完成”，也可在顶部输入或浏览选择其他目标文件夹。最终漫画会在目标文件夹下另建同名子文件夹，正文统一重命名为 0001、0002……。
@@ -3513,6 +3565,8 @@ function Show-OrganizerWindow {
         $smokeLoadResult = & $addSourceRows @([string]$smokeCandidate.Name) $true
         if ($null -eq $smokeLoadResult -or $grid.Rows.Count -eq 0) { throw '整理器 UI 冒烟测试无法载入章节行。' }
         if ([IO.Path]::GetFullPath($outputDirectory.Text) -ne $defaultOutputDirectory -or -not $browseOutputDirectory.Text.StartsWith('浏览目标文件夹')) { throw '整理器没有正确显示默认输出目录或自选目标文件夹按钮。' }
+        $smokeCoverPlan = & $getPlanFromGrid
+        if ([string]$smokeCoverPlan.coverSource -cne [string]$grid.Rows[0].Cells['SourceFolder'].Value -or [string]$smokeCoverPlan.coverSourceChapter -cne [string]$grid.Rows[0].Cells['SourceChapter'].Value -or [string]$smokeCoverPlan.coverSourceStart -cne [string]$grid.Rows[0].Cells['Start'].Value) { throw '整理器方案没有完整保存整本封面的来源漫画、来源章节及起始图片。' }
         if ([string]::IsNullOrWhiteSpace([string]$grid.Rows[0].Cells['MetadataCoverInfo'].Value)) { throw '整理器没有显示“跟随元数据”的实际章节封面指向。' }
         if (-not $chapterCoverColumn.Items.Contains('该话其他图片') -or -not $chapterCoverMenu.Items.Contains($chapterBodyCover)) { throw '整理器缺少“该话其他图片”章节封面选项。' }
         if (-not $chapterCoverColumn.Items.Contains('本地图片插入为首图') -or -not $chapterCoverMenu.Items.Contains($insertLocalAsFirst)) { throw '整理器缺少“本地图片插入为首图”选项。' }
