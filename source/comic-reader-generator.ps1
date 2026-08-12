@@ -442,17 +442,31 @@ function Get-SequenceDisplayName {
 function Get-FlexibleImageSequence {
     param(
         [System.IO.FileInfo[]]$Files,
-        [string]$Context
+        [string]$Context,
+        [switch]$UseFilenameOrder
     )
-    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $fatalErrors = New-Object 'System.Collections.Generic.List[string]'
+    $orderErrors = New-Object 'System.Collections.Generic.List[string]'
     $warnings = New-Object 'System.Collections.Generic.List[string]'
     $images = @($Files)
     if ($images.Count -eq 0) {
-        $errors.Add(($Context + '：没有图片'))
-        return [pscustomobject]@{ Images = @(); Errors = @($errors); Warnings = @($warnings); Mode = 'Empty' }
+        $fatalErrors.Add(($Context + '：没有图片'))
+        return [pscustomobject]@{ Images = @(); Errors = @($fatalErrors); Warnings = @($warnings); Mode = 'Empty'; CanUseFilenameOrder = $false; FilenameOrderProblems = @() }
     }
     foreach ($image in $images) {
-        if ($image.Length -eq 0) { $errors.Add(($Context + '：图片是空文件：' + $image.Name)) }
+        if ($image.Length -eq 0) { $fatalErrors.Add(($Context + '：图片是空文件：' + $image.Name)) }
+    }
+
+    if ($UseFilenameOrder) {
+        $warnings.Add(($Context + '：已按当前文件名自然排序；未再要求页码连续，工具无法判断是否缺图。'))
+        return [pscustomobject]@{
+            Images = @($images | Sort-Object { Get-NaturalNameSortKey -Name $_.Name }, Name)
+            Errors = @($fatalErrors)
+            Warnings = @($warnings)
+            Mode = 'FilenameOrder'
+            CanUseFilenameOrder = $false
+            FilenameOrderProblems = @()
+        }
     }
 
     $numericRecords = @()
@@ -461,7 +475,7 @@ function Get-FlexibleImageSequence {
         if ($image.BaseName -notmatch '^\d+$') { $allNumeric = $false; break }
         $number = [int64]0
         if (-not [int64]::TryParse($image.BaseName, [ref]$number)) {
-            $errors.Add(($Context + '：图片编号过大或无效：' + $image.Name))
+            $orderErrors.Add(($Context + '：图片编号过大或无效：' + $image.Name))
             continue
         }
         $numericRecords += [pscustomobject]@{ File = $image; Page = $number; Prefix = '' }
@@ -469,26 +483,28 @@ function Get-FlexibleImageSequence {
     if ($allNumeric) {
         $duplicates = @($numericRecords | Group-Object Page | Where-Object Count -gt 1)
         foreach ($duplicate in $duplicates) {
-            $errors.Add(('{0}：图片编号 {1} 重复（{2}）' -f $Context, $duplicate.Name, (($duplicate.Group.File.Name) -join '、')))
+            $orderErrors.Add(('{0}：图片编号 {1} 重复（{2}）' -f $Context, $duplicate.Name, (($duplicate.Group.File.Name) -join '、')))
         }
         $orderedNumbers = @($numericRecords.Page | Sort-Object -Unique)
         if ($orderedNumbers.Count -gt 0 -and $orderedNumbers[0] -ne 1) {
-            $errors.Add(('{0}：第一张图片应为 0001，实际编号为 {1}' -f $Context, $orderedNumbers[0]))
+            $orderErrors.Add(('{0}：第一张图片应为 0001，实际编号为 {1}' -f $Context, $orderedNumbers[0]))
         }
         if ($orderedNumbers.Count -gt 0) {
             $numberMap = @{}
             foreach ($number in $orderedNumbers) { $numberMap[[string]$number] = $true }
             for ($number = 1; $number -le $orderedNumbers[-1]; $number++) {
                 if (-not $numberMap.ContainsKey([string]$number)) {
-                    $errors.Add(('{0}：缺少图片编号 {1:D4}' -f $Context, $number))
+                    $orderErrors.Add(('{0}：缺少图片编号 {1:D4}' -f $Context, $number))
                 }
             }
         }
         return [pscustomobject]@{
             Images = @($numericRecords | Sort-Object Page, @{ Expression = { $_.File.Name } } | ForEach-Object File)
-            Errors = @($errors)
+            Errors = @($fatalErrors) + @($orderErrors)
             Warnings = @($warnings)
             Mode = 'Numeric'
+            CanUseFilenameOrder = ($fatalErrors.Count -eq 0 -and $orderErrors.Count -gt 0)
+            FilenameOrderProblems = @($orderErrors)
         }
     }
 
@@ -507,18 +523,18 @@ function Get-FlexibleImageSequence {
             $groupLabel = Get-SequenceDisplayName -Prefix $group.Name
             $duplicates = @($group.Group | Group-Object Page | Where-Object Count -gt 1)
             foreach ($duplicate in $duplicates) {
-                $errors.Add(('{0}：分组 {1} 的页码 {2} 重复（{3}）' -f $Context, $groupLabel, $duplicate.Name, (($duplicate.Group.File.Name) -join '、')))
+                $orderErrors.Add(('{0}：分组 {1} 的页码 {2} 重复（{3}）' -f $Context, $groupLabel, $duplicate.Name, (($duplicate.Group.File.Name) -join '、')))
             }
             $orderedNumbers = @($group.Group.Page | Sort-Object -Unique)
             if ($orderedNumbers.Count -gt 0 -and $orderedNumbers[0] -notin @([int64]0, [int64]1)) {
-                $errors.Add(('{0}：分组 {1} 应从 000 或 001 开始，实际从 {2} 开始' -f $Context, $groupLabel, $orderedNumbers[0]))
+                $orderErrors.Add(('{0}：分组 {1} 应从 000 或 001 开始，实际从 {2} 开始' -f $Context, $groupLabel, $orderedNumbers[0]))
             }
             if ($orderedNumbers.Count -gt 0) {
                 $numberMap = @{}
                 foreach ($number in $orderedNumbers) { $numberMap[[string]$number] = $true }
                 for ($number = $orderedNumbers[0]; $number -le $orderedNumbers[-1]; $number++) {
                     if (-not $numberMap.ContainsKey([string]$number)) {
-                        $errors.Add(('{0}：分组 {1} 缺少页码 {2}' -f $Context, $groupLabel, $number))
+                        $orderErrors.Add(('{0}：分组 {1} 缺少页码 {2}' -f $Context, $groupLabel, $number))
                     }
                 }
             }
@@ -526,18 +542,22 @@ function Get-FlexibleImageSequence {
         }
         return [pscustomobject]@{
             Images = @($orderedFiles)
-            Errors = @($errors)
+            Errors = @($fatalErrors) + @($orderErrors)
             Warnings = @($warnings)
             Mode = 'Composite'
+            CanUseFilenameOrder = ($fatalErrors.Count -eq 0 -and $orderErrors.Count -gt 0)
+            FilenameOrderProblems = @($orderErrors)
         }
     }
 
-    $warnings.Add(($Context + '：无法可靠提取连续页码，已按文件名称自然排序；这种命名方式无法自动判断是否缺图。'))
+    $orderErrors.Add(($Context + '：无法可靠提取连续页码。'))
     return [pscustomobject]@{
         Images = @($images | Sort-Object { Get-NaturalNameSortKey -Name $_.Name }, Name)
-        Errors = @($errors)
+        Errors = @($fatalErrors) + @($orderErrors)
         Warnings = @($warnings)
-        Mode = 'NameSorted'
+        Mode = 'Unrecognized'
+        CanUseFilenameOrder = ($fatalErrors.Count -eq 0)
+        FilenameOrderProblems = @($orderErrors)
     }
 }
 
@@ -1728,6 +1748,79 @@ function Show-UpdaterCustomCoverEditor {
     return $dialog.Tag
 }
 
+function Show-ImageOrderFallbackDialog {
+    param(
+        [System.Windows.Forms.IWin32Window]$Owner,
+        [string]$ComicName,
+        [string[]]$Problems
+    )
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = '图片顺序识别失败'
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.Size = New-Object System.Drawing.Size(720, 470)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(620, 400)
+    $dialog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '“{0}”的图片页码未通过连续性检查' -f $ComicName
+    $title.AutoSize = $true
+    $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
+    $title.Location = New-Object System.Drawing.Point(18, 18)
+    $dialog.Controls.Add($title)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '你可以取消并修正文件名，也可以按当前文件名进行自然排序（例如 2.jpg 会排在 10.jpg 前）。继续后无法自动判断是否真的缺图。空文件、无图片和路径错误仍会阻止生成。'
+    $hint.AutoSize = $false
+    $hint.Location = New-Object System.Drawing.Point(18, 52)
+    $hint.Size = New-Object System.Drawing.Size(670, 58)
+    $hint.Anchor = 'Top,Left,Right'
+    $dialog.Controls.Add($hint)
+
+    $details = New-Object System.Windows.Forms.TextBox
+    $details.Multiline = $true
+    $details.ReadOnly = $true
+    $details.ScrollBars = 'Vertical'
+    $details.WordWrap = $true
+    $details.Location = New-Object System.Drawing.Point(18, 116)
+    $details.Size = New-Object System.Drawing.Size(670, 250)
+    $details.Anchor = 'Top,Bottom,Left,Right'
+    $shownProblems = @($Problems | Select-Object -First 30)
+    $details.Text = $shownProblems -join "`r`n"
+    if (@($Problems).Count -gt $shownProblems.Count) {
+        $details.Text += ("`r`n……另有 {0} 项未显示。" -f (@($Problems).Count - $shownProblems.Count))
+    }
+    $dialog.Controls.Add($details)
+
+    $decision = [pscustomobject]@{ Continue = $false }
+    $continueButton = New-Object System.Windows.Forms.Button
+    $continueButton.Text = '按当前文件名顺序继续'
+    $continueButton.Location = New-Object System.Drawing.Point(396, 382)
+    $continueButton.Size = New-Object System.Drawing.Size(180, 38)
+    $continueButton.Anchor = 'Bottom,Right'
+    $continueButton.BackColor = [System.Drawing.Color]::FromArgb(35, 105, 160)
+    $continueButton.ForeColor = [System.Drawing.Color]::White
+    $continueButton.add_Click({
+        $decision.Continue = $true
+        $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dialog.Close()
+    })
+    $dialog.Controls.Add($continueButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = '取消并返回'
+    $cancelButton.Location = New-Object System.Drawing.Point(584, 382)
+    $cancelButton.Size = New-Object System.Drawing.Size(104, 38)
+    $cancelButton.Anchor = 'Bottom,Right'
+    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancelButton)
+    $dialog.CancelButton = $cancelButton
+
+    [void]$dialog.ShowDialog($Owner)
+    return [bool]$decision.Continue
+}
+
 function Show-ComicSelector {
     param(
         [string]$LibraryRoot,
@@ -2227,7 +2320,8 @@ function Show-ComicSelector {
 5. “编辑当前漫画逐话封面”可逐话选择图片：“自选”可复制任意本地图片进漫画阅读器资源，也可选择“插入本地图片为本话首图”，将原数字图片整体顺延并把该话逻辑重设为首图；“该话其他图片”只直接引用本话现有正文，不产生副本。
 6. “管理合集”只改变总书架和合集目录的归类，不会移动或改名原漫画文件夹。
 7. “重新扫描”会追加新漫画且不重置现有操作；已载入漫画发生变化时会先二次确认，再保留勾选和封面设置重新导入。
-8. 更新过程会在底部显示进度；任务完成前请不要关闭窗口。
+8. 图片页码有断号、重复、不是连续数字或无法识别时会显示具体错误；可取消修正，也可选择“按当前文件名顺序继续”。后者使用自然排序，但无法判断是否缺图。空文件等非排序错误仍不会放行。
+9. 更新过程会在底部显示进度；任务完成前请不要关闭窗口。
 '@
         [System.Windows.Forms.MessageBox]::Show($form, $helpText, '漫画更新器使用说明', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
     })
@@ -2288,7 +2382,11 @@ function Show-ComicSelector {
         $status.Text = if ($UpdateMode -eq 'Selected') { '正在准备加入 / 更新勾选的漫画……' } else { '正在准备全部更新……' }
         [System.Windows.Forms.Application]::DoEvents()
         try {
-            $result = Invoke-ComicUpdate -LibraryRoot $LibraryRoot -PreviousSelectedNames @($selectionState.PreviousSelectedNames) -DesiredSelectedNames $shelfNames -CheckedNames $checkedNames -UpdateMode $UpdateMode -OpenAfterGenerate ([bool]$openAfter.Checked) -Collections @($selectionState.Collections) -ChapterCoverOverrides $selectionState.ChapterCoverOverrides -ChapterCustomCovers $selectionState.ChapterCustomCovers -CatalogOnly:$catalogOnly
+            $imageOrderPrompt = {
+                param([string]$ComicName, [string[]]$Problems)
+                return Show-ImageOrderFallbackDialog -Owner $form -ComicName $ComicName -Problems $Problems
+            }
+            $result = Invoke-ComicUpdate -LibraryRoot $LibraryRoot -PreviousSelectedNames @($selectionState.PreviousSelectedNames) -DesiredSelectedNames $shelfNames -CheckedNames $checkedNames -UpdateMode $UpdateMode -OpenAfterGenerate ([bool]$openAfter.Checked) -Collections @($selectionState.Collections) -ChapterCoverOverrides $selectionState.ChapterCoverOverrides -ChapterCustomCovers $selectionState.ChapterCustomCovers -ImageOrderFallbackPrompt $imageOrderPrompt -CatalogOnly:$catalogOnly
             $selectionState.PreviousSelectedNames = @($result.PersistedSelectedNames)
             $selectionState.Collections = @($result.Collections)
             $selectionState.ChapterCoverOverrides = Copy-ChapterCoverOverrideMap -Value $result.ChapterCoverOverrides
@@ -2671,11 +2769,13 @@ function Get-ComicAudit {
         [System.IO.DirectoryInfo]$ComicDirectory,
         [AllowNull()][Nullable[bool]]$ShowChapterCoversOverride = $null,
         [ValidateSet('', 'metadata', 'first', 'custom', 'chapter', 'none')][string]$ChapterCoverOverrideMode = '',
-        [hashtable]$ChapterCustomCoverMap = @{}
+        [hashtable]$ChapterCustomCoverMap = @{},
+        [switch]$UseFilenameOrder
     )
 
     $errors = New-Object 'System.Collections.Generic.List[string]'
     $warnings = New-Object 'System.Collections.Generic.List[string]'
+    $filenameOrderProblems = New-Object 'System.Collections.Generic.List[string]'
     $coverFile = Get-CoverFile -ComicPath $ComicDirectory.FullName
     $coverPath = ''
     $coverRelativeHref = ''
@@ -2836,9 +2936,12 @@ function Get-ComicAudit {
             continue
         }
 
-        $sequence = Get-FlexibleImageSequence -Files $imageFiles -Context $draft.Name
+        $sequence = Get-FlexibleImageSequence -Files $imageFiles -Context $draft.Name -UseFilenameOrder:$UseFilenameOrder
         foreach ($problem in $sequence.Errors) { $errors.Add($problem) }
         foreach ($warning in $sequence.Warnings) { $warnings.Add($warning) }
+        foreach ($problem in @($sequence.FilenameOrderProblems)) {
+            if (-not $filenameOrderProblems.Contains([string]$problem)) { $filenameOrderProblems.Add([string]$problem) }
+        }
         $sortedImages = @($sequence.Images)
         if ($sortedImages.Count -eq 0) { continue }
         $totalImages += $sortedImages.Count
@@ -3025,6 +3128,12 @@ function Get-ComicAudit {
         }
     }
 
+    $canUseFilenameOrder = $false
+    if (-not $UseFilenameOrder -and $filenameOrderProblems.Count -gt 0) {
+        $nonFilenameOrderErrors = @($errors | Where-Object { -not $filenameOrderProblems.Contains([string]$_) })
+        $canUseFilenameOrder = ($nonFilenameOrderErrors.Count -eq 0)
+    }
+
     return [pscustomobject]@{
         Name = $ComicDirectory.Name
         FullName = $ComicDirectory.FullName
@@ -3040,6 +3149,9 @@ function Get-ComicAudit {
         ShowChapterCovers = $showChapterCovers
         Errors = @($errors)
         Warnings = @($warnings)
+        CanUseFilenameOrder = $canUseFilenameOrder
+        FilenameOrderProblems = @($filenameOrderProblems)
+        UsedFilenameOrder = [bool]$UseFilenameOrder
         IsValid = ($errors.Count -eq 0)
     }
 }
@@ -4015,7 +4127,7 @@ function Get-ExistingRootCards {
         [string]$LibraryRoot,
         [string[]]$ComicNames
     )
-    if (@($ComicNames).Count -eq 0) { return @{} }
+    if ($null -eq $ComicNames -or $ComicNames.Length -eq 0) { return @{} }
     $launcherPath = Join-Path $LibraryRoot $script:LauncherFileName
     if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
         throw '找不到现有漫画阅读器，无法在“加入 / 更新勾选”模式下保留旧书架；请先使用一次“全部更新”。'
@@ -4353,6 +4465,7 @@ function Invoke-ComicUpdate {
         [object[]]$Collections = @(),
         [hashtable]$ChapterCoverOverrides = @{},
         [hashtable]$ChapterCustomCovers = @{},
+        [scriptblock]$ImageOrderFallbackPrompt = $null,
         [switch]$CatalogOnly,
         [switch]$AuditOnlyMode
     )
@@ -4402,10 +4515,25 @@ function Invoke-ComicUpdate {
         Write-Info ('正在核验 {0}/{1}：{2}' -f ($auditIndex + 1), $namesToAudit.Count, $name)
         $comicDirectory = Get-Item -LiteralPath $path
         $comicCustomCovers = if ($ChapterCustomCovers.ContainsKey($name)) { $ChapterCustomCovers[$name] } else { @{} }
-        $audit = if ($ChapterCoverOverrides.ContainsKey($name)) {
-            Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCoverOverrideMode ([string]$ChapterCoverOverrides[$name]) -ChapterCustomCoverMap $comicCustomCovers
+        $getCurrentAudit = {
+            param([bool]$UseFilenameOrder)
+            if ($ChapterCoverOverrides.ContainsKey($name)) {
+                Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCoverOverrideMode ([string]$ChapterCoverOverrides[$name]) -ChapterCustomCoverMap $comicCustomCovers -UseFilenameOrder:$UseFilenameOrder
+            }
+            else {
+                Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCustomCoverMap $comicCustomCovers -UseFilenameOrder:$UseFilenameOrder
+            }
         }
-        else { Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCustomCoverMap $comicCustomCovers }
+        $audit = & $getCurrentAudit $false
+        if (-not $audit.IsValid -and [bool]$audit.CanUseFilenameOrder -and $null -ne $ImageOrderFallbackPrompt) {
+            $useFilenameOrder = $false
+            try { $useFilenameOrder = [bool](& $ImageOrderFallbackPrompt $name @($audit.FilenameOrderProblems)) }
+            catch { Write-Host ('  警告：无法显示文件名排序确认：' + $_.Exception.Message) -ForegroundColor Yellow }
+            if ($useFilenameOrder) {
+                Write-Info ('用户确认按当前文件名顺序继续：' + $name)
+                $audit = & $getCurrentAudit $true
+            }
+        }
         if ($audit.IsValid) {
             Write-Good ('核验通过：{0} 话，{1} 张图片' -f $audit.ChapterCount, $audit.TotalImages)
             foreach ($warning in $audit.Warnings) { Write-Host ('  警告：' + $warning) -ForegroundColor Yellow }
