@@ -360,6 +360,13 @@ function Get-NumericImages {
     return @($ordered)
 }
 
+function New-ImageOrderFallbackException {
+    param([string]$Message)
+    $exception = New-Object System.InvalidOperationException($Message)
+    $exception.Data['CanUseFilenameOrder'] = $true
+    return $exception
+}
+
 function Get-RootBodyImageFiles {
     param([string]$ComicPath)
     return @(Get-ChildItem -LiteralPath $ComicPath -File -ErrorAction SilentlyContinue | Where-Object {
@@ -389,7 +396,8 @@ function Get-SequenceDisplayName {
 function Get-FlexibleImageSequence {
     param(
         [System.IO.FileInfo[]]$Files,
-        [string]$Context
+        [string]$Context,
+        [switch]$UseFilenameOrder
     )
     $images = @($Files)
     if ($images.Count -eq 0) { throw ($Context + '：没有图片。') }
@@ -397,19 +405,26 @@ function Get-FlexibleImageSequence {
         if ($image.Length -eq 0) { throw ($Context + '：图片是空文件：' + $image.Name) }
     }
 
+    if ($UseFilenameOrder) {
+        return [pscustomobject]@{
+            Images = @($images | Sort-Object { Get-NaturalNameSortKey -Name $_.Name }, Name)
+            Mode = 'FilenameOrder'
+            Warning = ($Context + '：已按当前文件名自然排序；未再要求页码连续，工具无法判断是否缺图。')
+        }
+    }
+
     if (@($images | Where-Object { $_.BaseName -notmatch '^\d+$' }).Count -eq 0) {
-        return [pscustomobject]@{ Images = @(Get-NumericImages -DirectoryPath $images[0].DirectoryName -IgnoreCover); Mode = 'Numeric'; Warning = '' }
+        try {
+            return [pscustomobject]@{ Images = @(Get-NumericImages -DirectoryPath $images[0].DirectoryName -IgnoreCover); Mode = 'Numeric'; Warning = '' }
+        }
+        catch { throw (New-ImageOrderFallbackException -Message ($Context + '：' + $_.Exception.Message)) }
     }
 
     $records = @()
     foreach ($image in $images) {
         $record = Get-CompositeImageRecord -File $image
         if ($null -eq $record) {
-            return [pscustomobject]@{
-                Images = @($images | Sort-Object { Get-NaturalNameSortKey -Name $_.Name }, Name)
-                Mode = 'NameSorted'
-                Warning = ($Context + '：无法可靠提取连续页码，已按文件名称自然排序；这种命名方式无法自动判断是否缺图。')
-            }
+            throw (New-ImageOrderFallbackException -Message ($Context + '：无法可靠提取连续页码。'))
         }
         $records += $record
     }
@@ -422,17 +437,17 @@ function Get-FlexibleImageSequence {
         $duplicates = @($group.Group | Group-Object Page | Where-Object Count -gt 1)
         if ($duplicates.Count -gt 0) {
             $duplicate = $duplicates[0]
-            throw ('{0}：分组 {1} 的页码 {2} 重复（{3}）' -f $Context, $display, $duplicate.Name, (($duplicate.Group.File.Name) -join '、'))
+            throw (New-ImageOrderFallbackException -Message ('{0}：分组 {1} 的页码 {2} 重复（{3}）' -f $Context, $display, $duplicate.Name, (($duplicate.Group.File.Name) -join '、')))
         }
         $numbers = @($group.Group.Page | Sort-Object -Unique)
         if ($numbers[0] -notin @([int64]0, [int64]1)) {
-            throw ('{0}：分组 {1} 应从 000 或 001 开始，实际从 {2} 开始。' -f $Context, $display, $numbers[0])
+            throw (New-ImageOrderFallbackException -Message ('{0}：分组 {1} 应从 000 或 001 开始，实际从 {2} 开始。' -f $Context, $display, $numbers[0]))
         }
         $map = @{}
         foreach ($number in $numbers) { $map[[string]$number] = $true }
         for ($number = $numbers[0]; $number -le $numbers[-1]; $number++) {
             if (-not $map.ContainsKey([string]$number)) {
-                throw ('{0}：分组 {1} 缺少页码 {2}。' -f $Context, $display, $number)
+                throw (New-ImageOrderFallbackException -Message ('{0}：分组 {1} 缺少页码 {2}。' -f $Context, $display, $number))
             }
         }
         $orderedFiles += @($group.Group | Sort-Object Page, @{ Expression = { $_.File.Name } } | ForEach-Object { $_.File })
@@ -441,7 +456,10 @@ function Get-FlexibleImageSequence {
 }
 
 function Get-RootImageLayout {
-    param([string]$ComicPath)
+    param(
+        [string]$ComicPath,
+        [switch]$UseFilenameOrder
+    )
     $images = @(Get-RootBodyImageFiles -ComicPath $ComicPath)
     $standaloneZero = @($images | Where-Object { $_.BaseName -match '^0+$' })
     $records = @()
@@ -468,7 +486,7 @@ function Get-RootImageLayout {
             $suffix++
         }
         $usedNames[$display.ToLowerInvariant()] = $true
-        $sequence = Get-FlexibleImageSequence -Files @($group.Group.File) -Context $display
+        $sequence = Get-FlexibleImageSequence -Files @($group.Group.File) -Context $display -UseFilenameOrder:$UseFilenameOrder
         $entries += [pscustomobject]@{
             Name = $display
             IsRootChapter = $true
@@ -485,12 +503,15 @@ function Get-RootImageLayout {
 }
 
 function Get-PreferredCoverFile {
-    param([string]$ComicPath)
+    param(
+        [string]$ComicPath,
+        [switch]$UseFilenameOrder
+    )
     $namedCovers = @(Get-ChildItem -LiteralPath $ComicPath -File -ErrorAction SilentlyContinue | Where-Object {
         $_.BaseName -ieq 'cover' -and $script:ImageExtensions -contains $_.Extension.ToLowerInvariant() -and $_.Length -gt 0
     } | Sort-Object Name)
     if ($namedCovers.Count -gt 0) { return $namedCovers[0] }
-    $layout = Get-RootImageLayout -ComicPath $ComicPath
+    $layout = Get-RootImageLayout -ComicPath $ComicPath -UseFilenameOrder:$UseFilenameOrder
     if ($layout.Recognized -and $null -ne $layout.CoverCandidate -and $layout.CoverCandidate.Length -gt 0) {
         return $layout.CoverCandidate
     }
@@ -508,7 +529,10 @@ function Get-ChapterDirectories {
 }
 
 function Get-SourceChapterEntries {
-    param([string]$ComicPath)
+    param(
+        [string]$ComicPath,
+        [switch]$UseFilenameOrder
+    )
     $chapterDirectories = @(Get-ChapterDirectories -ComicPath $ComicPath)
     $rootImages = @(Get-RootBodyImageFiles -ComicPath $ComicPath)
     if ($chapterDirectories.Count -gt 0 -and $rootImages.Count -gt 0) {
@@ -517,7 +541,7 @@ function Get-SourceChapterEntries {
     if ($chapterDirectories.Count -gt 0) {
         $entries = @($chapterDirectories | ForEach-Object {
             $files = @(Get-ChildItem -LiteralPath $_.FullName -File | Where-Object { $script:ImageExtensions -contains $_.Extension.ToLowerInvariant() })
-            $sequence = Get-FlexibleImageSequence -Files $files -Context $_.Name
+            $sequence = Get-FlexibleImageSequence -Files $files -Context $_.Name -UseFilenameOrder:$UseFilenameOrder
             [pscustomobject]@{
                 Name = $_.Name
                 IsRootChapter = $false
@@ -529,9 +553,9 @@ function Get-SourceChapterEntries {
         return @(Set-SourceChapterEntryOrder -ComicPath $ComicPath -Entries $entries)
     }
     if ($rootImages.Count -gt 0) {
-        $layout = Get-RootImageLayout -ComicPath $ComicPath
+        $layout = Get-RootImageLayout -ComicPath $ComicPath -UseFilenameOrder:$UseFilenameOrder
         if ($layout.Recognized) { return @(Set-SourceChapterEntryOrder -ComicPath $ComicPath -Entries @($layout.Entries)) }
-        $sequence = Get-FlexibleImageSequence -Files $rootImages -Context $script:RootChapterToken
+        $sequence = Get-FlexibleImageSequence -Files $rootImages -Context $script:RootChapterToken -UseFilenameOrder:$UseFilenameOrder
         $entries = @([pscustomobject]@{
             Name = $script:RootChapterToken
             IsRootChapter = $true
@@ -549,7 +573,8 @@ function Get-SourceChapterInfo {
         [string]$LibraryRoot,
         [string]$SourceFolder,
         [string]$SourceChapter,
-        [hashtable]$SourceEntriesCache = $null
+        [hashtable]$SourceEntriesCache = $null,
+        [switch]$UseFilenameOrder
     )
     if (-not (Test-SimpleFolderName $SourceFolder)) {
         throw ('来源漫画文件夹名称不合法：' + $SourceFolder)
@@ -558,12 +583,13 @@ function Get-SourceChapterInfo {
     if (-not (Test-Path -LiteralPath $comicPath -PathType Container)) {
         throw ('来源漫画文件夹不存在：' + $SourceFolder)
     }
-    if ($null -ne $SourceEntriesCache -and $SourceEntriesCache.ContainsKey($SourceFolder)) {
-        $entries = @($SourceEntriesCache[$SourceFolder])
+    $sourceCacheKey = $SourceFolder + '|' + $(if ($UseFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+    if ($null -ne $SourceEntriesCache -and $SourceEntriesCache.ContainsKey($sourceCacheKey)) {
+        $entries = @($SourceEntriesCache[$sourceCacheKey])
     }
     else {
-        $entries = @(Get-SourceChapterEntries -ComicPath $comicPath)
-        if ($null -ne $SourceEntriesCache) { $SourceEntriesCache[$SourceFolder] = @($entries) }
+        $entries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$UseFilenameOrder)
+        if ($null -ne $SourceEntriesCache) { $SourceEntriesCache[$sourceCacheKey] = @($entries) }
     }
     $entry = @($entries | Where-Object { $_.Name -ceq $SourceChapter } | Select-Object -First 1)
     if ($entry.Count -eq 0) { throw ('来源章节不存在或命名分组已经变化：' + $SourceFolder + '\' + $SourceChapter) }
@@ -611,13 +637,30 @@ function Get-CandidateFolders {
         $chapterDirectories = @(Get-ChapterDirectories -ComicPath $directory.FullName)
         $rootImages = @(Get-RootBodyImageFiles -ComicPath $directory.FullName)
         if ($chapterDirectories.Count -eq 0 -and $rootImages.Count -eq 0) { continue }
+        $candidateChapterCount = $chapterDirectories.Count
+        if ($candidateChapterCount -eq 0) {
+            try { $candidateChapterCount = @(Get-SourceChapterEntries -ComicPath $directory.FullName).Count }
+            catch {
+                if ([bool]$_.Exception.Data['CanUseFilenameOrder']) {
+                    $candidateChapterCount = @(Get-SourceChapterEntries -ComicPath $directory.FullName -UseFilenameOrder).Count
+                }
+                else { $candidateChapterCount = 0 }
+            }
+        }
+        $candidateHasCover = $false
+        try { $candidateHasCover = ($null -ne (Get-PreferredCoverFile -ComicPath $directory.FullName)) }
+        catch {
+            if ([bool]$_.Exception.Data['CanUseFilenameOrder']) {
+                $candidateHasCover = ($null -ne (Get-PreferredCoverFile -ComicPath $directory.FullName -UseFilenameOrder))
+            }
+        }
         $candidates += [pscustomobject]@{
             Name = $directory.Name
             FullName = $directory.FullName
-            ChapterCount = if ($chapterDirectories.Count -gt 0) { $chapterDirectories.Count } else { @(Get-SourceChapterEntries -ComicPath $directory.FullName).Count }
+            ChapterCount = $candidateChapterCount
             IsAmbiguous = ($chapterDirectories.Count -gt 0 -and $rootImages.Count -gt 0)
             UsesRootImages = ($chapterDirectories.Count -eq 0 -and $rootImages.Count -gt 0)
-            HasCover = ($null -ne (Get-PreferredCoverFile -ComicPath $directory.FullName))
+            HasCover = $candidateHasCover
         }
     }
     return @($candidates)
@@ -704,6 +747,11 @@ function Test-OrganizerPlan {
     $omissionWarnings = New-Object 'System.Collections.Generic.List[string]'
     $overlapWarnings = New-Object 'System.Collections.Generic.List[string]'
     $simpleOverlapWarnings = New-Object 'System.Collections.Generic.List[string]'
+    $filenameOrderSources = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($sourceValue in @((Get-ObjectProperty -Object $Plan -Name 'filenameOrderSources' -Default @()))) {
+        $sourceText = ([string]$sourceValue).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($sourceText)) { [void]$filenameOrderSources.Add($sourceText) }
+    }
     $outputName = [string](Get-ObjectProperty -Object $Plan -Name 'outputName' -Default '')
     if (-not (Test-SimpleFolderName $outputName)) {
         $errors.Add('输出漫画名称为空或含有 Windows 文件夹不允许的字符。')
@@ -712,12 +760,28 @@ function Test-OrganizerPlan {
         $errors.Add(('输出漫画名称不能是“' + $script:OutputFolderName + '”。'))
     }
 
-    $outputBase = [IO.Path]::GetFullPath((Join-Path $LibraryRoot $script:OutputFolderName))
+    $outputDirectoryValue = ([string](Get-ObjectProperty -Object $Plan -Name 'outputDirectory' -Default '')).Trim()
+    if ([string]::IsNullOrWhiteSpace($outputDirectoryValue)) {
+        $outputDirectoryValue = Join-Path $LibraryRoot $script:OutputFolderName
+    }
+    $outputBase = ''
+    try {
+        $outputBase = if ([IO.Path]::IsPathRooted($outputDirectoryValue)) {
+            [IO.Path]::GetFullPath($outputDirectoryValue)
+        }
+        else {
+            [IO.Path]::GetFullPath((Join-Path $LibraryRoot $outputDirectoryValue))
+        }
+        if (Test-Path -LiteralPath $outputBase -PathType Leaf) {
+            $errors.Add(('输出目标是文件而不是文件夹：' + $outputBase))
+        }
+    }
+    catch { $errors.Add(('输出目标文件夹路径无效：' + $outputDirectoryValue)) }
     $outputPath = ''
-    if (Test-SimpleFolderName $outputName) {
+    if (Test-SimpleFolderName $outputName -and -not [string]::IsNullOrWhiteSpace($outputBase)) {
         $outputPath = [IO.Path]::GetFullPath((Join-Path $outputBase $outputName))
-        if ([IO.Path]::GetDirectoryName($outputPath) -cne $outputBase) {
-            $errors.Add('输出路径超出了整理完成目录。')
+        if (-not [IO.Path]::GetDirectoryName($outputPath).Equals($outputBase, [StringComparison]::OrdinalIgnoreCase)) {
+            $errors.Add('输出漫画路径超出了所选目标文件夹。')
         }
         elseif (-not $IgnoreExistingOutput -and (Test-Path -LiteralPath $outputPath)) {
             $errors.Add(('输出文件夹已经存在，不会覆盖：' + $outputPath))
@@ -748,6 +812,15 @@ function Test-OrganizerPlan {
             continue
         }
         [void]$selectedSourceFolders.Add($sourceFolderText)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($outputBase)) {
+        foreach ($sourceFolderText in @($selectedSourceFolders)) {
+            $sourceFolderFull = [IO.Path]::GetFullPath((Join-Path $LibraryRoot $sourceFolderText)).TrimEnd('\')
+            $sourcePrefix = $sourceFolderFull + '\'
+            if ($outputBase.Equals($sourceFolderFull, [StringComparison]::OrdinalIgnoreCase) -or $outputBase.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $errors.Add(('输出目标文件夹不能位于来源漫画内部：' + $sourceFolderText))
+            }
+        }
     }
     $planRowIndex = 0
 
@@ -802,6 +875,7 @@ function Test-OrganizerPlan {
         }
         $sourceFolder = [string](Get-ObjectProperty -Object $chapter -Name 'sourceFolder' -Default '')
         $sourceChapter = [string](Get-ObjectProperty -Object $chapter -Name 'sourceChapter' -Default '')
+        $useFilenameOrder = $filenameOrderSources.Contains($sourceFolder)
         $start = 0
         $end = 0
         if (-not [int]::TryParse([string](Get-ObjectProperty -Object $chapter -Name 'start' -Default 0), [ref]$start)) {
@@ -818,16 +892,17 @@ function Test-OrganizerPlan {
         }
 
         $sourceKey = $sourceFolder + '|' + $sourceChapter
-        if (-not $sourceCache.ContainsKey($sourceKey)) {
+        $sourceInfoCacheKey = $sourceKey + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+        if (-not $sourceCache.ContainsKey($sourceInfoCacheKey)) {
             try {
-                $sourceCache[$sourceKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache
+                $sourceCache[$sourceInfoCacheKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$useFilenameOrder
             }
             catch {
                 $errors.Add(($sourceFolder + '\' + $sourceChapter + '：' + $_.Exception.Message))
                 continue
             }
         }
-        $sourceInfo = $sourceCache[$sourceKey]
+        $sourceInfo = $sourceCache[$sourceInfoCacheKey]
         if (-not [string]::IsNullOrWhiteSpace($sourceInfo.Warning) -and -not $warnings.Contains($sourceInfo.Warning)) {
             $warnings.Add($sourceInfo.Warning)
         }
@@ -1000,15 +1075,17 @@ function Test-OrganizerPlan {
     $selectedSourceArray = @($selectedSourceFolders)
     for ($sourceFolderIndex = 0; $sourceFolderIndex -lt $selectedSourceArray.Count; $sourceFolderIndex++) {
         $sourceFolder = $selectedSourceArray[$sourceFolderIndex]
+        $useFilenameOrder = $filenameOrderSources.Contains($sourceFolder)
+        $sourceEntriesCacheKey = $sourceFolder + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
         Update-OrganizerProgress -Message ('{0}：检查来源 {1}/{2}｜{3}' -f $ProgressPrefix, ($sourceFolderIndex + 1), $selectedSourceArray.Count, $sourceFolder)
         $comicPath = Join-Path $LibraryRoot $sourceFolder
         try {
-            if ($sourceEntriesCache.ContainsKey($sourceFolder)) {
-                $sourceChapterEntries = @($sourceEntriesCache[$sourceFolder])
+            if ($sourceEntriesCache.ContainsKey($sourceEntriesCacheKey)) {
+                $sourceChapterEntries = @($sourceEntriesCache[$sourceEntriesCacheKey])
             }
             else {
-                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath)
-                $sourceEntriesCache[$sourceFolder] = @($sourceChapterEntries)
+                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$useFilenameOrder)
+                $sourceEntriesCache[$sourceEntriesCacheKey] = @($sourceChapterEntries)
             }
         }
         catch {
@@ -1019,11 +1096,12 @@ function Test-OrganizerPlan {
             $chapterDirectory = $sourceChapterEntries[$sourceChapterIndex]
             Update-OrganizerProgress -Message ('{0}：检查来源 {1}/{2}｜章节 {3}/{4}：{5}' -f $ProgressPrefix, ($sourceFolderIndex + 1), $selectedSourceArray.Count, ($sourceChapterIndex + 1), $sourceChapterEntries.Count, $chapterDirectory.Name)
             $sourceKey = $sourceFolder + '|' + $chapterDirectory.Name
+            $sourceInfoCacheKey = $sourceKey + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
             try {
-                if (-not $sourceCache.ContainsKey($sourceKey)) {
-                    $sourceCache[$sourceKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $chapterDirectory.Name -SourceEntriesCache $sourceEntriesCache
+                if (-not $sourceCache.ContainsKey($sourceInfoCacheKey)) {
+                    $sourceCache[$sourceInfoCacheKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $chapterDirectory.Name -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$useFilenameOrder
                 }
-                $sourceInfo = $sourceCache[$sourceKey]
+                $sourceInfo = $sourceCache[$sourceInfoCacheKey]
                 if (-not $usageBySource.ContainsKey($sourceKey)) {
                     $message = ('来源章节完全未选择：{0}\{1}（{2} 张图片不会输出）' -f $sourceFolder, $chapterDirectory.Name, $sourceInfo.Count)
                     $omissionWarnings.Add($message)
@@ -1080,7 +1158,9 @@ function Test-OrganizerPlan {
     }
     else {
         $coverComicPath = Join-Path $LibraryRoot $coverSource
-        $preferredCover = Get-PreferredCoverFile -ComicPath $coverComicPath
+        $coverUsesFilenameOrder = $filenameOrderSources.Contains($coverSource)
+        $coverEntriesCacheKey = $coverSource + '|' + $(if ($coverUsesFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+        $preferredCover = Get-PreferredCoverFile -ComicPath $coverComicPath -UseFilenameOrder:$coverUsesFilenameOrder
         if ($null -ne $preferredCover) {
             $coverPath = $preferredCover.FullName
             $coverOutputName = 'cover' + $preferredCover.Extension.ToLowerInvariant()
@@ -1091,17 +1171,17 @@ function Test-OrganizerPlan {
         }
         else {
             try {
-                if ($sourceEntriesCache.ContainsKey($coverSource)) {
-                    $coverChapterDirectories = @($sourceEntriesCache[$coverSource])
+                if ($sourceEntriesCache.ContainsKey($coverEntriesCacheKey)) {
+                    $coverChapterDirectories = @($sourceEntriesCache[$coverEntriesCacheKey])
                 }
                 else {
-                    $coverChapterDirectories = @(Get-SourceChapterEntries -ComicPath $coverComicPath)
-                    $sourceEntriesCache[$coverSource] = @($coverChapterDirectories)
+                    $coverChapterDirectories = @(Get-SourceChapterEntries -ComicPath $coverComicPath -UseFilenameOrder:$coverUsesFilenameOrder)
+                    $sourceEntriesCache[$coverEntriesCacheKey] = @($coverChapterDirectories)
                 }
                 if ($coverChapterDirectories.Count -eq 0) {
                     throw '没有可识别的章节文件夹。'
                 }
-                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverChapterDirectories[0].Name -SourceEntriesCache $sourceEntriesCache
+                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverChapterDirectories[0].Name -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$coverUsesFilenameOrder
                 $coverImage = $coverChapterInfo.Images[0]
                 $coverPath = $coverImage.FullName
                 $coverOutputName = 'cover' + $coverImage.Extension.ToLowerInvariant()
@@ -1153,6 +1233,7 @@ function Test-OrganizerPlan {
         OutputName = $outputName
         OutputBase = $outputBase
         OutputPath = $outputPath
+        FilenameOrderSources = @($filenameOrderSources)
         CoverSource = $coverSource
         CoverPath = $coverPath
         CoverOutputName = $coverOutputName
@@ -1298,7 +1379,7 @@ function Invoke-OrganizerPlan {
         throw '整理方案未通过核验。'
     }
     if (-not (Test-Path -LiteralPath $Audit.OutputBase -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $Audit.OutputBase)
+        [void](New-Item -ItemType Directory -Path $Audit.OutputBase -Force)
     }
     if (Test-Path -LiteralPath $Audit.OutputPath) {
         throw ('输出文件夹已经存在，不会覆盖：' + $Audit.OutputPath)
@@ -1368,6 +1449,75 @@ function Invoke-OrganizerPlan {
         }
         throw
     }
+}
+
+function Show-ImageOrderFallbackDialog {
+    param(
+        [System.Windows.Forms.IWin32Window]$Owner,
+        [string]$SourceName,
+        [string]$Problem
+    )
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = '图片顺序识别失败'
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.Size = New-Object System.Drawing.Size(720, 440)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(620, 380)
+    $dialog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '“{0}”的图片页码未通过连续性检查' -f $SourceName
+    $title.AutoSize = $true
+    $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
+    $title.Location = New-Object System.Drawing.Point(18, 18)
+    $dialog.Controls.Add($title)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '你可以取消并修正文件名，也可以按当前文件名进行自然排序（例如 2.jpg 会排在 10.jpg 前）。继续后，整理器会记住这个来源在当前方案中的选择，但无法自动判断是否真的缺图。'
+    $hint.AutoSize = $false
+    $hint.Location = New-Object System.Drawing.Point(18, 52)
+    $hint.Size = New-Object System.Drawing.Size(670, 58)
+    $hint.Anchor = 'Top,Left,Right'
+    $dialog.Controls.Add($hint)
+
+    $details = New-Object System.Windows.Forms.TextBox
+    $details.Multiline = $true
+    $details.ReadOnly = $true
+    $details.ScrollBars = 'Vertical'
+    $details.WordWrap = $true
+    $details.Location = New-Object System.Drawing.Point(18, 116)
+    $details.Size = New-Object System.Drawing.Size(670, 220)
+    $details.Anchor = 'Top,Bottom,Left,Right'
+    $details.Text = $Problem
+    $dialog.Controls.Add($details)
+
+    $decision = [pscustomobject]@{ Continue = $false }
+    $continueButton = New-Object System.Windows.Forms.Button
+    $continueButton.Text = '按当前文件名顺序继续'
+    $continueButton.Location = New-Object System.Drawing.Point(396, 352)
+    $continueButton.Size = New-Object System.Drawing.Size(180, 38)
+    $continueButton.Anchor = 'Bottom,Right'
+    $continueButton.BackColor = [System.Drawing.Color]::FromArgb(35, 105, 160)
+    $continueButton.ForeColor = [System.Drawing.Color]::White
+    $continueButton.add_Click({
+        $decision.Continue = $true
+        $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dialog.Close()
+    })
+    $dialog.Controls.Add($continueButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = '取消并返回'
+    $cancelButton.Location = New-Object System.Drawing.Point(584, 352)
+    $cancelButton.Size = New-Object System.Drawing.Size(104, 38)
+    $cancelButton.Anchor = 'Bottom,Right'
+    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancelButton)
+    $dialog.CancelButton = $cancelButton
+
+    [void]$dialog.ShowDialog($Owner)
+    return [bool]$decision.Continue
 }
 
 function Show-OrganizerWindow {
@@ -1463,9 +1613,30 @@ function Show-OrganizerWindow {
     $descriptionButton.BackColor = [System.Drawing.Color]::FromArgb(238, 244, 250)
     $form.Controls.Add($descriptionButton)
 
+    $defaultOutputDirectory = [IO.Path]::GetFullPath((Join-Path $LibraryRoot $script:OutputFolderName))
+    $outputDirectoryLabel = New-Object System.Windows.Forms.Label
+    $outputDirectoryLabel.Text = '输出目标文件夹：'
+    $outputDirectoryLabel.AutoSize = $true
+    $outputDirectoryLabel.Location = New-Object System.Drawing.Point(405, 122)
+    $form.Controls.Add($outputDirectoryLabel)
+
+    $outputDirectory = New-Object System.Windows.Forms.TextBox
+    $outputDirectory.Location = New-Object System.Drawing.Point(510, 116)
+    $outputDirectory.Size = New-Object System.Drawing.Size(850, 27)
+    $outputDirectory.Anchor = 'Top,Left,Right'
+    $outputDirectory.Text = $defaultOutputDirectory
+    $form.Controls.Add($outputDirectory)
+
+    $browseOutputDirectory = New-Object System.Windows.Forms.Button
+    $browseOutputDirectory.Text = '浏览目标文件夹…'
+    $browseOutputDirectory.Location = New-Object System.Drawing.Point(1370, 112)
+    $browseOutputDirectory.Size = New-Object System.Drawing.Size(195, 32)
+    $browseOutputDirectory.Anchor = 'Top,Right'
+    $form.Controls.Add($browseOutputDirectory)
+
     $wholeCoverButton = New-Object System.Windows.Forms.Button
     $wholeCoverButton.Text = '整本封面：按来源'
-    $wholeCoverButton.Location = New-Object System.Drawing.Point(405, 114)
+    $wholeCoverButton.Location = New-Object System.Drawing.Point(405, 150)
     $wholeCoverButton.Size = New-Object System.Drawing.Size(190, 32)
     $wholeCoverButton.Anchor = 'Top,Left'
     $wholeCoverButton.BackColor = [System.Drawing.Color]::FromArgb(238, 244, 250)
@@ -1474,20 +1645,20 @@ function Show-OrganizerWindow {
     $showChapterCovers = New-Object System.Windows.Forms.CheckBox
     $showChapterCovers.Text = '漫画目录显示每话封面（整本总开关）'
     $showChapterCovers.AutoSize = $true
-    $showChapterCovers.Location = New-Object System.Drawing.Point(610, 120)
+    $showChapterCovers.Location = New-Object System.Drawing.Point(610, 156)
     $showChapterCovers.Anchor = 'Top,Left'
     $form.Controls.Add($showChapterCovers)
 
     $chapterCoverButton = New-Object System.Windows.Forms.Button
     $chapterCoverButton.Text = '设置选中话封面…'
-    $chapterCoverButton.Location = New-Object System.Drawing.Point(1375, 114)
+    $chapterCoverButton.Location = New-Object System.Drawing.Point(1375, 150)
     $chapterCoverButton.Size = New-Object System.Drawing.Size(190, 32)
     $chapterCoverButton.Anchor = 'Top,Right'
     $form.Controls.Add($chapterCoverButton)
 
     $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Location = New-Object System.Drawing.Point(405, 154)
-    $grid.Size = New-Object System.Drawing.Size(1160, 390)
+    $grid.Location = New-Object System.Drawing.Point(405, 190)
+    $grid.Size = New-Object System.Drawing.Size(1160, 354)
     $grid.Anchor = 'Top,Bottom,Left,Right'
     $grid.AllowUserToAddRows = $false
     $grid.AllowUserToDeleteRows = $false
@@ -1715,6 +1886,7 @@ function Show-OrganizerWindow {
     $script:OrganizerDescriptionLocked = $false
     $script:OrganizerLoadedOnce = $false
     $script:OrganizerCustomCoverPath = ''
+    $script:OrganizerFilenameOrderSources = @{}
     $historyState = [pscustomobject]@{
         Undo = New-Object System.Collections.ArrayList
         Redo = New-Object System.Collections.ArrayList
@@ -1724,7 +1896,7 @@ function Show-OrganizerWindow {
     }
 
     $operationControls = @(
-        $sourceList, $loadSelected, $loadNewSources, $rescanSources, $outputName, $descriptionButton, $wholeCoverButton, $showChapterCovers, $chapterCoverButton,
+        $sourceList, $loadSelected, $loadNewSources, $rescanSources, $outputName, $outputDirectory, $browseOutputDirectory, $descriptionButton, $wholeCoverButton, $showChapterCovers, $chapterCoverButton,
         $grid, $splitRow, $duplicateRow, $deleteRow, $mergeSelected, $moveTop, $moveUp, $moveDown, $moveBottom, $autoNumber, $selectAllRows, $clearSelectedRows,
         $validateButton, $savePlan, $loadPlan, $helpButton, $clearWorkspace, $undoButton, $redoButton, $generateButton
     )
@@ -1868,6 +2040,19 @@ function Show-OrganizerWindow {
 
     $outputName.add_SelectedIndexChanged({ if (-not $historyState.Restoring) { & $syncDefaultDescriptionFromOutputName } })
     $outputName.add_Enter({ if (-not $historyState.Restoring) { & $pushUndoSnapshot } })
+    $outputDirectory.add_Enter({ if (-not $historyState.Restoring) { & $pushUndoSnapshot } })
+    $browseOutputDirectory.add_Click({
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dialog.Description = '选择整理结果的目标文件夹；最终漫画会在此文件夹下另建同名子文件夹。'
+        $currentDirectory = $outputDirectory.Text.Trim()
+        if (Test-Path -LiteralPath $currentDirectory -PathType Container) { $dialog.SelectedPath = $currentDirectory }
+        else { $dialog.SelectedPath = $LibraryRoot }
+        if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            & $pushUndoSnapshot
+            $outputDirectory.Text = [IO.Path]::GetFullPath($dialog.SelectedPath)
+            $status.Text = ('输出目标文件夹已设为：' + $outputDirectory.Text)
+        }
+    })
     $showChapterCovers.add_MouseDown({ if (-not $historyState.Restoring) { & $pushUndoSnapshot } })
 
     $descriptionButton.add_Click({
@@ -2055,6 +2240,8 @@ function Show-OrganizerWindow {
             Sources = $sourceStates
             OutputChoices = @($outputName.Items | ForEach-Object { [string]$_ })
             OutputName = [string]$outputName.Text
+            OutputDirectory = [string]$outputDirectory.Text
+            FilenameOrderSources = @($script:OrganizerFilenameOrderSources.Keys)
             Description = [string]$script:OrganizerDescription
             DescriptionSource = [string]$script:OrganizerDescriptionSource
             DescriptionLocked = [bool]$script:OrganizerDescriptionLocked
@@ -2090,6 +2277,13 @@ function Show-OrganizerWindow {
             }
             finally { $outputName.EndUpdate() }
             $outputName.Text = [string]$Snapshot.OutputName
+            $snapshotOutputDirectory = if ($null -ne $Snapshot.PSObject.Properties['OutputDirectory']) { [string]$Snapshot.OutputDirectory } else { '' }
+            $outputDirectory.Text = if ([string]::IsNullOrWhiteSpace($snapshotOutputDirectory)) { $defaultOutputDirectory } else { $snapshotOutputDirectory }
+            $script:OrganizerFilenameOrderSources = @{}
+            $snapshotFilenameOrderSources = if ($null -ne $Snapshot.PSObject.Properties['FilenameOrderSources']) { @($Snapshot.FilenameOrderSources) } else { @() }
+            foreach ($sourceName in $snapshotFilenameOrderSources) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$sourceName)) { $script:OrganizerFilenameOrderSources[[string]$sourceName] = $true }
+            }
 
             $grid.SuspendLayout()
             try {
@@ -2181,7 +2375,7 @@ function Show-OrganizerWindow {
             if ($rowIndex -gt $OwnerRow.Index -and $partRow.Cells['Merge'].Value -ne $true) { break }
             $sourceFolder = [string]$partRow.Cells['SourceFolder'].Value
             $sourceChapter = [string]$partRow.Cells['SourceChapter'].Value
-            $sourceInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter
+            $sourceInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -UseFilenameOrder:$($script:OrganizerFilenameOrderSources.ContainsKey($sourceFolder))
             $start = 0
             $end = 0
             if (-not [int]::TryParse([string]$partRow.Cells['Start'].Value, [ref]$start) -or
@@ -2509,8 +2703,10 @@ function Show-OrganizerWindow {
             $selectedCoverSource = [string]$grid.Rows[0].Cells['SourceFolder'].Value
         }
         return [pscustomobject][ordered]@{
-            schemaVersion = 8
+            schemaVersion = 9
             outputName = $outputName.Text.Trim()
+            outputDirectory = $outputDirectory.Text.Trim()
+            filenameOrderSources = @($script:OrganizerFilenameOrderSources.Keys)
             coverSource = $selectedCoverSource
             customCoverPath = $script:OrganizerCustomCoverPath
             showChapterCovers = [bool]$showChapterCovers.Checked
@@ -2531,6 +2727,13 @@ function Show-OrganizerWindow {
         $grid.Rows.Clear()
         $planOutputName = [string](Get-ObjectProperty -Object $Plan -Name 'outputName' -Default '')
         $outputName.Text = $planOutputName
+        $planOutputDirectory = ([string](Get-ObjectProperty -Object $Plan -Name 'outputDirectory' -Default '')).Trim()
+        $outputDirectory.Text = if ([string]::IsNullOrWhiteSpace($planOutputDirectory)) { $defaultOutputDirectory } elseif ([IO.Path]::IsPathRooted($planOutputDirectory)) { [IO.Path]::GetFullPath($planOutputDirectory) } else { [IO.Path]::GetFullPath((Join-Path $LibraryRoot $planOutputDirectory)) }
+        $script:OrganizerFilenameOrderSources = @{}
+        foreach ($filenameOrderSource in @((Get-ObjectProperty -Object $Plan -Name 'filenameOrderSources' -Default @()))) {
+            $filenameOrderSourceText = ([string]$filenameOrderSource).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($filenameOrderSourceText)) { $script:OrganizerFilenameOrderSources[$filenameOrderSourceText] = $true }
+        }
         $sourceNames = @((Get-ObjectProperty -Object $Plan -Name 'selectedSourceFolders' -Default @()) | ForEach-Object {
             [string]$_
         } | Where-Object { $_ } | Select-Object -Unique)
@@ -2566,7 +2769,7 @@ function Show-OrganizerWindow {
                 $total = ''
                 $sourceInfo = $null
                 try {
-                    $sourceInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache
+                    $sourceInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$($script:OrganizerFilenameOrderSources.ContainsKey($sourceFolder))
                     $total = $sourceInfo.Count
                 }
                 catch {}
@@ -2634,7 +2837,20 @@ function Show-OrganizerWindow {
         try {
             foreach ($name in $Names) {
                 $comicPath = Join-Path $LibraryRoot $name
-                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath)
+                $useFilenameOrder = $script:OrganizerFilenameOrderSources.ContainsKey($name)
+                try {
+                    $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$useFilenameOrder)
+                }
+                catch {
+                    if (-not $useFilenameOrder -and [bool]$_.Exception.Data['CanUseFilenameOrder']) {
+                        $useFilenameOrder = Show-ImageOrderFallbackDialog -Owner $form -SourceName $name -Problem $_.Exception.Message
+                        if (-not $useFilenameOrder) { throw }
+                        $script:OrganizerFilenameOrderSources[$name] = $true
+                        $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder)
+                        $orderWarnings += ($name + '：已按当前文件名自然排序；无法自动判断是否缺图。')
+                    }
+                    else { throw }
+                }
                 if ($sourceChapterEntries.Count -gt 0 -and [string]$sourceChapterEntries[0].OrderSource -eq 'Metadata') {
                     $metadataOrderSources += $name
                 }
@@ -2770,7 +2986,7 @@ function Show-OrganizerWindow {
                 $oldTotal = 0
                 [void][int]::TryParse([string]$row.Cells['Total'].Value, [ref]$oldTotal)
                 try {
-                    $refreshedSourceInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache
+                    $refreshedSourceInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$($script:OrganizerFilenameOrderSources.ContainsKey($sourceFolder))
                     $newTotal = $refreshedSourceInfo.Count
                     $endValue = 0
                     $endWasTotal = [int]::TryParse([string]$row.Cells['End'].Value, [ref]$endValue) -and $oldTotal -gt 0 -and $endValue -eq $oldTotal
@@ -3101,6 +3317,7 @@ function Show-OrganizerWindow {
             $grid.Rows.Clear()
             $outputName.Items.Clear()
             $outputName.Text = ''
+            $outputDirectory.Text = $defaultOutputDirectory
             for ($itemIndex = 0; $itemIndex -lt $sourceList.Items.Count; $itemIndex++) { $sourceList.SetItemChecked($itemIndex, $false) }
             $showChapterCovers.Checked = $false
             $script:lastDefaultOutput = ''
@@ -3108,6 +3325,7 @@ function Show-OrganizerWindow {
             $script:OrganizerDescriptionSource = ''
             $script:OrganizerDescriptionLocked = $false
             $script:OrganizerCustomCoverPath = ''
+            $script:OrganizerFilenameOrderSources = @{}
             $script:OrganizerLoadedOnce = $false
             $loadSelected.Text = '载入所选文件夹'
             $loadNewSources.Enabled = $false
@@ -3136,10 +3354,10 @@ function Show-OrganizerWindow {
 11. “整本封面”可沿用勾选来源，也可选择任意本地图片；自选图片只会复制，不会改动原文件。
 12. “漫画目录显示每话封面”是整本总开关：未勾选时目录不显示任何章节缩略图；勾选后，每行设置才会生效。“自选”会复制外部图片到漫画阅读器资源；“本地图片插入为首图”会在整理结果中把外部图片输出为 0001、原正文顺延并把元数据设为首图；“该话其他图片”直接引用本话正文，不会复制。“元数据实际指向”列会显示跟随后的最终结果。
 13. 图片被重复使用不再直接报错中止；整理前会汇总重叠范围并二次确认，疑似简单边界手误会单独标明。
-14. 原文件不会修改；结果输出到“整理完成”，正文统一重命名为 0001、0002……。
+14. 原文件不会修改；目标文件夹默认是工具同级的“整理完成”，也可在顶部输入或浏览选择其他目标文件夹。最终漫画会在目标文件夹下另建同名子文件夹，正文统一重命名为 0001、0002……。
 15. “从选中行后续编号”只计算合并后的独立逻辑章节，并入同一话的来源行不会占号，也不会改写其灰显的原话序；连续勾选多个逻辑章节时以最后一个为锚点。
 16. “清空右侧内容”会二次确认，只清空当前整理方案，不删除原漫画，也保留左侧来源文件夹库。
-17. 纯数字或复合页码会检查重复和缺号；无法识别的名称排序模式会明确警告无法判断缺图。
+17. 纯数字或复合页码会检查重复和缺号；识别失败时会显示具体错误，可取消修正，也可选择“按当前文件名顺序继续”。后者使用自然排序，但无法判断是否缺图。
 18. “撤销 / 恢复”会保存最近 40 次表格与界面操作，包括行内容、顺序、简介、整本封面、章节封面和载入状态；也可使用 Ctrl+Z / Ctrl+Y。
 '@
         & $showMessage $helpText '漫画整理器使用说明' ([System.Windows.Forms.MessageBoxIcon]::Information)
@@ -3294,6 +3512,7 @@ function Show-OrganizerWindow {
         if ($smokeSourceIndex -ge 0) { $sourceList.SetItemChecked($smokeSourceIndex, $true) }
         $smokeLoadResult = & $addSourceRows @([string]$smokeCandidate.Name) $true
         if ($null -eq $smokeLoadResult -or $grid.Rows.Count -eq 0) { throw '整理器 UI 冒烟测试无法载入章节行。' }
+        if ([IO.Path]::GetFullPath($outputDirectory.Text) -ne $defaultOutputDirectory -or -not $browseOutputDirectory.Text.StartsWith('浏览目标文件夹')) { throw '整理器没有正确显示默认输出目录或自选目标文件夹按钮。' }
         if ([string]::IsNullOrWhiteSpace([string]$grid.Rows[0].Cells['MetadataCoverInfo'].Value)) { throw '整理器没有显示“跟随元数据”的实际章节封面指向。' }
         if (-not $chapterCoverColumn.Items.Contains('该话其他图片') -or -not $chapterCoverMenu.Items.Contains($chapterBodyCover)) { throw '整理器缺少“该话其他图片”章节封面选项。' }
         if (-not $chapterCoverColumn.Items.Contains('本地图片插入为首图') -or -not $chapterCoverMenu.Items.Contains($insertLocalAsFirst)) { throw '整理器缺少“本地图片插入为首图”选项。' }
