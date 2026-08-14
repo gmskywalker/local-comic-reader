@@ -8,6 +8,7 @@ param(
     [switch]$IncludeCover,
     [switch]$AppendFormatToFolderName,
     [switch]$AutoNumberDuplicates,
+    [switch]$SplitRootGroups,
     [switch]$NonInteractive,
     [switch]$ValidateOnly,
     [switch]$ForceIssues,
@@ -51,6 +52,7 @@ function Get-ExporterSettings {
         OpenAfterExport = $true
         AppendFormat = $false
         AutoNumberDuplicates = $false
+        SplitRootGroups = $false
         OutputPath = ''
     }
     $key = $null
@@ -63,6 +65,7 @@ function Get-ExporterSettings {
         $settings.OpenAfterExport = ConvertTo-SettingBoolean -Value $key.GetValue('OpenAfterExport', $null) -DefaultValue $true
         $settings.AppendFormat = ConvertTo-SettingBoolean -Value $key.GetValue('AppendFormat', $null) -DefaultValue $false
         $settings.AutoNumberDuplicates = ConvertTo-SettingBoolean -Value $key.GetValue('AutoNumberDuplicates', $null) -DefaultValue $false
+        $settings.SplitRootGroups = ConvertTo-SettingBoolean -Value $key.GetValue('SplitRootGroups', $null) -DefaultValue $false
         $settings.OutputPath = [string]$key.GetValue('OutputPath', '')
     }
     catch {
@@ -81,6 +84,7 @@ function Save-ExporterSettings {
         [bool]$OpenAfterExport,
         [bool]$AppendFormat,
         [bool]$AutoNumberDuplicates,
+        [bool]$SplitRootGroups,
         [string]$SavedOutputPath
     )
     $key = $null
@@ -91,6 +95,7 @@ function Save-ExporterSettings {
         $key.SetValue('OpenAfterExport', [int]$OpenAfterExport, [Microsoft.Win32.RegistryValueKind]::DWord)
         $key.SetValue('AppendFormat', [int]$AppendFormat, [Microsoft.Win32.RegistryValueKind]::DWord)
         $key.SetValue('AutoNumberDuplicates', [int]$AutoNumberDuplicates, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $key.SetValue('SplitRootGroups', [int]$SplitRootGroups, [Microsoft.Win32.RegistryValueKind]::DWord)
         $key.SetValue('OutputPath', [string]$SavedOutputPath, [Microsoft.Win32.RegistryValueKind]::String)
     }
     catch {
@@ -452,7 +457,10 @@ function Read-ComicMetadata {
 }
 
 function Get-ComicPlan {
-    param([System.IO.DirectoryInfo]$ComicDirectory)
+    param(
+        [System.IO.DirectoryInfo]$ComicDirectory,
+        [switch]$SplitRootGroups
+    )
     $issues = New-Object 'System.Collections.Generic.List[string]'
     $warnings = New-Object 'System.Collections.Generic.List[string]'
     $cover = Get-CoverFile -ComicPath $ComicDirectory.FullName
@@ -473,7 +481,7 @@ function Get-ComicPlan {
 
     if ($rootImages.Count -gt 0) {
         $rootLayout = Get-RootCompositeGroups -Files $rootImages
-        if ($rootLayout.Recognized) {
+        if ($rootLayout.Recognized -and $SplitRootGroups) {
             foreach ($group in $rootLayout.Groups) {
                 $sequence = Get-FlexibleImageSequence -Files $group.Files -Context ($ComicDirectory.Name + ' / ' + $group.Name)
                 foreach ($message in $sequence.Issues) { $issues.Add($message) }
@@ -489,7 +497,7 @@ function Get-ComicPlan {
                     SourceKind = 'RootGroup'
                 }
             }
-            $warnings.Add(('根目录图片已按文件名前缀识别为 {0} 个章节组。' -f $rootLayout.Groups.Count))
+            $warnings.Add(('已按你的导出选项，将根目录图片按文件名前缀拆分为 {0} 个章节组。' -f $rootLayout.Groups.Count))
         }
         else {
             $rootLabel = if (@($directoryScan.Chapters).Count -gt 0) { '根目录正文' } else { '全一话' }
@@ -505,6 +513,9 @@ function Get-ComicPlan {
                 MetadataOrder = 0
                 MetadataMatched = $false
                 SourceKind = 'RootBody'
+            }
+            if ($rootLayout.Recognized) {
+                $warnings.Add(('检测到 {0} 个可能的文件名前缀分组；当前按“一个根目录＝一话”导出。' -f $rootLayout.Groups.Count))
             }
         }
     }
@@ -1432,14 +1443,14 @@ function Show-ExporterWindow {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [Windows.Forms.Application]::EnableVisualStyles()
-    $savedSettings = if ($SmokeTest) { [pscustomobject]@{ Mode = 'Epub'; IncludeCover = $true; OpenAfterExport = $true; AppendFormat = $false; AutoNumberDuplicates = $false; OutputPath = '' } } else { Get-ExporterSettings }
+    $savedSettings = if ($SmokeTest) { [pscustomobject]@{ Mode = 'Epub'; IncludeCover = $true; OpenAfterExport = $true; AppendFormat = $false; AutoNumberDuplicates = $false; SplitRootGroups = $false; OutputPath = '' } } else { Get-ExporterSettings }
     $restoredOutput = if (-not [string]::IsNullOrWhiteSpace($InitialOutput)) { $InitialOutput } elseif (-not [string]::IsNullOrWhiteSpace($savedSettings.OutputPath)) { $savedSettings.OutputPath } else { Resolve-OutputPath -LibraryRoot $LibraryRoot -Candidate '' }
 
     $form = New-Object Windows.Forms.Form
     $form.Text = '本地漫画 CBZ / EPUB / PDF 导出器'
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object Drawing.Size(1040, 790)
-    $form.MinimumSize = New-Object Drawing.Size(880, 680)
+    $form.Size = New-Object Drawing.Size(1040, 830)
+    $form.MinimumSize = New-Object Drawing.Size(880, 720)
     $form.Font = New-Object Drawing.Font('Microsoft YaHei UI', 10)
 
     $header = New-Object Windows.Forms.Label
@@ -1489,7 +1500,7 @@ function Show-ExporterWindow {
     $modeGroup.Text = '导出方式'
     $modeGroup.Anchor = 'Bottom,Left'
     $modeGroup.Location = New-Object Drawing.Point(28, 528)
-    $modeGroup.Size = New-Object Drawing.Size(430, 142)
+    $modeGroup.Size = New-Object Drawing.Size(430, 172)
     $perChapter = New-Object Windows.Forms.RadioButton
     $perChapter.Text = '每话一个 CBZ（推荐）'
     $perChapter.Checked = $savedSettings.Mode -eq 'PerChapter'
@@ -1519,7 +1530,7 @@ function Show-ExporterWindow {
     $optionsGroup.Text = '选项'
     $optionsGroup.Anchor = 'Bottom,Left'
     $optionsGroup.Location = New-Object Drawing.Point(470, 528)
-    $optionsGroup.Size = New-Object Drawing.Size(310, 142)
+    $optionsGroup.Size = New-Object Drawing.Size(390, 172)
     $coverCheck = New-Object Windows.Forms.CheckBox
     $coverCheck.Text = '把总封面放在第一话 / 整本开头'
     $coverCheck.Checked = $savedSettings.IncludeCover
@@ -1540,38 +1551,44 @@ function Show-ExporterWindow {
     $duplicateCheck.Checked = $savedSettings.AutoNumberDuplicates
     $duplicateCheck.AutoSize = $true
     $duplicateCheck.Location = New-Object Drawing.Point(16, 112)
+    $splitRootGroupsCheck = New-Object Windows.Forms.CheckBox
+    $splitRootGroupsCheck.Text = '按根目录图片文件名分组拆话'
+    $splitRootGroupsCheck.Checked = $savedSettings.SplitRootGroups
+    $splitRootGroupsCheck.AutoSize = $true
+    $splitRootGroupsCheck.Location = New-Object Drawing.Point(16, 140)
     [void]$optionsGroup.Controls.Add($coverCheck)
     [void]$optionsGroup.Controls.Add($openCheck)
     [void]$optionsGroup.Controls.Add($formatFolderCheck)
     [void]$optionsGroup.Controls.Add($duplicateCheck)
+    [void]$optionsGroup.Controls.Add($splitRootGroupsCheck)
 
     $outputLabel = New-Object Windows.Forms.Label
     $outputLabel.Text = '输出目录：'
     $outputLabel.Anchor = 'Bottom,Left'
     $outputLabel.AutoSize = $true
-    $outputLabel.Location = New-Object Drawing.Point(28, 676)
+    $outputLabel.Location = New-Object Drawing.Point(28, 716)
     $outputBox = New-Object Windows.Forms.TextBox
     $outputBox.Anchor = 'Bottom,Left,Right'
-    $outputBox.Location = New-Object Drawing.Point(112, 672)
+    $outputBox.Location = New-Object Drawing.Point(112, 712)
     $outputBox.Size = New-Object Drawing.Size(700, 30)
     $outputBox.Text = $restoredOutput
     $browse = New-Object Windows.Forms.Button
     $browse.Text = '浏览…'
     $browse.Anchor = 'Bottom,Right'
-    $browse.Location = New-Object Drawing.Point(822, 670)
+    $browse.Location = New-Object Drawing.Point(822, 710)
     $browse.Size = New-Object Drawing.Size(80, 34)
     $export = New-Object Windows.Forms.Button
     $export.Text = '开始导出'
     $export.Anchor = 'Bottom,Right'
     $export.BackColor = [Drawing.Color]::FromArgb(45, 118, 174)
     $export.ForeColor = [Drawing.Color]::White
-    $export.Location = New-Object Drawing.Point(910, 670)
+    $export.Location = New-Object Drawing.Point(910, 710)
     $export.Size = New-Object Drawing.Size(90, 34)
 
     $status = New-Object Windows.Forms.Label
     $status.Anchor = 'Bottom,Left,Right'
     $status.AutoEllipsis = $true
-    $status.Location = New-Object Drawing.Point(28, 716)
+    $status.Location = New-Object Drawing.Point(28, 756)
     $status.Size = New-Object Drawing.Size(970, 24)
     $status.ForeColor = [Drawing.Color]::DimGray
 
@@ -1680,10 +1697,11 @@ function Show-ExporterWindow {
 2. “整部漫画一个 CBZ”会把全部图片放进一个文件，但 CBZ 本身没有真正的可点击章节目录。
 3. “整部 EPUB”会生成一整本并带章节目录；具体翻页或连续滚动方式由手机阅读软件决定。
 4. “每话一个 PDF：整话无缝长页”会为每一话生成一个长页 PDF，图片之间不留空隙。
-5. 可选择是否把总封面放在开头、完成后打开输出文件夹，以及是否在输出文件夹名后标注格式。
-6. 默认会阻止同名重复导出；勾选“同名时自动加（1）（2）”后才会保留多个同名结果。
-7. 灰色漫画表示当前输出目录已有同名导出。更换输出目录或启用自动编号后可以再次选择。
-8. 导出只读取图片与章节顺序，不会修改源漫画；JSON、HTML 等网页文件不会写入 CBZ、EPUB 或 PDF 正文。
+5. 根目录直接放图片时默认视为一话；只有勾选“按根目录图片文件名分组拆话”才会按前缀拆成多话。
+6. 可选择是否把总封面放在开头、完成后打开输出文件夹，以及是否在输出文件夹名后标注格式。
+7. 默认会阻止同名重复导出；勾选“同名时自动加（1）（2）”后才会保留多个同名结果。
+8. 灰色漫画表示当前输出目录已有同名导出。更换输出目录或启用自动编号后可以再次选择。
+9. 导出只读取图片与章节顺序，不会修改源漫画；JSON、HTML 等网页文件不会写入 CBZ、EPUB 或 PDF 正文。
 '@
         [Windows.Forms.MessageBox]::Show($form, $helpText, '漫画导出器使用说明', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) | Out-Null
     })
@@ -1724,13 +1742,13 @@ function Show-ExporterWindow {
         try {
             $exportMode = & $getCurrentMode
             if (-not $SmokeTest) {
-                Save-ExporterSettings -SavedMode $exportMode -IncludeCover $coverCheck.Checked -OpenAfterExport $openCheck.Checked -AppendFormat $formatFolderCheck.Checked -AutoNumberDuplicates $duplicateCheck.Checked -SavedOutputPath $outputBox.Text.Trim()
+                Save-ExporterSettings -SavedMode $exportMode -IncludeCover $coverCheck.Checked -OpenAfterExport $openCheck.Checked -AppendFormat $formatFolderCheck.Checked -AutoNumberDuplicates $duplicateCheck.Checked -SplitRootGroups $splitRootGroupsCheck.Checked -SavedOutputPath $outputBox.Text.Trim()
             }
             $plans = @()
             for ($index = 0; $index -lt $selectedDirectories.Count; $index++) {
                 $status.Text = ('正在核验 {0}/{1}：{2}' -f ($index + 1), $selectedDirectories.Count, $selectedDirectories[$index].Name)
                 [Windows.Forms.Application]::DoEvents()
-                $plans += Get-ComicPlan -ComicDirectory $selectedDirectories[$index]
+                $plans += Get-ComicPlan -ComicDirectory $selectedDirectories[$index] -SplitRootGroups:$($splitRootGroupsCheck.Checked)
             }
             $details = New-Object Text.StringBuilder
             foreach ($plan in $plans) {
@@ -1776,7 +1794,7 @@ function Show-ExporterWindow {
             return
         }
         if (-not $SmokeTest) {
-            Save-ExporterSettings -SavedMode (& $getCurrentMode) -IncludeCover $coverCheck.Checked -OpenAfterExport $openCheck.Checked -AppendFormat $formatFolderCheck.Checked -AutoNumberDuplicates $duplicateCheck.Checked -SavedOutputPath $outputBox.Text.Trim()
+            Save-ExporterSettings -SavedMode (& $getCurrentMode) -IncludeCover $coverCheck.Checked -OpenAfterExport $openCheck.Checked -AppendFormat $formatFolderCheck.Checked -AutoNumberDuplicates $duplicateCheck.Checked -SplitRootGroups $splitRootGroupsCheck.Checked -SavedOutputPath $outputBox.Text.Trim()
         }
     })
     & $loadCandidates
@@ -1808,7 +1826,7 @@ try {
         $comicPath = Join-Path $resolvedRoot $ComicName
         if (-not (Test-Path -LiteralPath $comicPath -PathType Container)) { throw ('漫画文件夹不存在：' + $comicPath) }
         if (Test-PathInside -ChildPath $resolvedOutput -ParentPath $comicPath) { throw '输出目录不能放在待导出的漫画内部。' }
-        $plan = Get-ComicPlan -ComicDirectory (Get-Item -LiteralPath $comicPath)
+        $plan = Get-ComicPlan -ComicDirectory (Get-Item -LiteralPath $comicPath) -SplitRootGroups:$SplitRootGroups
         foreach ($message in $plan.Issues) { Write-Host ('[需确认] ' + $message) -ForegroundColor Yellow }
         foreach ($message in $plan.Warnings) { Write-Host ('[提示] ' + $message) -ForegroundColor DarkYellow }
         Write-Host ('[核验] {0}：{1} 话，{2} 张正文图片，元数据顺序={3}' -f $plan.Name, $plan.ChapterCount, $plan.TotalImages, $plan.MetadataUsed)

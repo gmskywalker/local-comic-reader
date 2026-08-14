@@ -204,24 +204,56 @@ function Get-WindowsChapterNameMatchKey {
 
 function Get-SourceChapterOrderConfiguration {
     param([string]$ComicPath)
-    $result = [ordered]@{ Enabled = $false; ExactMap = @{}; NormalizedMap = @{}; Warning = ''; ShowChapterCovers = $false }
+    $result = [ordered]@{
+        Enabled = $false
+        ExactMap = @{}
+        NormalizedMap = @{}
+        CoverExactMap = @{}
+        CoverNormalizedMap = @{}
+        Warning = ''
+        ShowChapterCovers = $false
+        HasShowChapterCoversSetting = $false
+    }
     $metadataPath = Join-Path $ComicPath '元数据.json'
     if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { return [pscustomobject]$result }
     try {
         $metadata = [IO.File]::ReadAllText($metadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
         if ($null -ne $metadata.PSObject.Properties['readerOptions'] -and $null -ne $metadata.readerOptions -and $null -ne $metadata.readerOptions.PSObject.Properties['showChapterCovers']) {
             $result.ShowChapterCovers = [bool]$metadata.readerOptions.showChapterCovers
+            $result.HasShowChapterCoversSetting = $true
         }
         $chapterInfos = if ($null -ne $metadata.PSObject.Properties['chapterInfos']) { @($metadata.chapterInfos) } else { @() }
         if ($chapterInfos.Count -eq 0) { return [pscustomobject]$result }
         $errors = New-Object 'System.Collections.Generic.List[string]'
         $exactMap = @{}
         $normalizedMap = @{}
+        $coverExactMap = @{}
+        $coverNormalizedMap = @{}
         $usedOrders = @{}
         foreach ($chapterInfo in $chapterInfos) {
             $chapterFolder = ''
             if ($null -ne $chapterInfo.PSObject.Properties['chapterFolder']) { $chapterFolder = [string]$chapterInfo.chapterFolder }
             elseif ($null -ne $chapterInfo.PSObject.Properties['chapterTitle']) { $chapterFolder = [string]$chapterInfo.chapterTitle }
+            $normalizedKey = Get-WindowsChapterNameMatchKey -Value $chapterFolder
+            $hasCoverSetting = $null -ne $chapterInfo.PSObject.Properties['coverMode']
+            $rawCoverMode = if ($hasCoverSetting) { ([string]$chapterInfo.coverMode).Trim().ToLowerInvariant() } else { '' }
+            $coverModeIsValid = $hasCoverSetting -and $rawCoverMode -in @('first', 'custom', 'chapter', 'none')
+            $coverMode = if ($coverModeIsValid) { $rawCoverMode } else { 'first' }
+            $coverFile = if ($null -ne $chapterInfo.PSObject.Properties['coverFile']) { ([string]$chapterInfo.coverFile).Trim() } else { '' }
+            $coverEntry = [pscustomobject]@{
+                Folder = $chapterFolder
+                CoverMode = $coverMode
+                CoverFile = $coverFile
+                HasCoverSetting = $hasCoverSetting
+                RawCoverMode = $rawCoverMode
+                CoverModeIsValid = $coverModeIsValid
+            }
+            if (-not [string]::IsNullOrWhiteSpace($chapterFolder) -and -not $coverExactMap.ContainsKey($chapterFolder)) {
+                $coverExactMap[$chapterFolder] = $coverEntry
+            }
+            if (-not [string]::IsNullOrWhiteSpace($normalizedKey) -and -not $coverNormalizedMap.ContainsKey($normalizedKey)) {
+                $coverNormalizedMap[$normalizedKey] = $coverEntry
+            }
             $order = 0
             if ([string]::IsNullOrWhiteSpace($chapterFolder) -or $null -eq $chapterInfo.PSObject.Properties['order'] -or -not [int]::TryParse([string]$chapterInfo.order, [ref]$order) -or $order -lt 1) {
                 $errors.Add('存在缺少章节文件夹名或有效顺序的 chapterInfos 项。')
@@ -235,7 +267,6 @@ function Get-SourceChapterOrderConfiguration {
                 $errors.Add(('章节顺序重复：' + $order))
                 continue
             }
-            $normalizedKey = Get-WindowsChapterNameMatchKey -Value $chapterFolder
             if ([string]::IsNullOrWhiteSpace($normalizedKey)) {
                 $errors.Add(('章节名称无法用于匹配：' + $chapterFolder))
                 continue
@@ -244,14 +275,21 @@ function Get-SourceChapterOrderConfiguration {
                 $errors.Add(('章节名称按 Windows 文件名规则处理后重复：{0}、{1}' -f $normalizedMap[$normalizedKey].Folder, $chapterFolder))
                 continue
             }
-            $coverMode = if ($null -ne $chapterInfo.PSObject.Properties['coverMode']) { ([string]$chapterInfo.coverMode).Trim().ToLowerInvariant() } else { 'first' }
-            if ($coverMode -notin @('first', 'custom', 'chapter', 'none')) { $coverMode = 'first' }
-            $coverFile = if ($null -ne $chapterInfo.PSObject.Properties['coverFile']) { ([string]$chapterInfo.coverFile).Trim() } else { '' }
-            $entry = [pscustomobject]@{ Folder = $chapterFolder; Order = $order; CoverMode = $coverMode; CoverFile = $coverFile }
+            $entry = [pscustomobject]@{
+                Folder = $chapterFolder
+                Order = $order
+                CoverMode = $coverMode
+                CoverFile = $coverFile
+                HasCoverSetting = $hasCoverSetting
+                RawCoverMode = $rawCoverMode
+                CoverModeIsValid = $coverModeIsValid
+            }
             $exactMap[$chapterFolder] = $entry
             $normalizedMap[$normalizedKey] = $entry
             $usedOrders[[string]$order] = $true
         }
+        $result.CoverExactMap = $coverExactMap
+        $result.CoverNormalizedMap = $coverNormalizedMap
         if ($errors.Count -gt 0) {
             $result.Warning = '元数据.json 的章节顺序无效，已改用名称自然排序：' + ($errors -join '；')
             return [pscustomobject]$result
@@ -270,6 +308,27 @@ function Set-SourceChapterEntryOrder {
     param([string]$ComicPath, [object[]]$Entries)
     $naturalEntries = @($Entries | Sort-Object { Get-NaturalNameSortKey -Name $_.Name }, Name)
     $configuration = Get-SourceChapterOrderConfiguration -ComicPath $ComicPath
+    foreach ($entry in $naturalEntries) {
+        $configuredCover = $null
+        if ($configuration.CoverExactMap.ContainsKey($entry.Name)) {
+            $configuredCover = $configuration.CoverExactMap[$entry.Name]
+        }
+        else {
+            $coverNormalizedKey = Get-WindowsChapterNameMatchKey -Value $entry.Name
+            if ($configuration.CoverNormalizedMap.ContainsKey($coverNormalizedKey)) {
+                $configuredCover = $configuration.CoverNormalizedMap[$coverNormalizedKey]
+            }
+        }
+        if ($null -ne $configuredCover) {
+            $entry | Add-Member -NotePropertyName ConfiguredCoverMode -NotePropertyValue ([string]$configuredCover.CoverMode) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredCoverFile -NotePropertyValue ([string]$configuredCover.CoverFile) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredHasCoverSetting -NotePropertyValue ([bool]$configuredCover.HasCoverSetting) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredRawCoverMode -NotePropertyValue ([string]$configuredCover.RawCoverMode) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredCoverModeIsValid -NotePropertyValue ([bool]$configuredCover.CoverModeIsValid) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredShowChapterCovers -NotePropertyValue ([bool]$configuration.ShowChapterCovers) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredHasShowChapterCoversSetting -NotePropertyValue ([bool]$configuration.HasShowChapterCoversSetting) -Force
+        }
+    }
     if (-not $configuration.Enabled) {
         foreach ($entry in $naturalEntries) {
             $entry | Add-Member -NotePropertyName OrderSource -NotePropertyValue 'Natural' -Force
@@ -296,7 +355,11 @@ function Set-SourceChapterEntryOrder {
         $usedMetadataFolders[[string]$configured.Folder] = $true
         $entry | Add-Member -NotePropertyName ConfiguredCoverMode -NotePropertyValue ([string]$configured.CoverMode) -Force
         $entry | Add-Member -NotePropertyName ConfiguredCoverFile -NotePropertyValue ([string]$configured.CoverFile) -Force
+        $entry | Add-Member -NotePropertyName ConfiguredHasCoverSetting -NotePropertyValue ([bool]$configured.HasCoverSetting) -Force
+        $entry | Add-Member -NotePropertyName ConfiguredRawCoverMode -NotePropertyValue ([string]$configured.RawCoverMode) -Force
+        $entry | Add-Member -NotePropertyName ConfiguredCoverModeIsValid -NotePropertyValue ([bool]$configured.CoverModeIsValid) -Force
         $entry | Add-Member -NotePropertyName ConfiguredShowChapterCovers -NotePropertyValue ([bool]$configuration.ShowChapterCovers) -Force
+        $entry | Add-Member -NotePropertyName ConfiguredHasShowChapterCoversSetting -NotePropertyValue ([bool]$configuration.HasShowChapterCoversSetting) -Force
         $matched += [pscustomobject]@{ Entry = $entry; Order = [int]$configured.Order }
     }
     if ($missing.Count -gt 0) {
@@ -415,7 +478,25 @@ function Get-FlexibleImageSequence {
 
     if (@($images | Where-Object { $_.BaseName -notmatch '^\d+$' }).Count -eq 0) {
         try {
-            return [pscustomobject]@{ Images = @(Get-NumericImages -DirectoryPath $images[0].DirectoryName -IgnoreCover); Mode = 'Numeric'; Warning = '' }
+            # Validate exactly the files supplied by the caller. Re-scanning
+            # the whole directory here would accidentally put a filtered
+            # 0000 cover back into the chapter body.
+            $records = @()
+            foreach ($image in $images) {
+                $number = [int64]0
+                if (-not [int64]::TryParse($image.BaseName, [ref]$number)) { throw ('图片编号过大或无效：' + $image.Name) }
+                $records += [pscustomobject]@{ File = $image; Number = $number }
+            }
+            $duplicates = @($records | Group-Object Number | Where-Object Count -gt 1)
+            if ($duplicates.Count -gt 0) { throw ('图片数字编号重复：' + $duplicates[0].Name) }
+            $orderedRecords = @($records | Sort-Object Number, @{ Expression = { $_.File.Name } })
+            if ($orderedRecords[0].Number -ne 1) { throw ('图片编号应从 0001 开始，实际从 ' + $orderedRecords[0].File.Name + ' 开始。') }
+            $numberMap = @{}
+            foreach ($record in $orderedRecords) { $numberMap[[string]$record.Number] = $true }
+            for ($number = 1; $number -le $orderedRecords[-1].Number; $number++) {
+                if (-not $numberMap.ContainsKey([string]$number)) { throw ('缺少图片编号：' + $number.ToString('D4')) }
+            }
+            return [pscustomobject]@{ Images = @($orderedRecords | ForEach-Object File); Mode = 'Numeric'; Warning = '' }
         }
         catch { throw (New-ImageOrderFallbackException -Message ($Context + '：' + $_.Exception.Message)) }
     }
@@ -471,7 +552,11 @@ function Get-RootImageLayout {
     }
     $groups = @($records | Group-Object Prefix)
     if ($records.Count -eq 0 -or $unrecognized.Count -gt 0 -or $standaloneZero.Count -gt 1 -or $groups.Count -lt 2) {
-        return [pscustomobject]@{ Recognized = $false; Entries = @(); CoverCandidate = $null }
+        return [pscustomobject]@{
+            Recognized = $false
+            Entries = @()
+            CoverCandidate = if ($standaloneZero.Count -eq 1) { $standaloneZero[0] } else { $null }
+        }
     }
     $usedNames = @{}
     $entries = @()
@@ -512,7 +597,7 @@ function Get-PreferredCoverFile {
     } | Sort-Object Name)
     if ($namedCovers.Count -gt 0) { return $namedCovers[0] }
     $layout = Get-RootImageLayout -ComicPath $ComicPath -UseFilenameOrder:$UseFilenameOrder
-    if ($layout.Recognized -and $null -ne $layout.CoverCandidate -and $layout.CoverCandidate.Length -gt 0) {
+    if ($null -ne $layout.CoverCandidate -and $layout.CoverCandidate.Length -gt 0) {
         return $layout.CoverCandidate
     }
     return $null
@@ -531,7 +616,8 @@ function Get-ChapterDirectories {
 function Get-SourceChapterEntries {
     param(
         [string]$ComicPath,
-        [switch]$UseFilenameOrder
+        [switch]$UseFilenameOrder,
+        [switch]$SplitRootGroups
     )
     $chapterDirectories = @(Get-ChapterDirectories -ComicPath $ComicPath)
     $rootImages = @(Get-RootBodyImageFiles -ComicPath $ComicPath)
@@ -554,8 +640,13 @@ function Get-SourceChapterEntries {
     }
     if ($rootImages.Count -gt 0) {
         $layout = Get-RootImageLayout -ComicPath $ComicPath -UseFilenameOrder:$UseFilenameOrder
-        if ($layout.Recognized) { return @(Set-SourceChapterEntryOrder -ComicPath $ComicPath -Entries @($layout.Entries)) }
-        $sequence = Get-FlexibleImageSequence -Files $rootImages -Context $script:RootChapterToken -UseFilenameOrder:$UseFilenameOrder
+        if ($layout.Recognized -and $SplitRootGroups) { return @(Set-SourceChapterEntryOrder -ComicPath $ComicPath -Entries @($layout.Entries)) }
+        $singleChapterImages = @($rootImages)
+        if ($null -ne $layout.CoverCandidate) {
+            $coverCandidatePath = [IO.Path]::GetFullPath($layout.CoverCandidate.FullName)
+            $singleChapterImages = @($rootImages | Where-Object { [IO.Path]::GetFullPath($_.FullName) -cne $coverCandidatePath })
+        }
+        $sequence = Get-FlexibleImageSequence -Files $singleChapterImages -Context $script:RootChapterToken -UseFilenameOrder:$UseFilenameOrder
         $entries = @([pscustomobject]@{
             Name = $script:RootChapterToken
             IsRootChapter = $true
@@ -574,7 +665,8 @@ function Get-SourceChapterInfo {
         [string]$SourceFolder,
         [string]$SourceChapter,
         [hashtable]$SourceEntriesCache = $null,
-        [switch]$UseFilenameOrder
+        [switch]$UseFilenameOrder,
+        [switch]$SplitRootGroups
     )
     if (-not (Test-SimpleFolderName $SourceFolder)) {
         throw ('来源漫画文件夹名称不合法：' + $SourceFolder)
@@ -583,15 +675,22 @@ function Get-SourceChapterInfo {
     if (-not (Test-Path -LiteralPath $comicPath -PathType Container)) {
         throw ('来源漫画文件夹不存在：' + $SourceFolder)
     }
-    $sourceCacheKey = $SourceFolder + '|' + $(if ($UseFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+    $sourceCacheKey = $SourceFolder + '|' + $(if ($UseFilenameOrder) { 'FilenameOrder' } else { 'Strict' }) + '|' + $(if ($SplitRootGroups) { 'SplitGroups' } else { 'SingleRoot' })
     if ($null -ne $SourceEntriesCache -and $SourceEntriesCache.ContainsKey($sourceCacheKey)) {
         $entries = @($SourceEntriesCache[$sourceCacheKey])
     }
     else {
-        $entries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$UseFilenameOrder)
+        $entries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$UseFilenameOrder -SplitRootGroups:$SplitRootGroups)
         if ($null -ne $SourceEntriesCache) { $SourceEntriesCache[$sourceCacheKey] = @($entries) }
     }
     $entry = @($entries | Where-Object { $_.Name -ceq $SourceChapter } | Select-Object -First 1)
+    if ($entry.Count -eq 0 -and -not $SplitRootGroups -and $SourceChapter -cne $script:RootChapterToken) {
+        # Old organizer plans could reference an automatically detected root
+        # filename group. Retry that explicit layout only for compatibility;
+        # fresh imports still default to one root folder = one chapter.
+        $legacyEntries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$UseFilenameOrder -SplitRootGroups)
+        $entry = @($legacyEntries | Where-Object { $_.Name -ceq $SourceChapter } | Select-Object -First 1)
+    }
     if ($entry.Count -eq 0) { throw ('来源章节不存在或命名分组已经变化：' + $SourceFolder + '\' + $SourceChapter) }
     return [pscustomobject]@{
         SourceFolder = $SourceFolder
@@ -603,10 +702,13 @@ function Get-SourceChapterInfo {
         Count = @($entry[0].Images).Count
         OrderMode = $entry[0].OrderMode
         Warning = $entry[0].Warning
-        HasConfiguredCover = ($null -ne $entry[0].PSObject.Properties['ConfiguredCoverMode'])
+        HasConfiguredCover = if ($null -ne $entry[0].PSObject.Properties['ConfiguredHasCoverSetting']) { [bool]$entry[0].ConfiguredHasCoverSetting } else { $null -ne $entry[0].PSObject.Properties['ConfiguredCoverMode'] }
         ConfiguredCoverMode = if ($null -ne $entry[0].PSObject.Properties['ConfiguredCoverMode']) { [string]$entry[0].ConfiguredCoverMode } else { 'first' }
         ConfiguredCoverFile = if ($null -ne $entry[0].PSObject.Properties['ConfiguredCoverFile']) { [string]$entry[0].ConfiguredCoverFile } else { '' }
+        ConfiguredRawCoverMode = if ($null -ne $entry[0].PSObject.Properties['ConfiguredRawCoverMode']) { [string]$entry[0].ConfiguredRawCoverMode } else { '' }
+        ConfiguredCoverModeIsValid = if ($null -ne $entry[0].PSObject.Properties['ConfiguredCoverModeIsValid']) { [bool]$entry[0].ConfiguredCoverModeIsValid } else { $true }
         ConfiguredShowChapterCovers = if ($null -ne $entry[0].PSObject.Properties['ConfiguredShowChapterCovers']) { [bool]$entry[0].ConfiguredShowChapterCovers } else { $false }
+        ConfiguredHasShowChapterCoversSetting = if ($null -ne $entry[0].PSObject.Properties['ConfiguredHasShowChapterCoversSetting']) { [bool]$entry[0].ConfiguredHasShowChapterCoversSetting } else { $null -ne $entry[0].PSObject.Properties['ConfiguredShowChapterCovers'] }
     }
 }
 
@@ -752,6 +854,11 @@ function Test-OrganizerPlan {
         $sourceText = ([string]$sourceValue).Trim()
         if (-not [string]::IsNullOrWhiteSpace($sourceText)) { [void]$filenameOrderSources.Add($sourceText) }
     }
+    $splitRootGroupSources = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($sourceValue in @((Get-ObjectProperty -Object $Plan -Name 'splitRootGroupSources' -Default @()))) {
+        $sourceText = ([string]$sourceValue).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($sourceText)) { [void]$splitRootGroupSources.Add($sourceText) }
+    }
     $outputName = [string](Get-ObjectProperty -Object $Plan -Name 'outputName' -Default '')
     if (-not (Test-SimpleFolderName $outputName)) {
         $errors.Add('输出漫画名称为空或含有 Windows 文件夹不允许的字符。')
@@ -789,6 +896,23 @@ function Test-OrganizerPlan {
     }
 
     $planChapters = @((Get-ObjectProperty -Object $Plan -Name 'chapters' -Default @()))
+    # Compatibility with plans created before splitRootGroupSources existed:
+    # infer the old explicit root-group layout from the referenced source row.
+    foreach ($planChapter in $planChapters) {
+        $legacySourceFolder = ([string](Get-ObjectProperty -Object $planChapter -Name 'sourceFolder' -Default '')).Trim()
+        $legacySourceChapter = ([string](Get-ObjectProperty -Object $planChapter -Name 'sourceChapter' -Default '')).Trim()
+        if ([string]::IsNullOrWhiteSpace($legacySourceFolder) -or $legacySourceChapter -eq $script:RootChapterToken -or $splitRootGroupSources.Contains($legacySourceFolder)) { continue }
+        $legacyComicPath = Join-Path $LibraryRoot $legacySourceFolder
+        if (-not (Test-Path -LiteralPath $legacyComicPath -PathType Container)) { continue }
+        if (@(Get-ChapterDirectories -ComicPath $legacyComicPath).Count -gt 0) { continue }
+        try {
+            $legacyLayout = Get-RootImageLayout -ComicPath $legacyComicPath -UseFilenameOrder:$($filenameOrderSources.Contains($legacySourceFolder))
+            if ($legacyLayout.Recognized -and @($legacyLayout.Entries | Where-Object { $_.Name -ieq $legacySourceChapter }).Count -gt 0) {
+                [void]$splitRootGroupSources.Add($legacySourceFolder)
+            }
+        }
+        catch { }
+    }
     $showChapterCovers = [bool](Get-ObjectProperty -Object $Plan -Name 'showChapterCovers' -Default $false)
     if ($planChapters.Count -eq 0) {
         $errors.Add('方案中没有章节。')
@@ -876,6 +1000,7 @@ function Test-OrganizerPlan {
         $sourceFolder = [string](Get-ObjectProperty -Object $chapter -Name 'sourceFolder' -Default '')
         $sourceChapter = [string](Get-ObjectProperty -Object $chapter -Name 'sourceChapter' -Default '')
         $useFilenameOrder = $filenameOrderSources.Contains($sourceFolder)
+        $splitRootGroups = $splitRootGroupSources.Contains($sourceFolder)
         $start = 0
         $end = 0
         if (-not [int]::TryParse([string](Get-ObjectProperty -Object $chapter -Name 'start' -Default 0), [ref]$start)) {
@@ -892,10 +1017,10 @@ function Test-OrganizerPlan {
         }
 
         $sourceKey = $sourceFolder + '|' + $sourceChapter
-        $sourceInfoCacheKey = $sourceKey + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+        $sourceInfoCacheKey = $sourceKey + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' }) + '|' + $(if ($splitRootGroups) { 'SplitGroups' } else { 'SingleRoot' })
         if (-not $sourceCache.ContainsKey($sourceInfoCacheKey)) {
             try {
-                $sourceCache[$sourceInfoCacheKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$useFilenameOrder
+                $sourceCache[$sourceInfoCacheKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $sourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$useFilenameOrder -SplitRootGroups:$splitRootGroups
             }
             catch {
                 $errors.Add(($sourceFolder + '\' + $sourceChapter + '：' + $_.Exception.Message))
@@ -1076,7 +1201,8 @@ function Test-OrganizerPlan {
     for ($sourceFolderIndex = 0; $sourceFolderIndex -lt $selectedSourceArray.Count; $sourceFolderIndex++) {
         $sourceFolder = $selectedSourceArray[$sourceFolderIndex]
         $useFilenameOrder = $filenameOrderSources.Contains($sourceFolder)
-        $sourceEntriesCacheKey = $sourceFolder + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+        $splitRootGroups = $splitRootGroupSources.Contains($sourceFolder)
+        $sourceEntriesCacheKey = $sourceFolder + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' }) + '|' + $(if ($splitRootGroups) { 'SplitGroups' } else { 'SingleRoot' })
         Update-OrganizerProgress -Message ('{0}：检查来源 {1}/{2}｜{3}' -f $ProgressPrefix, ($sourceFolderIndex + 1), $selectedSourceArray.Count, $sourceFolder)
         $comicPath = Join-Path $LibraryRoot $sourceFolder
         try {
@@ -1084,7 +1210,7 @@ function Test-OrganizerPlan {
                 $sourceChapterEntries = @($sourceEntriesCache[$sourceEntriesCacheKey])
             }
             else {
-                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$useFilenameOrder)
+                $sourceChapterEntries = @(Get-SourceChapterEntries -ComicPath $comicPath -UseFilenameOrder:$useFilenameOrder -SplitRootGroups:$splitRootGroups)
                 $sourceEntriesCache[$sourceEntriesCacheKey] = @($sourceChapterEntries)
             }
         }
@@ -1096,10 +1222,10 @@ function Test-OrganizerPlan {
             $chapterDirectory = $sourceChapterEntries[$sourceChapterIndex]
             Update-OrganizerProgress -Message ('{0}：检查来源 {1}/{2}｜章节 {3}/{4}：{5}' -f $ProgressPrefix, ($sourceFolderIndex + 1), $selectedSourceArray.Count, ($sourceChapterIndex + 1), $sourceChapterEntries.Count, $chapterDirectory.Name)
             $sourceKey = $sourceFolder + '|' + $chapterDirectory.Name
-            $sourceInfoCacheKey = $sourceKey + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+            $sourceInfoCacheKey = $sourceKey + '|' + $(if ($useFilenameOrder) { 'FilenameOrder' } else { 'Strict' }) + '|' + $(if ($splitRootGroups) { 'SplitGroups' } else { 'SingleRoot' })
             try {
                 if (-not $sourceCache.ContainsKey($sourceInfoCacheKey)) {
-                    $sourceCache[$sourceInfoCacheKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $chapterDirectory.Name -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$useFilenameOrder
+                    $sourceCache[$sourceInfoCacheKey] = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $sourceFolder -SourceChapter $chapterDirectory.Name -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$useFilenameOrder -SplitRootGroups:$splitRootGroups
                 }
                 $sourceInfo = $sourceCache[$sourceInfoCacheKey]
                 if (-not $usageBySource.ContainsKey($sourceKey)) {
@@ -1181,7 +1307,8 @@ function Test-OrganizerPlan {
     else {
         $coverComicPath = Join-Path $LibraryRoot $coverSource
         $coverUsesFilenameOrder = $filenameOrderSources.Contains($coverSource)
-        $coverEntriesCacheKey = $coverSource + '|' + $(if ($coverUsesFilenameOrder) { 'FilenameOrder' } else { 'Strict' })
+        $coverUsesSplitRootGroups = $splitRootGroupSources.Contains($coverSource)
+        $coverEntriesCacheKey = $coverSource + '|' + $(if ($coverUsesFilenameOrder) { 'FilenameOrder' } else { 'Strict' }) + '|' + $(if ($coverUsesSplitRootGroups) { 'SplitGroups' } else { 'SingleRoot' })
         $preferredCover = Get-PreferredCoverFile -ComicPath $coverComicPath -UseFilenameOrder:$coverUsesFilenameOrder
         if ($null -ne $preferredCover) {
             $coverPath = $preferredCover.FullName
@@ -1197,7 +1324,7 @@ function Test-OrganizerPlan {
                     $coverChapterDirectories = @($sourceEntriesCache[$coverEntriesCacheKey])
                 }
                 else {
-                    $coverChapterDirectories = @(Get-SourceChapterEntries -ComicPath $coverComicPath -UseFilenameOrder:$coverUsesFilenameOrder)
+                    $coverChapterDirectories = @(Get-SourceChapterEntries -ComicPath $coverComicPath -UseFilenameOrder:$coverUsesFilenameOrder -SplitRootGroups:$coverUsesSplitRootGroups)
                     $sourceEntriesCache[$coverEntriesCacheKey] = @($coverChapterDirectories)
                 }
                 if ($coverChapterDirectories.Count -eq 0) {
@@ -1211,7 +1338,7 @@ function Test-OrganizerPlan {
                     $selectedCoverChapter = @($coverChapterDirectories[0])
                     $coverSourceChapter = [string]$selectedCoverChapter[0].Name
                 }
-                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverSourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$coverUsesFilenameOrder
+                $coverChapterInfo = Get-SourceChapterInfo -LibraryRoot $LibraryRoot -SourceFolder $coverSource -SourceChapter $coverSourceChapter -SourceEntriesCache $sourceEntriesCache -UseFilenameOrder:$coverUsesFilenameOrder -SplitRootGroups:$coverUsesSplitRootGroups
                 if ($coverSourceStart -gt $coverChapterInfo.Count) {
                     $warnings.Add(('方案指定的封面来源起始图片超出范围，已改用该章首图：{0}\{1}（{2}）' -f $coverSource, $coverSourceChapter, $coverSourceStart))
                     $coverSourceStart = 1
@@ -1268,6 +1395,7 @@ function Test-OrganizerPlan {
         OutputBase = $outputBase
         OutputPath = $outputPath
         FilenameOrderSources = @($filenameOrderSources)
+        SplitRootGroupSources = @($splitRootGroupSources)
         CoverSource = $coverSource
         CoverSourceChapter = $coverSourceChapter
         CoverSourceStart = $coverSourceStart
@@ -1748,7 +1876,7 @@ function Show-OrganizerWindow {
     $batchColumn.IndeterminateValue = $false
     $batchColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
     [void]$grid.Columns.Add($batchColumn)
-    [void]$grid.Columns.Add('MetadataCoverInfo', '元数据实际指向')
+    [void]$grid.Columns.Add('MetadataCoverInfo', '元数据状态')
     $grid.Columns['Batch'].DisplayIndex = 0
     $grid.Columns['Number'].Width = 85
     $grid.Columns['Number'].ToolTipText = '可填 4.5、1.01，也可直接填“特典话”“番外篇”“插画集”；实际阅读位置由行顺序决定'
@@ -1768,7 +1896,7 @@ function Show-OrganizerWindow {
     $grid.Columns['Batch'].Width = 48
     $grid.Columns['MetadataCoverInfo'].Width = 170
     $grid.Columns['MetadataCoverInfo'].ReadOnly = $true
-    $grid.Columns['MetadataCoverInfo'].ToolTipText = '当章节封面选择“跟随元数据”时，这里显示来源元数据最终会采用首图、隐藏、资源目录自选图片，还是本话正文图片'
+    $grid.Columns['MetadataCoverInfo'].ToolTipText = '只显示来源元数据中实际保存的章节封面状态；未保存 coverMode 时显示“未设置”，不会显示运行时回退结果'
     $grid.Columns['MetadataCoverInfo'].DisplayIndex = $grid.Columns['ChapterCover'].DisplayIndex + 1
     $grid.Columns['Total'].ReadOnly = $true
     $form.Controls.Add($grid)
@@ -1988,25 +2116,40 @@ function Show-OrganizerWindow {
             [bool]$SourceInfo.HasConfiguredCover
         }
         else { $null -ne $SourceInfo.PSObject.Properties['ConfiguredCoverMode'] }
-        if (-not $hasConfiguredCover) {
-            return [pscustomobject]@{ Display = '无设置 → 首图'; Details = '来源没有逐话章节封面元数据；跟随元数据时回退到本话首图。' }
+        $hasGlobalSetting = if ($null -ne $SourceInfo.PSObject.Properties['ConfiguredHasShowChapterCoversSetting']) {
+            [bool]$SourceInfo.ConfiguredHasShowChapterCoversSetting
         }
-        $showCovers = $null -ne $SourceInfo.PSObject.Properties['ConfiguredShowChapterCovers'] -and [bool]$SourceInfo.ConfiguredShowChapterCovers
-        if (-not $showCovers) {
-            return [pscustomobject]@{ Display = '总开关关闭 → 隐藏'; Details = '来源元数据 readerOptions.showChapterCovers 为 false；跟随元数据时不会显示章节封面。' }
+        else { $null -ne $SourceInfo.PSObject.Properties['ConfiguredShowChapterCovers'] }
+        $showCovers = $hasGlobalSetting -and [bool]$SourceInfo.ConfiguredShowChapterCovers
+        $globalSuffix = if ($hasGlobalSetting -and -not $showCovers) { '（整本开关关闭）' } else { '' }
+        $globalDetails = if ($hasGlobalSetting) {
+            "`r`n整本元数据 readerOptions.showChapterCovers = " + $(if ($showCovers) { 'true（开启）' } else { 'false（关闭）' }) + '。'
+        }
+        else { "`r`n整本元数据没有保存 readerOptions.showChapterCovers。" }
+        if (-not $hasConfiguredCover) {
+            return [pscustomobject]@{ Display = '未设置' + $globalSuffix; Details = '来源元数据没有为本话保存 coverMode。' + $globalDetails }
+        }
+        $coverModeIsValid = if ($null -ne $SourceInfo.PSObject.Properties['ConfiguredCoverModeIsValid']) {
+            [bool]$SourceInfo.ConfiguredCoverModeIsValid
+        }
+        else { $true }
+        if (-not $coverModeIsValid) {
+            $rawMode = if ($null -ne $SourceInfo.PSObject.Properties['ConfiguredRawCoverMode']) { ([string]$SourceInfo.ConfiguredRawCoverMode).Trim() } else { '' }
+            $rawDisplay = if ([string]::IsNullOrWhiteSpace($rawMode)) { '空值' } else { $rawMode }
+            return [pscustomobject]@{ Display = '无效：' + $rawDisplay + $globalSuffix; Details = '来源元数据保存了无法识别的 coverMode：' + $rawDisplay + '。' + $globalDetails }
         }
         $mode = ([string]$SourceInfo.ConfiguredCoverMode).Trim().ToLowerInvariant()
         if ($mode -eq 'none') {
-            return [pscustomobject]@{ Display = '隐藏'; Details = '来源元数据把这一话的 coverMode 设为 none（隐藏）。' }
+            return [pscustomobject]@{ Display = '隐藏' + $globalSuffix; Details = '来源元数据把本话 coverMode 设为 none（隐藏）。' + $globalDetails }
         }
         if ($mode -eq 'custom') {
             $relativePath = ([string]$SourceInfo.ConfiguredCoverFile).Trim()
             $displayName = if ([string]::IsNullOrWhiteSpace($relativePath)) { '路径缺失' } else { [IO.Path]::GetFileName($relativePath) }
             $resolvedPath = if ([string]::IsNullOrWhiteSpace($ComicPath)) { '' } else { Resolve-ConfiguredSourceCoverPath -ComicPath $ComicPath -RelativePath $relativePath }
-            $details = '来源元数据自选封面：' + $relativePath
+            $details = "来源元数据把本话 coverMode 设为 custom（自选）。`r`n保存路径：" + $relativePath
             if (-not [string]::IsNullOrWhiteSpace($resolvedPath)) { $details += "`r`n本地位置：" + $resolvedPath }
             else { $details += "`r`n注意：当前路径无法解析或图片已不存在。" }
-            return [pscustomobject]@{ Display = '自选：' + $displayName; Details = $details }
+            return [pscustomobject]@{ Display = '自选：' + $displayName + $globalSuffix; Details = $details + $globalDetails }
         }
         if ($mode -eq 'chapter') {
             $relativePath = ([string]$SourceInfo.ConfiguredCoverFile).Trim()
@@ -2018,12 +2161,12 @@ function Show-OrganizerWindow {
                 }).Count -gt 0
                 if (-not $belongsToChapter) { $resolvedPath = '' }
             }
-            $details = '来源元数据直接引用该话正文图片：' + $relativePath
+            $details = "来源元数据把本话 coverMode 设为 chapter（该话其他图片）。`r`n保存路径：" + $relativePath
             if (-not [string]::IsNullOrWhiteSpace($resolvedPath)) { $details += "`r`n本地位置：" + $resolvedPath }
             else { $details += "`r`n注意：当前路径无法解析或图片已不存在。" }
-            return [pscustomobject]@{ Display = '该话图片：' + $displayName; Details = $details }
+            return [pscustomobject]@{ Display = '该话图片：' + $displayName + $globalSuffix; Details = $details + $globalDetails }
         }
-        return [pscustomobject]@{ Display = '首图'; Details = '来源元数据把这一话设为首图；跟随元数据时采用该话第一张正文图片。' }
+        return [pscustomobject]@{ Display = '首图' + $globalSuffix; Details = '来源元数据把本话 coverMode 设为 first（首图）。' + $globalDetails }
     }
 
     $setMetadataCoverCell = {
@@ -2031,7 +2174,7 @@ function Show-OrganizerWindow {
         $coverDisplay = & $getMetadataCoverDisplay $SourceInfo $ComicPath
         $Row.Cells['MetadataCoverInfo'].Value = [string]$coverDisplay.Display
         $Row.Cells['MetadataCoverInfo'].ToolTipText = [string]$coverDisplay.Details
-        $Row.Cells['ChapterCover'].ToolTipText = '跟随元数据时：' + [string]$coverDisplay.Details
+        $Row.Cells['ChapterCover'].ToolTipText = '来源元数据状态：' + [string]$coverDisplay.Details
     }
 
     $updateDescriptionButton = {
@@ -2467,7 +2610,7 @@ function Show-OrganizerWindow {
         $skippedCount = @($Rows).Count - $usableRows.Count
         if ($Mode -eq 'metadata') {
             $actualValues = @($usableRows | ForEach-Object { [string]$_.Cells['MetadataCoverInfo'].Value } | Where-Object { $_ } | Select-Object -Unique)
-            $status.Text = ('已设为“跟随元数据”；当前实际指向：{0}{1}。详细路径可查看右侧“元数据实际指向”列或悬停提示。' -f ($actualValues -join '、'), $(if ($skippedCount -gt 0) { '；跳过 ' + $skippedCount + ' 行并入内容' } else { '' }))
+            $status.Text = ('已设为“跟随元数据”；当前保存状态：{0}{1}。详细内容可查看右侧“元数据状态”列或悬停提示。' -f ($actualValues -join '、'), $(if ($skippedCount -gt 0) { '；跳过 ' + $skippedCount + ' 行并入内容' } else { '' }))
         }
         else {
             $status.Text = ('已把 {0} 行章节封面设为“{1}”{2}。' -f $usableRows.Count, $display, $(if ($skippedCount -gt 0) { '，并跳过 ' + $skippedCount + ' 行“并入上一话”' } else { '' }))
@@ -2721,6 +2864,7 @@ function Show-OrganizerWindow {
 
     $getPlanFromGrid = {
         $chapters = @()
+        $splitRootGroupSources = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         $selectedCoverSource = ''
         $selectedCoverSourceChapter = ''
         $selectedCoverSourceStart = ''
@@ -2741,6 +2885,14 @@ function Show-OrganizerWindow {
                 chapterCoverMode = if ([string]::IsNullOrWhiteSpace([string]$row.Cells['ChapterCoverMode'].Value)) { 'first' } else { [string]$row.Cells['ChapterCoverMode'].Value }
                 chapterCoverPath = [string]$row.Cells['ChapterCoverPath'].Value
             }
+            $rowSourceFolder = [string]$row.Cells['SourceFolder'].Value
+            $rowSourceChapter = [string]$row.Cells['SourceChapter'].Value
+            if ((Test-SimpleFolderName -Name $rowSourceFolder) -and $rowSourceChapter -cne $script:RootChapterToken) {
+                $rowComicPath = Join-Path $LibraryRoot $rowSourceFolder
+                if ((Test-Path -LiteralPath $rowComicPath -PathType Container) -and @(Get-ChapterDirectories -ComicPath $rowComicPath).Count -eq 0 -and @(Get-RootBodyImageFiles -ComicPath $rowComicPath).Count -gt 0) {
+                    [void]$splitRootGroupSources.Add($rowSourceFolder)
+                }
+            }
         }
         if ([string]::IsNullOrWhiteSpace($selectedCoverSource) -and $grid.Rows.Count -gt 0) {
             $selectedCoverSource = [string]$grid.Rows[0].Cells['SourceFolder'].Value
@@ -2748,10 +2900,11 @@ function Show-OrganizerWindow {
             $selectedCoverSourceStart = [string]$grid.Rows[0].Cells['Start'].Value
         }
         return [pscustomobject][ordered]@{
-            schemaVersion = 10
+            schemaVersion = 11
             outputName = $outputName.Text.Trim()
             outputDirectory = $outputDirectory.Text.Trim()
             filenameOrderSources = @($script:OrganizerFilenameOrderSources.Keys)
+            splitRootGroupSources = @($splitRootGroupSources)
             coverSource = $selectedCoverSource
             coverSourceChapter = $selectedCoverSourceChapter
             coverSourceStart = $selectedCoverSourceStart
@@ -2913,7 +3066,7 @@ function Show-OrganizerWindow {
                     if ($imageCount -eq 0) { throw ($name + '\' + $chapterDirectory.Name + '：没有可载入的图片。') }
                     $outputNumber++
                     $initialFields = Get-InitialOrganizerChapterFields -ChapterName $chapterDirectory.Name -IsRootChapter ([bool]$chapterDirectory.IsRootChapter) -DefaultNumber ([string]$outputNumber) -PreserveNumericNumber ($allSourceNames.Count -eq 1)
-                    $hasConfiguredCover = $null -ne $chapterDirectory.PSObject.Properties['ConfiguredCoverMode']
+                    $hasConfiguredCover = if ($null -ne $chapterDirectory.PSObject.Properties['ConfiguredHasCoverSetting']) { [bool]$chapterDirectory.ConfiguredHasCoverSetting } else { $null -ne $chapterDirectory.PSObject.Properties['ConfiguredCoverMode'] }
                     $chapterCoverMode = if ($hasConfiguredCover) { 'metadata' } else { 'first' }
                     $chapterCoverPath = ''
                     if ($null -ne $chapterDirectory.PSObject.Properties['ConfiguredShowChapterCovers'] -and [bool]$chapterDirectory.ConfiguredShowChapterCovers) {
@@ -3398,13 +3551,13 @@ function Show-OrganizerWindow {
 3. 输出漫画名称可手动输入，也可用右侧下拉箭头直接选择已载入漫画名称。
 4. 简介默认跟随输出漫画名称所选来源；在简介窗口按“确定”后即固定，不再随名称来源变化。
 5. 来源若有元数据.json 且 chapterInfos 完整有效，会按其中的 order 排列；无配置或无法完整匹配时按名称自然排序并提示原因。
-6. 根目录若为 P01_001、P02_001 等格式，会按前缀自动生成多行章节；无法识别页码时按名称自然排序。
+6. 来源漫画若直接把图片放在根目录，默认只载入为一话；P01_001、P02_001 等前缀不会再自动误拆成多话。需要拆话时可载入后使用“按范围拆分选中行”。
 7. 表格从上到下就是阅读顺序，可修改话序、章节名、范围并上下移动；非数字话序会保留原特殊名称。
 8. 第一列“选择”用于批量操作；封面、复制、删除、上移、下移、移到最上和移到最下等按钮优先处理勾选行，未勾选时处理当前行。
 9. “合并所选为同一话”允许所选行不连续；整理器会把它们聚拢到第一条所选行的位置并按原相对顺序合并。并入行会保留原话序、章节名、章节封面和元数据指向并灰显，便于辨认来源，但这些字段逻辑上不会单独生效或占用章节编号。
 10. “按范围拆分选中行”会检查是否连续完整覆盖；1-3,3-10 这类边界重复可自动修正，其他缺口或重叠必须二次确认。
 11. 表格最后一列勾选哪一行，整本封面就会沿用该行来源漫画、来源章节及所选范围的第一张图片；也可通过“整本封面”选择任意本地图片。自选图片只会复制，不会改动原文件。
-12. “漫画目录显示每话封面”是整本总开关：未勾选时目录不显示任何章节缩略图；勾选后，每行设置才会生效。“自选”会复制外部图片到漫画阅读器资源；“本地图片插入为首图”会在整理结果中把外部图片输出为 0001、原正文顺延并把元数据设为首图；“该话其他图片”直接引用本话正文，不会复制。“元数据实际指向”列会显示跟随后的最终结果。
+12. “漫画目录显示每话封面”是整本总开关：未勾选时目录不显示任何章节缩略图；勾选后，每行设置才会生效。“自选”会复制外部图片到漫画阅读器资源；“本地图片插入为首图”会在整理结果中把外部图片输出为 0001、原正文顺延并把元数据设为首图；“该话其他图片”直接引用本话正文，不会复制。“元数据状态”列只显示来源元数据实际保存的设置；没有 coverMode 时显示“未设置”，不会把运行时回退结果写成元数据状态。
 13. 图片被重复使用不再直接报错中止；整理前会汇总重叠范围并二次确认，疑似简单边界手误会单独标明。
 14. 原文件不会修改；目标文件夹默认是工具同级的“整理完成”，也可在顶部输入或浏览选择其他目标文件夹。最终漫画会在目标文件夹下另建同名子文件夹，正文统一重命名为 0001、0002……。
 15. “从选中行后续编号”只计算合并后的独立逻辑章节，并入同一话的来源行不会占号，也不会改写其灰显的原话序；连续勾选多个逻辑章节时以最后一个为锚点。
@@ -3567,7 +3720,9 @@ function Show-OrganizerWindow {
         if ([IO.Path]::GetFullPath($outputDirectory.Text) -ne $defaultOutputDirectory -or -not $browseOutputDirectory.Text.StartsWith('浏览目标文件夹')) { throw '整理器没有正确显示默认输出目录或自选目标文件夹按钮。' }
         $smokeCoverPlan = & $getPlanFromGrid
         if ([string]$smokeCoverPlan.coverSource -cne [string]$grid.Rows[0].Cells['SourceFolder'].Value -or [string]$smokeCoverPlan.coverSourceChapter -cne [string]$grid.Rows[0].Cells['SourceChapter'].Value -or [string]$smokeCoverPlan.coverSourceStart -cne [string]$grid.Rows[0].Cells['Start'].Value) { throw '整理器方案没有完整保存整本封面的来源漫画、来源章节及起始图片。' }
-        if ([string]::IsNullOrWhiteSpace([string]$grid.Rows[0].Cells['MetadataCoverInfo'].Value)) { throw '整理器没有显示“跟随元数据”的实际章节封面指向。' }
+        $smokeMetadataStatus = [string]$grid.Rows[0].Cells['MetadataCoverInfo'].Value
+        if ([string]::IsNullOrWhiteSpace($smokeMetadataStatus) -or $grid.Columns['MetadataCoverInfo'].HeaderText -ne '元数据状态') { throw '整理器没有在独立列显示元数据保存状态。' }
+        if ($smokeMetadataStatus.Contains('→') -or $smokeMetadataStatus.Contains('＝')) { throw '整理器元数据状态仍混入了运行时回退结果。' }
         if (-not $chapterCoverColumn.Items.Contains('该话其他图片') -or -not $chapterCoverMenu.Items.Contains($chapterBodyCover)) { throw '整理器缺少“该话其他图片”章节封面选项。' }
         if (-not $chapterCoverColumn.Items.Contains('本地图片插入为首图') -or -not $chapterCoverMenu.Items.Contains($insertLocalAsFirst)) { throw '整理器缺少“本地图片插入为首图”选项。' }
         if ($undoButton.Text -ne '撤销' -or $redoButton.Text -ne '恢复') { throw '整理器缺少撤销或恢复按钮。' }

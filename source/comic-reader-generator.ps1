@@ -574,7 +574,11 @@ function Get-RootImageLayout {
     }
     $groups = @($records | Group-Object Prefix)
     if ($records.Count -eq 0 -or $unrecognized.Count -gt 0 -or $standaloneZero.Count -gt 1 -or $groups.Count -lt 2) {
-        return [pscustomobject]@{ Recognized = $false; Groups = @(); CoverCandidate = $null }
+        return [pscustomobject]@{
+            Recognized = $false
+            Groups = @()
+            CoverCandidate = if ($standaloneZero.Count -eq 1) { $standaloneZero[0] } else { $null }
+        }
     }
 
     $usedNames = @{}
@@ -894,59 +898,112 @@ function Get-FolderCandidate {
     elseif ($matching.Count -eq 0 -and $rootImages.Count -eq 0) {
         $reasons.Add('没有包含漫画图片的章节文件夹或根目录正文图片')
     }
-    $metadataCoverCounts = @{ first = 0; custom = 0; chapter = 0; none = 0 }
+    $metadataCoverCounts = @{ unset = 0; first = 0; custom = 0; chapter = 0; none = 0; invalid = 0 }
     $metadataCustomDetails = New-Object 'System.Collections.Generic.List[string]'
     $metadataChapterDetails = New-Object 'System.Collections.Generic.List[string]'
+    $metadataInvalidDetails = New-Object 'System.Collections.Generic.List[string]'
+    $recordMetadataCoverState = {
+        param([string]$ChapterName, [AllowNull()][object]$CoverInfo)
+        if ($null -eq $CoverInfo) {
+            $metadataCoverCounts['unset']++
+            return
+        }
+        $hasSetting = if ($null -ne $CoverInfo.PSObject.Properties['HasSetting']) { [bool]$CoverInfo.HasSetting } else { $true }
+        if (-not $hasSetting) {
+            $metadataCoverCounts['unset']++
+            return
+        }
+        $mode = ([string]$CoverInfo.Mode).Trim().ToLowerInvariant()
+        $isValid = if ($null -ne $CoverInfo.PSObject.Properties['IsValid']) { [bool]$CoverInfo.IsValid } else { $mode -in @('first', 'custom', 'chapter', 'none') }
+        if (-not $isValid) {
+            $metadataCoverCounts['invalid']++
+            $rawMode = if ($null -ne $CoverInfo.PSObject.Properties['RawMode']) { ([string]$CoverInfo.RawMode).Trim() } else { $mode }
+            if ([string]::IsNullOrWhiteSpace($rawMode)) { $rawMode = '空值' }
+            $metadataInvalidDetails.Add(('{0}：{1}' -f $ChapterName, $rawMode))
+            return
+        }
+        $metadataCoverCounts[$mode]++
+        if ($mode -eq 'custom') {
+            $metadataCustomDetails.Add(('{0}：{1}' -f $ChapterName, [string]$CoverInfo.File))
+        }
+        elseif ($mode -eq 'chapter') {
+            $metadataChapterDetails.Add(('{0}：{1}' -f $ChapterName, [string]$CoverInfo.File))
+        }
+    }
     if ($matching.Count -gt 0) {
         foreach ($chapterDirectory in $matching) {
             $coverInfo = $null
-            if ($metadata.ChapterCoverMap.ContainsKey($chapterDirectory.Name)) {
-                $coverInfo = $metadata.ChapterCoverMap[$chapterDirectory.Name]
+            if ($metadata.ChapterCoverStatusMap.ContainsKey($chapterDirectory.Name)) {
+                $coverInfo = $metadata.ChapterCoverStatusMap[$chapterDirectory.Name]
             }
             else {
                 $normalizedChapterName = Get-WindowsChapterNameMatchKey -Value $chapterDirectory.Name
-                if ($metadata.ChapterCoverNormalizedMap.ContainsKey($normalizedChapterName)) {
-                    $coverInfo = $metadata.ChapterCoverNormalizedMap[$normalizedChapterName]
+                if ($metadata.ChapterCoverStatusNormalizedMap.ContainsKey($normalizedChapterName)) {
+                    $coverInfo = $metadata.ChapterCoverStatusNormalizedMap[$normalizedChapterName]
                 }
             }
-            $metadataMode = if ($null -eq $coverInfo) { 'first' } else { [string]$coverInfo.Mode }
-            if ($metadataMode -notin @('first', 'custom', 'chapter', 'none')) { $metadataMode = 'first' }
-            $metadataCoverCounts[$metadataMode]++
-            if ($metadataMode -eq 'custom') {
-                $metadataCustomDetails.Add(('{0} → {1}' -f $chapterDirectory.Name, [string]$coverInfo.File))
-            }
-            elseif ($metadataMode -eq 'chapter') {
-                $metadataChapterDetails.Add(('{0} → {1}' -f $chapterDirectory.Name, [string]$coverInfo.File))
-            }
+            & $recordMetadataCoverState $chapterDirectory.Name $coverInfo
         }
     }
     else {
-        $rootChapterCount = if ($usesRootImages -and $null -ne $rootLayout -and $rootLayout.Recognized) { $rootLayout.Groups.Count } elseif ($usesRootImages) { 1 } else { 0 }
-        $metadataCoverCounts['first'] = $rootChapterCount
+        # A directory containing images is one chapter by default. Filename
+        # prefixes are only a possible grouping hint and must never silently
+        # turn a single doujin folder into dozens of chapters.
+        if ($usesRootImages) {
+            $rootCoverInfo = $null
+            if ($metadata.ChapterCoverStatusMap.Count -eq 1) {
+                $rootCoverInfo = @($metadata.ChapterCoverStatusMap.Values)[0]
+            }
+            & $recordMetadataCoverState '第1话' $rootCoverInfo
+        }
     }
-    $metadataCoverSummary = if (-not [bool]$metadata.ShowChapterCovers) {
-        '跟随元数据＝隐藏（整本总开关关闭）'
+    if (-not [string]::IsNullOrWhiteSpace([string]$metadata.MetadataWarning)) {
+        $metadataCoverSummary = '元数据无法读取'
+        $metadataCoverDetails = [string]$metadata.MetadataWarning
     }
     else {
-        '跟随元数据＝首图 {0} 话 / 自选 {1} 话 / 该话图片 {2} 话 / 隐藏 {3} 话' -f $metadataCoverCounts['first'], $metadataCoverCounts['custom'], $metadataCoverCounts['chapter'], $metadataCoverCounts['none']
-    }
-    $metadataCoverDetails = $metadataCoverSummary
-    if ($metadataCustomDetails.Count -gt 0) {
-        $metadataCoverDetails += "`r`n自选封面路径：`r`n" + ($metadataCustomDetails -join "`r`n")
-    }
-    if ($metadataChapterDetails.Count -gt 0) {
-        $metadataCoverDetails += "`r`n该话正文图片路径：`r`n" + ($metadataChapterDetails -join "`r`n")
+        $globalState = if ([bool]$metadata.HasShowChapterCoversSetting) {
+            '整本开关：' + $(if ([bool]$metadata.ShowChapterCovers) { '开启' } else { '关闭' })
+        }
+        else { '整本开关：未设置' }
+        $stateParts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($state in @(
+            [pscustomobject]@{ Key = 'unset'; Label = '未设置' },
+            [pscustomobject]@{ Key = 'first'; Label = '首图' },
+            [pscustomobject]@{ Key = 'custom'; Label = '自选' },
+            [pscustomobject]@{ Key = 'chapter'; Label = '该话图片' },
+            [pscustomobject]@{ Key = 'none'; Label = '隐藏' },
+            [pscustomobject]@{ Key = 'invalid'; Label = '无效' }
+        )) {
+            if ($metadataCoverCounts[$state.Key] -gt 0) {
+                $stateParts.Add(('{0} {1} 话' -f $state.Label, $metadataCoverCounts[$state.Key]))
+            }
+        }
+        if ($stateParts.Count -eq 0) { $stateParts.Add('无可匹配章节') }
+        $metadataCoverSummary = $globalState + '；逐话：' + ($stateParts -join ' / ')
+        $metadataCoverDetails = $metadataCoverSummary
+        if ($metadataCustomDetails.Count -gt 0) {
+            $metadataCoverDetails += "`r`n自选封面保存路径：`r`n" + ($metadataCustomDetails -join "`r`n")
+        }
+        if ($metadataChapterDetails.Count -gt 0) {
+            $metadataCoverDetails += "`r`n该话正文图片保存路径：`r`n" + ($metadataChapterDetails -join "`r`n")
+        }
+        if ($metadataInvalidDetails.Count -gt 0) {
+            $metadataCoverDetails += "`r`n无效 coverMode：`r`n" + ($metadataInvalidDetails -join "`r`n")
+        }
     }
     return [pscustomobject]@{
         Name = $Directory.Name
         FullName = $Directory.FullName
         Eligible = ($reasons.Count -eq 0)
-        ChapterCount = if ($usesRootImages -and $null -ne $rootLayout -and $rootLayout.Recognized) { $rootLayout.Groups.Count } elseif ($usesRootImages) { 1 } else { $matching.Count }
+        ChapterCount = if ($usesRootImages) { 1 } else { $matching.Count }
         UsesRootImages = $usesRootImages
-        UsesCompositeGroups = ($usesRootImages -and $null -ne $rootLayout -and $rootLayout.Recognized)
+        UsesCompositeGroups = $false
+        HasOptionalCompositeGroups = ($usesRootImages -and $null -ne $rootLayout -and $rootLayout.Recognized)
+        OptionalCompositeGroupCount = if ($usesRootImages -and $null -ne $rootLayout -and $rootLayout.Recognized) { $rootLayout.Groups.Count } else { 0 }
         HasCover = ($null -ne $cover)
         MetadataShowsChapterCovers = [bool]$metadata.ShowChapterCovers
-        MetadataCustomCoverCount = @($metadata.ChapterCoverMap.Values | Where-Object { [string]$_.Mode -eq 'custom' }).Count
+        MetadataCustomCoverCount = @($metadata.ChapterCoverStatusMap.Values | Where-Object { [bool]$_.HasSetting -and [bool]$_.IsValid -and [string]$_.Mode -eq 'custom' }).Count
         MetadataCoverSummary = $metadataCoverSummary
         MetadataCoverDetails = $metadataCoverDetails
         SourceFingerprint = Get-ComicSourceFingerprint -ComicPath $Directory.FullName
@@ -1752,29 +1809,45 @@ function Show-ImageOrderFallbackDialog {
     param(
         [System.Windows.Forms.IWin32Window]$Owner,
         [string]$ComicName,
-        [string[]]$Problems
+        [string[]]$Problems,
+        [bool]$CanSplitRootGroups = $false,
+        [int]$RootGroupCount = 0,
+        [string[]]$RootGroupNames = @()
     )
     $dialog = New-Object System.Windows.Forms.Form
-    $dialog.Text = '图片顺序识别失败'
+    $dialog.Text = if (@($Problems).Count -gt 0) { '图片顺序需要确认' } else { '检测到可选的图片分组' }
     $dialog.StartPosition = 'CenterParent'
-    $dialog.Size = New-Object System.Drawing.Size(720, 470)
-    $dialog.MinimumSize = New-Object System.Drawing.Size(620, 400)
+    $dialog.Size = New-Object System.Drawing.Size(820, 570)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(720, 500)
     $dialog.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $dialog.MinimizeBox = $false
     $dialog.MaximizeBox = $false
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = '“{0}”的图片页码未通过连续性检查' -f $ComicName
-    $title.AutoSize = $true
+    $title.Text = if (@($Problems).Count -gt 0) {
+        '“{0}”的图片页码未通过连续性检查' -f $ComicName
+    }
+    else {
+        '“{0}”包含可按文件名拆分的图片分组' -f $ComicName
+    }
+    $title.AutoSize = $false
     $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
     $title.Location = New-Object System.Drawing.Point(18, 18)
+    $title.Size = New-Object System.Drawing.Size(770, 28)
+    $title.Anchor = 'Top,Left,Right'
+    $title.AutoEllipsis = $true
     $dialog.Controls.Add($title)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = '你可以取消并修正文件名，也可以按当前文件名进行自然排序（例如 2.jpg 会排在 10.jpg 前）。继续后无法自动判断是否真的缺图。空文件、无图片和路径错误仍会阻止生成。'
+    $hint.Text = if (@($Problems).Count -gt 0) {
+        '继续时会按当前文件名自然排序（例如 2.jpg 会排在 10.jpg 前），但无法再自动判断是否真的缺图。也可以只跳过当前漫画，或退出整个本次更新任务。空文件、无图片和路径错误仍不会放行。'
+    }
+    else {
+        '一个直接装图片的文件夹默认只算一话。只有勾选下方选项时，才会按识别到的文件名前缀拆成多话。'
+    }
     $hint.AutoSize = $false
     $hint.Location = New-Object System.Drawing.Point(18, 52)
-    $hint.Size = New-Object System.Drawing.Size(670, 58)
+    $hint.Size = New-Object System.Drawing.Size(770, 58)
     $hint.Anchor = 'Top,Left,Right'
     $dialog.Controls.Add($hint)
 
@@ -1784,41 +1857,93 @@ function Show-ImageOrderFallbackDialog {
     $details.ScrollBars = 'Vertical'
     $details.WordWrap = $true
     $details.Location = New-Object System.Drawing.Point(18, 116)
-    $details.Size = New-Object System.Drawing.Size(670, 250)
+    $details.Size = New-Object System.Drawing.Size(770, 275)
     $details.Anchor = 'Top,Bottom,Left,Right'
     $shownProblems = @($Problems | Select-Object -First 30)
-    $details.Text = $shownProblems -join "`r`n"
+    $detailLines = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($problem in $shownProblems) { $detailLines.Add([string]$problem) }
     if (@($Problems).Count -gt $shownProblems.Count) {
-        $details.Text += ("`r`n……另有 {0} 项未显示。" -f (@($Problems).Count - $shownProblems.Count))
+        $detailLines.Add(("……另有 {0} 项未显示。" -f (@($Problems).Count - $shownProblems.Count)))
     }
+    if ($CanSplitRootGroups) {
+        if ($detailLines.Count -gt 0) { $detailLines.Add('') }
+        $shownGroups = @($RootGroupNames | Select-Object -First 16)
+        $detailLines.Add(('检测到 {0} 个可能的章节分组：{1}' -f $RootGroupCount, ($shownGroups -join '、')))
+        if (@($RootGroupNames).Count -gt $shownGroups.Count) {
+            $detailLines.Add(('……另有 {0} 个分组未显示。' -f (@($RootGroupNames).Count - $shownGroups.Count)))
+        }
+    }
+    if ($detailLines.Count -eq 0) { $detailLines.Add('文件本身可以作为一话正常排序。') }
+    $details.Text = $detailLines -join "`r`n"
     $dialog.Controls.Add($details)
 
-    $decision = [pscustomobject]@{ Continue = $false }
+    $splitGroups = New-Object System.Windows.Forms.CheckBox
+    $splitGroups.Text = '根据图片文件名分组，拆分成不同话（默认关闭）'
+    $splitGroups.AutoSize = $true
+    $splitGroups.Location = New-Object System.Drawing.Point(20, 404)
+    $splitGroups.Anchor = 'Bottom,Left'
+    $splitGroups.Checked = $false
+    $splitGroups.Visible = $CanSplitRootGroups
+    $dialog.Controls.Add($splitGroups)
+
+    $applyToAll = New-Object System.Windows.Forms.CheckBox
+    $applyToAll.Text = '本次任务中，后续漫画遇到同类情况时自动执行相同操作'
+    $applyToAll.AutoSize = $true
+    $applyToAll.Location = New-Object System.Drawing.Point(20, 432)
+    $applyToAll.Anchor = 'Bottom,Left'
+    $dialog.Controls.Add($applyToAll)
+
+    $decision = [pscustomobject]@{
+        Action = 'Abort'
+        UseFilenameOrder = (@($Problems).Count -gt 0)
+        SplitRootGroups = $false
+        ApplyToAll = $false
+    }
     $continueButton = New-Object System.Windows.Forms.Button
-    $continueButton.Text = '按当前文件名顺序继续'
-    $continueButton.Location = New-Object System.Drawing.Point(396, 382)
-    $continueButton.Size = New-Object System.Drawing.Size(180, 38)
+    $continueButton.Text = if (@($Problems).Count -gt 0) { '按当前文件名顺序继续' } else { '按当前设置继续' }
+    $continueButton.Location = New-Object System.Drawing.Point(370, 474)
+    $continueButton.Size = New-Object System.Drawing.Size(180, 40)
     $continueButton.Anchor = 'Bottom,Right'
     $continueButton.BackColor = [System.Drawing.Color]::FromArgb(35, 105, 160)
     $continueButton.ForeColor = [System.Drawing.Color]::White
     $continueButton.add_Click({
-        $decision.Continue = $true
+        $decision.Action = 'Continue'
+        $decision.SplitRootGroups = [bool]$splitGroups.Checked
+        $decision.ApplyToAll = [bool]$applyToAll.Checked
         $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $dialog.Close()
     })
     $dialog.Controls.Add($continueButton)
 
-    $cancelButton = New-Object System.Windows.Forms.Button
-    $cancelButton.Text = '取消并返回'
-    $cancelButton.Location = New-Object System.Drawing.Point(584, 382)
-    $cancelButton.Size = New-Object System.Drawing.Size(104, 38)
-    $cancelButton.Anchor = 'Bottom,Right'
-    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $dialog.Controls.Add($cancelButton)
-    $dialog.CancelButton = $cancelButton
+    $skipButton = New-Object System.Windows.Forms.Button
+    $skipButton.Text = '不加入当前漫画'
+    $skipButton.Location = New-Object System.Drawing.Point(558, 474)
+    $skipButton.Size = New-Object System.Drawing.Size(112, 40)
+    $skipButton.Anchor = 'Bottom,Right'
+    $skipButton.add_Click({
+        $decision.Action = 'Skip'
+        $decision.SplitRootGroups = [bool]$splitGroups.Checked
+        $decision.ApplyToAll = [bool]$applyToAll.Checked
+        $dialog.DialogResult = [System.Windows.Forms.DialogResult]::Ignore
+        $dialog.Close()
+    })
+    $dialog.Controls.Add($skipButton)
+
+    $abortButton = New-Object System.Windows.Forms.Button
+    $abortButton.Text = '退出本次更新'
+    $abortButton.Location = New-Object System.Drawing.Point(678, 474)
+    $abortButton.Size = New-Object System.Drawing.Size(110, 40)
+    $abortButton.Anchor = 'Bottom,Right'
+    $abortButton.add_Click({
+        $decision.Action = 'Abort'
+        $dialog.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $dialog.Close()
+    })
+    $dialog.Controls.Add($abortButton)
+    $dialog.CancelButton = $abortButton
 
     [void]$dialog.ShowDialog($Owner)
-    return [bool]$decision.Continue
+    return $decision
 }
 
 function Show-ComicSelector {
@@ -1871,7 +1996,9 @@ function Show-ComicSelector {
         $membership = if ($OnShelf) { '已在书架；' } else { '尚未加入；' }
         $candidateStatus = $membership + ('可生成，共 {0} 话' -f $Candidate.ChapterCount)
         if ($Candidate.UsesRootImages) { $candidateStatus += '；根目录按单话' }
-        if ($Candidate.UsesCompositeGroups) { $candidateStatus = $membership + ('可生成，共 {0} 话；按文件名前缀自动分组' -f $Candidate.ChapterCount) }
+        if ($Candidate.HasOptionalCompositeGroups) {
+            $candidateStatus += ('；检测到 {0} 个可选文件名分组（默认不拆话）' -f $Candidate.OptionalCompositeGroupCount)
+        }
         if (-not $Candidate.HasCover) { $candidateStatus += '；自动封面' }
         return $candidateStatus
     }
@@ -1911,7 +2038,7 @@ function Show-ComicSelector {
     $coverColumn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     foreach ($choice in @('跟随元数据', '首图', '自选', '该话其他图片', '隐藏')) { [void]$coverColumn.Items.Add($choice) }
     [void]$grid.Columns.Add($coverColumn)
-    [void]$grid.Columns.Add('MetadataCoverInfo', '元数据实际指向')
+    [void]$grid.Columns.Add('MetadataCoverInfo', '元数据状态')
     $grid.Columns['ComicName'].Width = 340
     $grid.Columns['ComicName'].ReadOnly = $true
     $grid.Columns['Status'].AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::None
@@ -1920,7 +2047,7 @@ function Show-ComicSelector {
     $grid.Columns['ChapterCover'].Width = 125
     $grid.Columns['MetadataCoverInfo'].Width = 310
     $grid.Columns['MetadataCoverInfo'].ReadOnly = $true
-    $grid.Columns['MetadataCoverInfo'].ToolTipText = '显示来源元数据在“跟随元数据”模式下最终会采用首图、自选图片还是隐藏；自选图片完整路径可悬停查看'
+    $grid.Columns['MetadataCoverInfo'].ToolTipText = '只显示漫画元数据中实际保存的整本开关与逐话封面状态；未保存 coverMode 时显示“未设置”'
     $grid.Columns['MetadataCoverInfo'].DisplayIndex = $grid.Columns['ChapterCover'].DisplayIndex + 1
 
     $applyCandidateToRow = {
@@ -2316,12 +2443,13 @@ function Show-ComicSelector {
 1. “加入书架”决定漫画是否长期显示在总目录；“本次操作”只决定这一次要加入或更新哪些漫画。
 2. 勾选“本次操作”会自动加入书架；取消加入书架会同步取消本次操作，重新勾选加入书架会重新加入本次操作。
 3. “加入 / 更新本次勾选”只处理本次操作列中的漫画；“全部更新”处理所有已加入书架的漫画。
-4. 章节封面可选“跟随元数据、首图、自选、该话其他图片、隐藏”。执行更新后，非“跟随元数据”的设置也会写入漫画自身的元数据；“元数据实际指向”列可查看最终结果和完整路径。
+4. 章节封面可选“跟随元数据、首图、自选、该话其他图片、隐藏”。执行更新后，非“跟随元数据”的设置也会写入漫画自身的元数据；“元数据状态”列只显示元数据里实际保存的整本开关与逐话设置，未设置时不会显示运行时回退结果，完整保存路径可悬停查看。
 5. “编辑当前漫画逐话封面”可逐话选择图片：“自选”可复制任意本地图片进漫画阅读器资源，也可选择“插入本地图片为本话首图”，将原数字图片整体顺延并把该话逻辑重设为首图；“该话其他图片”只直接引用本话现有正文，不产生副本。
 6. “管理合集”只改变总书架和合集目录的归类，不会移动或改名原漫画文件夹。
 7. “重新扫描”会追加新漫画且不重置现有操作；已载入漫画发生变化时会先二次确认，再保留勾选和封面设置重新导入。
-8. 图片页码有断号、重复、不是连续数字或无法识别时会显示具体错误；可取消修正，也可选择“按当前文件名顺序继续”。后者使用自然排序，但无法判断是否缺图。空文件等非排序错误仍不会放行。
-9. 更新过程会在底部显示进度；任务完成前请不要关闭窗口。
+8. 直接装图片的一个文件夹默认是一话。检测到多个文件名前缀时会询问是否按分组拆话，默认不拆。
+9. 图片页码有断号、重复、不是连续数字或无法识别时会显示具体错误；可按当前文件名自然排序继续、只跳过当前漫画，或退出整个本次任务。可勾选对本次任务后续同类情况执行相同操作。空文件等非排序错误仍不会放行。
+10. 更新过程会在底部显示进度；任务完成前请不要关闭窗口。
 '@
         [System.Windows.Forms.MessageBox]::Show($form, $helpText, '漫画更新器使用说明', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
     })
@@ -2383,8 +2511,8 @@ function Show-ComicSelector {
         [System.Windows.Forms.Application]::DoEvents()
         try {
             $imageOrderPrompt = {
-                param([string]$ComicName, [string[]]$Problems)
-                return Show-ImageOrderFallbackDialog -Owner $form -ComicName $ComicName -Problems $Problems
+                param([string]$ComicName, [string[]]$Problems, [bool]$CanSplitRootGroups, [int]$RootGroupCount, [string[]]$RootGroupNames)
+                return Show-ImageOrderFallbackDialog -Owner $form -ComicName $ComicName -Problems $Problems -CanSplitRootGroups $CanSplitRootGroups -RootGroupCount $RootGroupCount -RootGroupNames $RootGroupNames
             }
             $result = Invoke-ComicUpdate -LibraryRoot $LibraryRoot -PreviousSelectedNames @($selectionState.PreviousSelectedNames) -DesiredSelectedNames $shelfNames -CheckedNames $checkedNames -UpdateMode $UpdateMode -OpenAfterGenerate ([bool]$openAfter.Checked) -Collections @($selectionState.Collections) -ChapterCoverOverrides $selectionState.ChapterCoverOverrides -ChapterCustomCovers $selectionState.ChapterCustomCovers -ImageOrderFallbackPrompt $imageOrderPrompt -CatalogOnly:$catalogOnly
             $selectionState.PreviousSelectedNames = @($result.PersistedSelectedNames)
@@ -2421,11 +2549,19 @@ function Show-ComicSelector {
                 $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Warning
                 $selectionState.ExitCode = 2
             }
+            if ($null -ne $result.PSObject.Properties['SkippedCount'] -and [int]$result.SkippedCount -gt 0) {
+                $summaryText += "`r`n`r`n你选择跳过了 $($result.SkippedCount) 部漫画；既有书架内容保持不变。"
+                $summaryIcon = [System.Windows.Forms.MessageBoxIcon]::Warning
+            }
             $status.Text = $summaryText.Replace("`r`n`r`n", ' ')
             [System.Windows.Forms.MessageBox]::Show($summaryText, '漫画更新器：任务已完成', [System.Windows.Forms.MessageBoxButtons]::OK, $summaryIcon) | Out-Null
-            if (-not $SkipOpen -and $openAfter.Checked -and -not [string]::IsNullOrWhiteSpace($result.LauncherPath)) {
+            if (-not $SkipOpen -and $openAfter.Checked -and ($result.GeneratedCount -gt 0 -or $catalogOnly) -and -not [string]::IsNullOrWhiteSpace($result.LauncherPath)) {
                 Start-Process -FilePath $result.LauncherPath
             }
+        }
+        catch [System.OperationCanceledException] {
+            $selectionState.ExitCode = 0
+            $status.Text = '已退出本次更新，未生成或修改漫画网页。'
         }
         catch {
             $selectionState.ExitCode = 1
@@ -2480,8 +2616,9 @@ function Show-ComicSelector {
         if (-not $selectionState.ChapterCoverOverrides.ContainsKey($name) -or [string]$selectionState.ChapterCoverOverrides[$name] -ne 'chapter') { throw '章节封面下拉框没有写入“该话其他图片”模式。' }
         $row.Cells['ChapterCover'].Value = '跟随元数据'
         if ($selectionState.ChapterCoverOverrides.ContainsKey($name)) { throw '章节封面下拉框没有恢复“跟随元数据”。' }
-        if ([string]::IsNullOrWhiteSpace([string]$row.Cells['MetadataCoverInfo'].Value)) { throw '更新器没有把“跟随元数据”的实际结果放进独立列。' }
-        if ([string]::IsNullOrWhiteSpace([string]$row.Cells['MetadataCoverInfo'].ToolTipText)) { throw '元数据实际指向列没有显示完整封面模式与路径提示。' }
+        if ([string]::IsNullOrWhiteSpace([string]$row.Cells['MetadataCoverInfo'].Value)) { throw '更新器没有把元数据保存状态放进独立列。' }
+        if ([string]::IsNullOrWhiteSpace([string]$row.Cells['MetadataCoverInfo'].ToolTipText)) { throw '元数据状态列没有显示完整封面状态与保存路径提示。' }
+        if ($grid.Columns['MetadataCoverInfo'].HeaderText -ne '元数据状态' -or ([string]$row.Cells['MetadataCoverInfo'].Value).Contains('→') -or ([string]$row.Cells['MetadataCoverInfo'].Value).Contains('＝')) { throw '更新器元数据状态列仍混入了运行时回退结果。' }
         if ($grid.Columns['Status'].AutoSizeMode -ne [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::None -or $grid.Columns['MetadataCoverInfo'].Width -lt 280) { throw '章节封面与元数据列仍会随窗口边框改变位置，或元数据列宽度不足。' }
         if ($rescanButton.Text -ne '重新扫描' -or [string]::IsNullOrWhiteSpace([string]$row.Tag.SourceFingerprint)) { throw '更新器重新扫描功能没有准备好来源指纹。' }
         if ($helpButton.Text -ne '使用说明') { throw '更新器缺少“使用说明”按钮。' }
@@ -2529,8 +2666,11 @@ function Get-ComicMetadata {
         ReadingOrderNormalizedMap = @{}
         ReadingOrderError = ''
         ShowChapterCovers = $false
+        HasShowChapterCoversSetting = $false
         ChapterCoverMap = @{}
         ChapterCoverNormalizedMap = @{}
+        ChapterCoverStatusMap = @{}
+        ChapterCoverStatusNormalizedMap = @{}
     }
     if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
         return [pscustomobject]$result
@@ -2545,6 +2685,7 @@ function Get-ComicMetadata {
         if ($null -ne $meta.PSObject.Properties['readerOptions'] -and $null -ne $meta.readerOptions -and
             $null -ne $meta.readerOptions.PSObject.Properties['showChapterCovers']) {
             $result.ShowChapterCovers = [bool]$meta.readerOptions.showChapterCovers
+            $result.HasShowChapterCoversSetting = $true
         }
         $organizerSchema = 0
         if ($null -ne $meta.PSObject.Properties['organizer'] -and
@@ -2562,6 +2703,8 @@ function Get-ComicMetadata {
             $normalizedOrderMap = @{}
             $chapterCoverMap = @{}
             $chapterCoverNormalizedMap = @{}
+            $chapterCoverStatusMap = @{}
+            $chapterCoverStatusNormalizedMap = @{}
             $usedOrders = @{}
             if ($chapterInfos.Count -eq 0) {
                 $orderErrors.Add('新版整理器元数据中没有 chapterInfos。')
@@ -2573,6 +2716,27 @@ function Get-ComicMetadata {
                 }
                 elseif ($null -ne $chapterInfo.PSObject.Properties['chapterTitle']) {
                     $chapterFolder = [string]$chapterInfo.chapterTitle
+                }
+                $normalizedKey = Get-WindowsChapterNameMatchKey -Value $chapterFolder
+                $hasCoverSetting = $null -ne $chapterInfo.PSObject.Properties['coverMode']
+                $rawCoverMode = if ($hasCoverSetting) { ([string]$chapterInfo.coverMode).Trim().ToLowerInvariant() } else { '' }
+                $coverModeIsValid = $hasCoverSetting -and $rawCoverMode -in @('first', 'custom', 'chapter', 'none')
+                $coverMode = if ($coverModeIsValid) { $rawCoverMode } else { 'first' }
+                $coverFile = ''
+                if ($null -ne $chapterInfo.PSObject.Properties['coverFile']) { $coverFile = ([string]$chapterInfo.coverFile).Trim() }
+                $coverInfo = [pscustomobject]@{
+                    Folder = $chapterFolder
+                    Mode = $coverMode
+                    File = $coverFile
+                    HasSetting = $hasCoverSetting
+                    RawMode = $rawCoverMode
+                    IsValid = $coverModeIsValid
+                }
+                if (-not [string]::IsNullOrWhiteSpace($chapterFolder) -and -not $chapterCoverStatusMap.ContainsKey($chapterFolder)) {
+                    $chapterCoverStatusMap[$chapterFolder] = $coverInfo
+                }
+                if (-not [string]::IsNullOrWhiteSpace($normalizedKey) -and -not $chapterCoverStatusNormalizedMap.ContainsKey($normalizedKey)) {
+                    $chapterCoverStatusNormalizedMap[$normalizedKey] = $coverInfo
                 }
                 $readingOrder = 0
                 if ([string]::IsNullOrWhiteSpace($chapterFolder) -or
@@ -2590,7 +2754,6 @@ function Get-ComicMetadata {
                     $orderErrors.Add(('阅读顺序元数据中的顺序重复：' + $readingOrder))
                     continue
                 }
-                $normalizedKey = Get-WindowsChapterNameMatchKey -Value $chapterFolder
                 if ([string]::IsNullOrWhiteSpace($normalizedKey)) {
                     $orderErrors.Add(('阅读顺序元数据中的章节名称无法用于匹配：' + $chapterFolder))
                     continue
@@ -2602,18 +2765,14 @@ function Get-ComicMetadata {
                         continue
                     }
                 }
-                $coverMode = 'first'
-                if ($null -ne $chapterInfo.PSObject.Properties['coverMode']) { $coverMode = ([string]$chapterInfo.coverMode).Trim().ToLowerInvariant() }
-                if ($coverMode -notin @('first', 'custom', 'chapter', 'none')) { $coverMode = 'first' }
-                $coverFile = ''
-                if ($null -ne $chapterInfo.PSObject.Properties['coverFile']) { $coverFile = ([string]$chapterInfo.coverFile).Trim() }
-                $coverInfo = [pscustomobject]@{ Folder = $chapterFolder; Mode = $coverMode; File = $coverFile }
                 $orderMap[$chapterFolder] = $readingOrder
                 $normalizedOrderMap[$normalizedKey] = [pscustomobject]@{ Folder = $chapterFolder; Order = $readingOrder }
                 $chapterCoverMap[$chapterFolder] = $coverInfo
                 $chapterCoverNormalizedMap[$normalizedKey] = $coverInfo
                 $usedOrders[[string]$readingOrder] = $true
             }
+            $result.ChapterCoverStatusMap = $chapterCoverStatusMap
+            $result.ChapterCoverStatusNormalizedMap = $chapterCoverStatusNormalizedMap
             if ($orderErrors.Count -gt 0) {
                 $result.ReadingOrderError = ($orderErrors -join '；')
             }
@@ -2770,7 +2929,8 @@ function Get-ComicAudit {
         [AllowNull()][Nullable[bool]]$ShowChapterCoversOverride = $null,
         [ValidateSet('', 'metadata', 'first', 'custom', 'chapter', 'none')][string]$ChapterCoverOverrideMode = '',
         [hashtable]$ChapterCustomCoverMap = @{},
-        [switch]$UseFilenameOrder
+        [switch]$UseFilenameOrder,
+        [switch]$SplitRootGroups
     )
 
     $errors = New-Object 'System.Collections.Generic.List[string]'
@@ -2842,12 +3002,13 @@ function Get-ComicAudit {
 
     $rootImageFiles = @(Get-RootBodyImageFiles -ComicPath $ComicDirectory.FullName)
     $rootLayout = Get-RootImageLayout -Files $rootImageFiles
+    $rootGroupingAvailable = [bool]($chapterDrafts.Count -eq 0 -and $rootImageFiles.Count -gt 0 -and $rootLayout.Recognized)
     $rootCoverCandidate = $null
     if ($chapterDrafts.Count -gt 0 -and $rootImageFiles.Count -gt 0) {
         $errors.Add('漫画根目录中有正文图片，同时又存在章节文件夹；结构有歧义，请只保留一种正文结构。')
     }
     elseif ($chapterDrafts.Count -eq 0 -and $rootImageFiles.Count -gt 0) {
-        if ($rootLayout.Recognized) {
+        if ($rootLayout.Recognized -and $SplitRootGroups) {
             foreach ($group in $rootLayout.Groups) {
                 $chapterDrafts += [pscustomobject]@{
                     IsRootChapter = $true
@@ -2866,12 +3027,18 @@ function Get-ComicAudit {
                 }
             }
             $rootCoverCandidate = $rootLayout.CoverCandidate
-            $warnings.Add(('根目录图片已按文件名前缀拆分为 {0} 话；无元数据时按分组名称自然排序。' -f $rootLayout.Groups.Count))
+            $warnings.Add(('已按你的选择，将根目录图片按文件名前缀拆分为 {0} 话；分组名称按自然顺序排列。' -f $rootLayout.Groups.Count))
         }
         else {
+            $singleChapterFiles = @($rootImageFiles)
+            if ($null -ne $rootLayout.CoverCandidate) {
+                $rootCoverCandidate = $rootLayout.CoverCandidate
+                $coverCandidatePath = [IO.Path]::GetFullPath($rootLayout.CoverCandidate.FullName)
+                $singleChapterFiles = @($rootImageFiles | Where-Object { [IO.Path]::GetFullPath($_.FullName) -cne $coverCandidatePath })
+            }
             $chapterDrafts += [pscustomobject]@{
                 IsRootChapter = $true
-                ImageFiles = @($rootImageFiles)
+                ImageFiles = @($singleChapterFiles)
                 IsNumeric = $true
                 Number = '1'
                 HasQualifier = $false
@@ -2885,6 +3052,9 @@ function Get-ComicAudit {
                 FullName = $ComicDirectory.FullName
             }
             $warnings.Add('未找到章节文件夹，已将漫画根目录中的图片作为第 1 话。')
+            if ($rootLayout.Recognized) {
+                $warnings.Add(('检测到 {0} 个可能的文件名前缀分组；默认仍按一话处理，只有你在确认窗口中选择时才会拆话。' -f $rootLayout.Groups.Count))
+            }
         }
     }
 
@@ -3152,6 +3322,10 @@ function Get-ComicAudit {
         CanUseFilenameOrder = $canUseFilenameOrder
         FilenameOrderProblems = @($filenameOrderProblems)
         UsedFilenameOrder = [bool]$UseFilenameOrder
+        RootGroupingAvailable = $rootGroupingAvailable
+        RootGroupCount = if ($rootLayout.Recognized) { $rootLayout.Groups.Count } else { 0 }
+        RootGroupNames = if ($rootLayout.Recognized) { @($rootLayout.Groups | ForEach-Object Name) } else { @() }
+        SplitRootGroups = [bool]$SplitRootGroups
         IsValid = ($errors.Count -eq 0)
     }
 }
@@ -4485,14 +4659,34 @@ function Invoke-ComicUpdate {
     if ($CatalogOnly -and $UpdateMode -ne 'Selected') { throw '仅更新合集目录只能用于“加入 / 更新本次勾选”模式。' }
     if ($UpdateMode -eq 'Selected' -and $namesToGenerate.Count -eq 0 -and -not $CatalogOnly) { throw '没有可加入或更新的勾选漫画。' }
 
+    # Preserve cards for previously shelved comics in every mode. If an old
+    # comic is skipped or fails validation, a full update must not silently
+    # remove it from the bookshelf.
     $preservedCards = @{}
+    $previousDesiredNames = @($PreviousSelectedNames | Where-Object { $selectedNames -contains $_ } | Select-Object -Unique)
+    $preservablePreviousNames = @()
+    if ($previousDesiredNames.Count -gt 0) {
+        if ($UpdateMode -eq 'Selected') {
+            $preservedCards = Get-ExistingRootCards -LibraryRoot $LibraryRoot -ComicNames $previousDesiredNames
+            $preservablePreviousNames = @($previousDesiredNames)
+        }
+        elseif (Test-Path -LiteralPath (Join-Path $LibraryRoot $script:LauncherFileName) -PathType Leaf) {
+            foreach ($previousName in $previousDesiredNames) {
+                try {
+                    $singleCard = Get-ExistingRootCards -LibraryRoot $LibraryRoot -ComicNames @($previousName)
+                    if ($singleCard.ContainsKey($previousName)) {
+                        $preservedCards[$previousName] = [string]$singleCard[$previousName]
+                        $preservablePreviousNames += $previousName
+                    }
+                }
+                catch {
+                    Write-Host ('  警告：旧书架卡片无法保留，将仅在本次重新生成成功后加入：' + $previousName) -ForegroundColor Yellow
+                }
+            }
+        }
+    }
     $namesToAudit = @($selectedNames)
     if ($UpdateMode -eq 'Selected') {
-        $preservedNames = if ($hasDesiredSelection) {
-            @($PreviousSelectedNames | Where-Object { $selectedNames -contains $_ } | Select-Object -Unique)
-        }
-        else { @($PreviousSelectedNames) }
-        $preservedCards = Get-ExistingRootCards -LibraryRoot $LibraryRoot -ComicNames $preservedNames
         $namesToAudit = @($namesToGenerate)
         if ($CatalogOnly) {
             Write-Info '合集配置更新模式：保留全部既有漫画网页，只重建总书架与合集目录页。'
@@ -4504,6 +4698,8 @@ function Invoke-ComicUpdate {
 
     $audited = @()
     $failed = @()
+    $skipped = @()
+    $batchPromptPolicies = @{}
     for ($auditIndex = 0; $auditIndex -lt $namesToAudit.Count; $auditIndex++) {
         $name = $namesToAudit[$auditIndex]
         $path = Join-Path $LibraryRoot $name
@@ -4516,24 +4712,97 @@ function Invoke-ComicUpdate {
         $comicDirectory = Get-Item -LiteralPath $path
         $comicCustomCovers = if ($ChapterCustomCovers.ContainsKey($name)) { $ChapterCustomCovers[$name] } else { @{} }
         $getCurrentAudit = {
-            param([bool]$UseFilenameOrder)
+            param([bool]$UseFilenameOrder, [bool]$SplitRootGroups)
             if ($ChapterCoverOverrides.ContainsKey($name)) {
-                Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCoverOverrideMode ([string]$ChapterCoverOverrides[$name]) -ChapterCustomCoverMap $comicCustomCovers -UseFilenameOrder:$UseFilenameOrder
+                Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCoverOverrideMode ([string]$ChapterCoverOverrides[$name]) -ChapterCustomCoverMap $comicCustomCovers -UseFilenameOrder:$UseFilenameOrder -SplitRootGroups:$SplitRootGroups
             }
             else {
-                Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCustomCoverMap $comicCustomCovers -UseFilenameOrder:$UseFilenameOrder
+                Get-ComicAudit -ComicDirectory $comicDirectory -ChapterCustomCoverMap $comicCustomCovers -UseFilenameOrder:$UseFilenameOrder -SplitRootGroups:$SplitRootGroups
             }
         }
-        $audit = & $getCurrentAudit $false
-        if (-not $audit.IsValid -and [bool]$audit.CanUseFilenameOrder -and $null -ne $ImageOrderFallbackPrompt) {
-            $useFilenameOrder = $false
-            try { $useFilenameOrder = [bool](& $ImageOrderFallbackPrompt $name @($audit.FilenameOrderProblems)) }
-            catch { Write-Host ('  警告：无法显示文件名排序确认：' + $_.Exception.Message) -ForegroundColor Yellow }
-            if ($useFilenameOrder) {
-                Write-Info ('用户确认按当前文件名顺序继续：' + $name)
-                $audit = & $getCurrentAudit $true
+        $useFilenameOrder = $false
+        $splitRootGroups = $false
+        $rootGroupingDecisionMade = $false
+        $skipCurrentComic = $false
+        $audit = & $getCurrentAudit $useFilenameOrder $splitRootGroups
+        while ($null -ne $ImageOrderFallbackPrompt) {
+            $needsFilenameFallback = (-not $audit.IsValid -and [bool]$audit.CanUseFilenameOrder)
+            $needsRootGroupingChoice = (-not $rootGroupingDecisionMade -and [bool]$audit.RootGroupingAvailable)
+            if (-not $needsFilenameFallback -and -not $needsRootGroupingChoice) { break }
+
+            $policyKey = if ($needsRootGroupingChoice) { 'RootGroups' } else { 'ImageOrder' }
+            $decision = $null
+            if ($batchPromptPolicies.ContainsKey($policyKey)) {
+                $savedDecision = $batchPromptPolicies[$policyKey]
+                $decision = [pscustomobject]@{
+                    Action = [string]$savedDecision.Action
+                    UseFilenameOrder = [bool]$savedDecision.UseFilenameOrder
+                    SplitRootGroups = [bool]$savedDecision.SplitRootGroups
+                    ApplyToAll = $true
+                }
+                Write-Info ('已对“{0}”自动应用本次任务中保存的同类处理方式。' -f $name)
             }
+            else {
+                try {
+                    $decision = & $ImageOrderFallbackPrompt $name @($audit.FilenameOrderProblems) $needsRootGroupingChoice ([int]$audit.RootGroupCount) @($audit.RootGroupNames)
+                }
+                catch {
+                    Write-Host ('  警告：无法显示图片顺序确认窗口：' + $_.Exception.Message) -ForegroundColor Yellow
+                }
+            }
+
+            # Backward compatibility for non-UI callers that still return a Boolean.
+            if ($decision -is [bool]) {
+                $decision = [pscustomobject]@{
+                    Action = if ([bool]$decision) { 'Continue' } else { 'Skip' }
+                    UseFilenameOrder = [bool]$decision
+                    SplitRootGroups = $false
+                    ApplyToAll = $false
+                }
+            }
+            if ($null -eq $decision) {
+                $decision = [pscustomobject]@{ Action = 'Abort'; UseFilenameOrder = $false; SplitRootGroups = $false; ApplyToAll = $false }
+            }
+            if ([bool]$decision.ApplyToAll -and [string]$decision.Action -ne 'Abort') {
+                $batchPromptPolicies[$policyKey] = [pscustomobject]@{
+                    Action = [string]$decision.Action
+                    UseFilenameOrder = [bool]$decision.UseFilenameOrder
+                    SplitRootGroups = [bool]$decision.SplitRootGroups
+                }
+            }
+
+            switch ([string]$decision.Action) {
+                'Abort' {
+                    throw [System.OperationCanceledException]::new('用户退出了本次更新。')
+                }
+                'Skip' {
+                    $skipCurrentComic = $true
+                    $skipped += [pscustomobject]@{ Name = $name; Reason = '用户选择不加入当前漫画' }
+                    Write-Info ('已跳过当前漫画：' + $name)
+                }
+                'Continue' {
+                    if ($needsRootGroupingChoice) {
+                        $splitRootGroups = [bool]$decision.SplitRootGroups
+                        $rootGroupingDecisionMade = $true
+                        Write-Info $(if ($splitRootGroups) {
+                            '用户选择按文件名分组拆话：' + $name
+                        } else {
+                            '用户选择保持一个文件夹为一话：' + $name
+                        })
+                    }
+                    if ($needsFilenameFallback) {
+                        $useFilenameOrder = [bool]$decision.UseFilenameOrder
+                        if ($useFilenameOrder) { Write-Info ('用户确认按当前文件名顺序继续：' + $name) }
+                    }
+                    $audit = & $getCurrentAudit $useFilenameOrder $splitRootGroups
+                }
+                default {
+                    throw [System.OperationCanceledException]::new('图片顺序确认窗口返回了未知操作，已退出本次更新。')
+                }
+            }
+            if ($skipCurrentComic) { break }
         }
+        if ($skipCurrentComic) { continue }
         if ($audit.IsValid) {
             Write-Good ('核验通过：{0} 话，{1} 张图片' -f $audit.ChapterCount, $audit.TotalImages)
             foreach ($warning in $audit.Warnings) { Write-Host ('  警告：' + $warning) -ForegroundColor Yellow }
@@ -4552,8 +4821,10 @@ function Invoke-ComicUpdate {
             PersistedSelectedNames = @($selectedNames)
             Generated = @()
             Failed = @($failed)
+            Skipped = @($skipped)
             GeneratedCount = 0
             FailedCount = $failed.Count
+            SkippedCount = $skipped.Count
             ChapterCount = 0
             ImageCount = 0
             LauncherCount = 0
@@ -4563,7 +4834,27 @@ function Invoke-ComicUpdate {
             ChapterCustomCovers = Copy-ChapterCustomCoverMap -Value $ChapterCustomCovers
         }
     }
-    if (-not $CatalogOnly -and $audited.Count -eq 0) { throw '没有任何漫画通过核验，未生成网页。' }
+    if (-not $CatalogOnly -and $audited.Count -eq 0) {
+        if ($skipped.Count -gt 0 -and $failed.Count -eq 0) {
+            return [pscustomobject]@{
+                PersistedSelectedNames = @($PreviousSelectedNames | Select-Object -Unique)
+                Generated = @()
+                Failed = @()
+                Skipped = @($skipped)
+                GeneratedCount = 0
+                FailedCount = 0
+                SkippedCount = $skipped.Count
+                ChapterCount = 0
+                ImageCount = 0
+                LauncherCount = @($PreviousSelectedNames | Select-Object -Unique).Count
+                LauncherPath = Join-Path $LibraryRoot $script:LauncherFileName
+                Collections = @($Collections | ForEach-Object { Copy-CollectionDefinition -Collection $_ })
+                ChapterCoverOverrides = Copy-ChapterCoverOverrideMap -Value $ChapterCoverOverrides
+                ChapterCustomCovers = Copy-ChapterCustomCoverMap -Value $ChapterCustomCovers
+            }
+        }
+        throw '没有任何漫画通过核验，未生成网页。'
+    }
     $generationTargets = @()
     if (-not $CatalogOnly) { $generationTargets = @($audited | Where-Object { $namesToGenerate -contains $_.Name }) }
     if (-not $CatalogOnly -and $generationTargets.Count -eq 0) { throw '本次需要生成的漫画均未通过核验，未修改网页。' }
@@ -4610,7 +4901,11 @@ function Invoke-ComicUpdate {
         }
         else { @($PreviousSelectedNames + @($generated | ForEach-Object { $_.Name }) | Select-Object -Unique) }
     }
-    else { @($launcherComics | ForEach-Object { $_.Name }) }
+    else {
+        # Keep previously shelved comics whose current update was skipped or
+        # failed. New comics are added only after they generate successfully.
+        @($preservablePreviousNames + @($launcherComics | ForEach-Object { $_.Name }) | Select-Object -Unique)
+    }
     $launcherCount = @($persistedSelectedNames | Select-Object -Unique).Count
     Write-Info '正在更新并复核总打开器……'
     $launcherPath = New-RootPage -Comics $launcherComics -LibraryRoot $LibraryRoot -SelectedNames $persistedSelectedNames -OpenAfterGenerate $OpenAfterGenerate -PreservedCards $preservedCards -Collections $Collections -ChapterCoverOverrides $ChapterCoverOverrides -ChapterCustomCovers $ChapterCustomCovers
@@ -4646,8 +4941,10 @@ function Invoke-ComicUpdate {
         PersistedSelectedNames = @($persistedSelectedNames)
         Generated = @($generated)
         Failed = @($failed)
+        Skipped = @($skipped)
         GeneratedCount = $generated.Count
         FailedCount = $failed.Count
+        SkippedCount = $skipped.Count
         ChapterCount = $chapterCount
         ImageCount = $imageCount
         LauncherCount = $launcherCount
