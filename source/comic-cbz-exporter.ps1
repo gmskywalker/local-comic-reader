@@ -22,7 +22,9 @@ $ErrorActionPreference = 'Stop'
 $script:ImageExtensions = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif')
 $script:ReaderResourceFolderName = '漫画阅读器资源'
 $script:DefaultOutputFolderName = 'CBZ导出'
-$script:SettingsRegistryPath = 'Software\LocalComicTools\ComicExporter'
+$script:ToolSettingsMarker = "'#==TOOL_SETTINGS=="
+$script:ExporterToolPath = ''
+$script:LegacyExporterSettingsRegistryPath = 'Software\LocalComicTools\ComicExporter'
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:ExporterProgressCallback = $null
 $script:ExporterIsRunning = $false
@@ -45,6 +47,108 @@ function ConvertTo-SettingBoolean {
     return $DefaultValue
 }
 
+function Set-ObjectPropertyValue {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [AllowNull()][object]$Value
+    )
+    if ($null -eq $Object) { throw '不能向空对象写入工具设置。' }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -ne $property) { $property.Value = $Value }
+    else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
+}
+
+function Get-EmbeddedToolSettings {
+    param([string]$ToolPath = $script:ExporterToolPath)
+    try {
+        if ([string]::IsNullOrWhiteSpace($ToolPath) -or
+            [IO.Path]::GetExtension($ToolPath) -ine '.vbs' -or
+            -not (Test-Path -LiteralPath $ToolPath -PathType Leaf)) {
+            return [pscustomobject]@{}
+        }
+        $content = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ToolPath), [Text.Encoding]::UTF8)
+        $pattern = '(?m)^''#==TOOL_SETTINGS==(?<data>[A-Za-z0-9+/=]*)(?=\r?$)'
+        $matches = [regex]::Matches($content, $pattern)
+        if ($matches.Count -ne 1 -or [string]::IsNullOrWhiteSpace($matches[0].Groups['data'].Value)) {
+            return [pscustomobject]@{}
+        }
+        $jsonBytes = [Convert]::FromBase64String($matches[0].Groups['data'].Value)
+        $json = [Text.Encoding]::UTF8.GetString($jsonBytes)
+        $parsed = $json | ConvertFrom-Json
+        if ($null -eq $parsed) { return [pscustomobject]@{} }
+        return $parsed
+    }
+    catch { return [pscustomobject]@{} }
+}
+
+function Save-EmbeddedToolSettings {
+    param(
+        [object]$Settings,
+        [string]$ToolPath = $script:ExporterToolPath
+    )
+    $temporaryPath = ''
+    try {
+        if ([string]::IsNullOrWhiteSpace($ToolPath) -or
+            [IO.Path]::GetExtension($ToolPath) -ine '.vbs' -or
+            -not (Test-Path -LiteralPath $ToolPath -PathType Leaf)) { return $false }
+        $resolvedToolPath = [IO.Path]::GetFullPath($ToolPath)
+        $content = [IO.File]::ReadAllText($resolvedToolPath, [Text.Encoding]::UTF8)
+        $pattern = '(?m)^''#==TOOL_SETTINGS==(?<data>[A-Za-z0-9+/=]*)(?=\r?$)'
+        $matches = [regex]::Matches($content, $pattern)
+        if ($matches.Count -ne 1) { return $false }
+
+        $json = $Settings | ConvertTo-Json -Depth 20 -Compress
+        if ([string]::IsNullOrWhiteSpace($json)) { $json = '{}' }
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+        $replacement = $script:ToolSettingsMarker + $encoded
+        $match = $matches[0]
+        $updated = $content.Substring(0, $match.Index) + $replacement + $content.Substring($match.Index + $match.Length)
+
+        $temporaryPath = Join-Path ([IO.Path]::GetDirectoryName($resolvedToolPath)) ('.tool-settings-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        [IO.File]::WriteAllText($temporaryPath, $updated, $script:Utf8NoBom)
+        try {
+            [IO.File]::Replace($temporaryPath, $resolvedToolPath, $null, $true)
+            $temporaryPath = ''
+        }
+        catch {
+            [IO.File]::Copy($temporaryPath, $resolvedToolPath, $true)
+            [IO.File]::Delete($temporaryPath)
+            $temporaryPath = ''
+        }
+        $verification = [IO.File]::ReadAllText($resolvedToolPath, [Text.Encoding]::UTF8)
+        $verificationMatches = [regex]::Matches($verification, $pattern)
+        return $verificationMatches.Count -eq 1 -and $verificationMatches[0].Groups['data'].Value -ceq $encoded
+    }
+    catch { return $false }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($temporaryPath) -and (Test-Path -LiteralPath $temporaryPath -PathType Leaf)) {
+            try { [IO.File]::Delete($temporaryPath) } catch {}
+        }
+    }
+}
+
+function Get-LegacyExporterSettings {
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:LegacyExporterSettingsRegistryPath, $false)
+        if ($null -eq $key) { return $null }
+        return [pscustomobject][ordered]@{
+            Mode = [string]$key.GetValue('Mode', '')
+            IncludeCover = $key.GetValue('IncludeCover', $null)
+            OpenAfterExport = $key.GetValue('OpenAfterExport', $null)
+            AppendFormat = $key.GetValue('AppendFormat', $null)
+            AutoNumberDuplicates = $key.GetValue('AutoNumberDuplicates', $null)
+            SplitRootGroups = $key.GetValue('SplitRootGroups', $null)
+            OutputPath = [string]$key.GetValue('OutputPath', '')
+        }
+    }
+    catch { return $null }
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
+    }
+}
+
 function Get-ExporterSettings {
     $settings = [ordered]@{
         Mode = 'Epub'
@@ -55,24 +159,25 @@ function Get-ExporterSettings {
         SplitRootGroups = $false
         OutputPath = ''
     }
-    $key = $null
-    try {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:SettingsRegistryPath, $false)
-        if ($null -eq $key) { return [pscustomobject]$settings }
-        $savedMode = [string]$key.GetValue('Mode', '')
+    $rootSettings = Get-EmbeddedToolSettings
+    $sourceSettings = Get-ObjectProperty -Object $rootSettings -Name 'exporter' -DefaultValue $null
+    $migrateLegacy = $false
+    if ($null -eq $sourceSettings) {
+        $sourceSettings = Get-LegacyExporterSettings
+        $migrateLegacy = $null -ne $sourceSettings
+    }
+    if ($null -ne $sourceSettings) {
+        $savedMode = [string](Get-ObjectProperty -Object $sourceSettings -Name 'Mode' -DefaultValue '')
         if ($savedMode -in @('PerChapter', 'SingleBook', 'Epub', 'PdfStrip')) { $settings.Mode = $savedMode }
-        $settings.IncludeCover = ConvertTo-SettingBoolean -Value $key.GetValue('IncludeCover', $null) -DefaultValue $true
-        $settings.OpenAfterExport = ConvertTo-SettingBoolean -Value $key.GetValue('OpenAfterExport', $null) -DefaultValue $true
-        $settings.AppendFormat = ConvertTo-SettingBoolean -Value $key.GetValue('AppendFormat', $null) -DefaultValue $false
-        $settings.AutoNumberDuplicates = ConvertTo-SettingBoolean -Value $key.GetValue('AutoNumberDuplicates', $null) -DefaultValue $false
-        $settings.SplitRootGroups = ConvertTo-SettingBoolean -Value $key.GetValue('SplitRootGroups', $null) -DefaultValue $false
-        $settings.OutputPath = [string]$key.GetValue('OutputPath', '')
+        $settings.IncludeCover = ConvertTo-SettingBoolean -Value (Get-ObjectProperty -Object $sourceSettings -Name 'IncludeCover' -DefaultValue $null) -DefaultValue $true
+        $settings.OpenAfterExport = ConvertTo-SettingBoolean -Value (Get-ObjectProperty -Object $sourceSettings -Name 'OpenAfterExport' -DefaultValue $null) -DefaultValue $true
+        $settings.AppendFormat = ConvertTo-SettingBoolean -Value (Get-ObjectProperty -Object $sourceSettings -Name 'AppendFormat' -DefaultValue $null) -DefaultValue $false
+        $settings.AutoNumberDuplicates = ConvertTo-SettingBoolean -Value (Get-ObjectProperty -Object $sourceSettings -Name 'AutoNumberDuplicates' -DefaultValue $null) -DefaultValue $false
+        $settings.SplitRootGroups = ConvertTo-SettingBoolean -Value (Get-ObjectProperty -Object $sourceSettings -Name 'SplitRootGroups' -DefaultValue $null) -DefaultValue $false
+        $settings.OutputPath = [string](Get-ObjectProperty -Object $sourceSettings -Name 'OutputPath' -DefaultValue '')
     }
-    catch {
-        # 设置读取失败不应妨碍导出器打开。
-    }
-    finally {
-        if ($null -ne $key) { $key.Dispose() }
+    if ($migrateLegacy) {
+        [void](Save-ExporterSettings -SavedMode $settings.Mode -IncludeCover $settings.IncludeCover -OpenAfterExport $settings.OpenAfterExport -AppendFormat $settings.AppendFormat -AutoNumberDuplicates $settings.AutoNumberDuplicates -SplitRootGroups $settings.SplitRootGroups -SavedOutputPath $settings.OutputPath)
     }
     return [pscustomobject]$settings
 }
@@ -87,22 +192,23 @@ function Save-ExporterSettings {
         [bool]$SplitRootGroups,
         [string]$SavedOutputPath
     )
-    $key = $null
     try {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($script:SettingsRegistryPath)
-        $key.SetValue('Mode', $SavedMode, [Microsoft.Win32.RegistryValueKind]::String)
-        $key.SetValue('IncludeCover', [int]$IncludeCover, [Microsoft.Win32.RegistryValueKind]::DWord)
-        $key.SetValue('OpenAfterExport', [int]$OpenAfterExport, [Microsoft.Win32.RegistryValueKind]::DWord)
-        $key.SetValue('AppendFormat', [int]$AppendFormat, [Microsoft.Win32.RegistryValueKind]::DWord)
-        $key.SetValue('AutoNumberDuplicates', [int]$AutoNumberDuplicates, [Microsoft.Win32.RegistryValueKind]::DWord)
-        $key.SetValue('SplitRootGroups', [int]$SplitRootGroups, [Microsoft.Win32.RegistryValueKind]::DWord)
-        $key.SetValue('OutputPath', [string]$SavedOutputPath, [Microsoft.Win32.RegistryValueKind]::String)
+        $rootSettings = Get-EmbeddedToolSettings
+        $exporterSettings = [pscustomobject][ordered]@{
+            Mode = $SavedMode
+            IncludeCover = $IncludeCover
+            OpenAfterExport = $OpenAfterExport
+            AppendFormat = $AppendFormat
+            AutoNumberDuplicates = $AutoNumberDuplicates
+            SplitRootGroups = $SplitRootGroups
+            OutputPath = [string]$SavedOutputPath
+        }
+        Set-ObjectPropertyValue -Object $rootSettings -Name 'exporter' -Value $exporterSettings
+        return Save-EmbeddedToolSettings -Settings $rootSettings
     }
     catch {
         # 设置保存失败不应阻止窗口关闭。
-    }
-    finally {
-        if ($null -ne $key) { $key.Dispose() }
+        return $false
     }
 }
 
@@ -224,8 +330,8 @@ function Get-FlexibleImageSequence {
             $issues.Add(('{0}：图片编号 {1} 重复（{2}）' -f $Context, $duplicate.Name, (($duplicate.Group.File.Name) -join '、')))
         }
         $orderedNumbers = @($numericRecords.Page | Sort-Object -Unique)
-        if ($orderedNumbers.Count -gt 0 -and $orderedNumbers[0] -ne 1) {
-            $issues.Add(('{0}：第一张图片通常应为 0001，实际编号为 {1}。' -f $Context, $orderedNumbers[0]))
+        if ($orderedNumbers.Count -gt 0 -and $orderedNumbers[0] -notin @([int64]0, [int64]1)) {
+            $issues.Add(('{0}：第一张图片通常应从 0000 或 0001 开始，实际编号为 {1}。' -f $Context, $orderedNumbers[0]))
         }
         if ($orderedNumbers.Count -gt 0) {
             $span = $orderedNumbers[-1] - $orderedNumbers[0]
@@ -465,15 +571,6 @@ function Get-ComicPlan {
     $warnings = New-Object 'System.Collections.Generic.List[string]'
     $cover = Get-CoverFile -ComicPath $ComicDirectory.FullName
     $rootImages = @(Get-RootBodyImages -ComicPath $ComicDirectory.FullName)
-
-    if ($null -eq $cover) {
-        $zeroCandidates = @($rootImages | Where-Object { $_.BaseName -match '^0+$' })
-        if ($zeroCandidates.Count -eq 1 -and $rootImages.Count -gt 1) {
-            $cover = $zeroCandidates[0]
-            $rootImages = @($rootImages | Where-Object { $_.FullName -ine $cover.FullName })
-            $warnings.Add(('已把根目录的零号图片作为封面：' + $cover.Name))
-        }
-    }
 
     $directoryScan = Get-ImageChapterDirectories -ComicPath $ComicDirectory.FullName
     foreach ($message in $directoryScan.Warnings) { $warnings.Add($message) }
@@ -1816,6 +1913,7 @@ try {
     $toolPath = ''
     if (-not [string]::IsNullOrWhiteSpace($env:LOCAL_COMIC_TOOL_PATH)) { $toolPath = $env:LOCAL_COMIC_TOOL_PATH }
     elseif ($null -ne $MyInvocation.MyCommand.PSObject.Properties['Path']) { $toolPath = [string]$MyInvocation.MyCommand.Path }
+    $script:ExporterToolPath = $toolPath
     $scriptDirectory = if ([string]::IsNullOrWhiteSpace($toolPath)) { (Get-Location).Path } else { [IO.Path]::GetDirectoryName($toolPath) }
     $rootCandidate = if ([string]::IsNullOrWhiteSpace($RootPath)) { $scriptDirectory } elseif ([IO.Path]::IsPathRooted($RootPath)) { $RootPath } else { Join-Path $scriptDirectory $RootPath }
     $resolvedRoot = (Resolve-Path -LiteralPath $rootCandidate).Path
