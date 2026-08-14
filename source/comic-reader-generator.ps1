@@ -666,8 +666,15 @@ function ConvertTo-CollectionDefinition {
     if ($null -ne $Parsed.PSObject.Properties['members']) {
         $members = @($Parsed.members | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
     }
-    $hideMembers = $true
-    if ($null -ne $Parsed.PSObject.Properties['hideMembersOnRoot']) { $hideMembers = [bool]$Parsed.hideMembersOnRoot }
+    $rootVisibleMembers = @()
+    if ($null -ne $Parsed.PSObject.Properties['rootVisibleMembers']) {
+        $rootVisibleMembers = @($Parsed.rootVisibleMembers | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -and $members -contains $_ } | Select-Object -Unique)
+    }
+    elseif ($null -ne $Parsed.PSObject.Properties['hideMembersOnRoot'] -and -not [bool]$Parsed.hideMembersOnRoot) {
+        # Legacy collections only had one whole-collection switch. Preserve an
+        # old "show members on root" choice by opting every existing member in.
+        $rootVisibleMembers = @($members)
+    }
     $coverMode = if ($null -ne $Parsed.PSObject.Properties['coverMode']) { [string]$Parsed.coverMode } else { 'auto' }
     if ($coverMode -notin @('auto', 'comic', 'custom')) { $coverMode = 'auto' }
     $coverComic = if ($null -ne $Parsed.PSObject.Properties['coverComic']) { [string]$Parsed.coverComic } else { '' }
@@ -677,7 +684,7 @@ function ConvertTo-CollectionDefinition {
         Title = $title.Trim()
         Description = $description.Trim()
         Members = @($members)
-        HideMembersOnRoot = $hideMembers
+        RootVisibleMembers = @($rootVisibleMembers)
         CoverMode = $coverMode
         CoverComic = $coverComic.Trim()
         CoverFile = $coverFile.Trim()
@@ -692,7 +699,7 @@ function ConvertTo-PersistedCollection {
         title = [string]$Collection.Title
         description = [string]$Collection.Description
         members = @($Collection.Members)
-        hideMembersOnRoot = [bool]$Collection.HideMembersOnRoot
+        rootVisibleMembers = @($Collection.RootVisibleMembers | Where-Object { $Collection.Members -contains $_ } | Select-Object -Unique)
         coverMode = [string]$Collection.CoverMode
         coverComic = [string]$Collection.CoverComic
         coverFile = [string]$Collection.CoverFile
@@ -1143,7 +1150,7 @@ function Show-CollectionEditor {
             Title = ''
             Description = ''
             Members = @()
-            HideMembersOnRoot = $true
+            RootVisibleMembers = @()
             CoverMode = 'auto'
             CoverComic = ''
             CoverFile = ''
@@ -1188,22 +1195,67 @@ function Show-CollectionEditor {
     $dialog.Controls.Add($descriptionBox)
 
     $membersLabel = New-Object System.Windows.Forms.Label
-    $membersLabel.Text = '成员漫画（勾选并可调整显示顺序）：'
+    $membersLabel.Text = '成员漫画（逐部决定是否在总书架重复显示；新加入成员默认不重复）：'
     $membersLabel.AutoSize = $true
     $membersLabel.Location = New-Object System.Drawing.Point(20, 145)
     $dialog.Controls.Add($membersLabel)
 
-    $memberList = New-Object System.Windows.Forms.CheckedListBox
-    $memberList.CheckOnClick = $true
+    $memberList = New-Object System.Windows.Forms.DataGridView
     $memberList.Location = New-Object System.Drawing.Point(20, 174)
     $memberList.Size = New-Object System.Drawing.Size(620, 250)
     $memberList.Anchor = 'Top,Bottom,Left,Right'
+    $memberList.AllowUserToAddRows = $false
+    $memberList.AllowUserToDeleteRows = $false
+    $memberList.AllowUserToResizeRows = $false
+    $memberList.RowHeadersVisible = $false
+    $memberList.MultiSelect = $false
+    $memberList.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $memberList.EditMode = [System.Windows.Forms.DataGridViewEditMode]::EditOnEnter
+    $memberList.AutoGenerateColumns = $false
+    $memberColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $memberColumn.Name = 'Member'
+    $memberColumn.HeaderText = '加入合集'
+    $memberColumn.Width = 88
+    [void]$memberList.Columns.Add($memberColumn)
+    $rootVisibleColumn = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $rootVisibleColumn.Name = 'RootVisible'
+    $rootVisibleColumn.HeaderText = '总书架重复显示'
+    $rootVisibleColumn.Width = 145
+    [void]$memberList.Columns.Add($rootVisibleColumn)
+    $memberNameColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $memberNameColumn.Name = 'ComicName'
+    $memberNameColumn.HeaderText = '漫画名称'
+    $memberNameColumn.ReadOnly = $true
+    $memberNameColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    [void]$memberList.Columns.Add($memberNameColumn)
     $orderedNames = @($working.Members | Where-Object { $AvailableNames -contains $_ })
     $orderedNames += @($AvailableNames | Where-Object { $orderedNames -notcontains $_ } | Sort-Object)
     foreach ($name in @($orderedNames | Select-Object -Unique)) {
-        $index = $memberList.Items.Add($name)
-        $memberList.SetItemChecked($index, ($working.Members -contains $name))
+        $isMember = $working.Members -contains $name
+        $showOnRoot = $isMember -and $working.RootVisibleMembers -contains $name
+        $index = $memberList.Rows.Add($isMember, $showOnRoot, $name)
+        $memberList.Rows[$index].Cells['RootVisible'].ReadOnly = -not $isMember
+        if (-not $isMember) { $memberList.Rows[$index].Cells['RootVisible'].Style.BackColor = [System.Drawing.SystemColors]::Control }
     }
+    $memberGridState = [pscustomobject]@{ Suppress = $false }
+    $syncMemberRow = {
+        param([System.Windows.Forms.DataGridViewRow]$Row)
+        if ($null -eq $Row) { return }
+        $isMember = ($Row.Cells['Member'].Value -eq $true)
+        $Row.Cells['RootVisible'].ReadOnly = -not $isMember
+        $Row.Cells['RootVisible'].Style.BackColor = if ($isMember) { [System.Drawing.SystemColors]::Window } else { [System.Drawing.SystemColors]::Control }
+        if (-not $isMember) { $Row.Cells['RootVisible'].Value = $false }
+    }
+    $memberList.add_CurrentCellDirtyStateChanged({
+        if ($memberList.IsCurrentCellDirty) { [void]$memberList.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) }
+    })
+    $memberList.add_CellValueChanged({
+        param($sender, $eventArgs)
+        if ($memberGridState.Suppress -or $eventArgs.RowIndex -lt 0 -or $eventArgs.ColumnIndex -ne $memberList.Columns['Member'].Index) { return }
+        $memberGridState.Suppress = $true
+        try { & $syncMemberRow $memberList.Rows[$eventArgs.RowIndex] }
+        finally { $memberGridState.Suppress = $false }
+    })
     $dialog.Controls.Add($memberList)
 
     $moveUp = New-Object System.Windows.Forms.Button
@@ -1212,14 +1264,22 @@ function Show-CollectionEditor {
     $moveUp.Size = New-Object System.Drawing.Size(72, 34)
     $moveUp.Anchor = 'Top,Right'
     $moveUp.add_Click({
-        $index = $memberList.SelectedIndex
+        $index = if ($null -ne $memberList.CurrentRow) { $memberList.CurrentRow.Index } else { -1 }
         if ($index -le 0) { return }
-        $text = [string]$memberList.Items[$index]
-        $checked = $memberList.GetItemChecked($index)
-        $memberList.Items.RemoveAt($index)
-        $memberList.Items.Insert($index - 1, $text)
-        $memberList.SetItemChecked($index - 1, $checked)
-        $memberList.SelectedIndex = $index - 1
+        $memberGridState.Suppress = $true
+        try {
+            $values = @($memberList.Rows[$index].Cells['Member'].Value, $memberList.Rows[$index].Cells['RootVisible'].Value, $memberList.Rows[$index].Cells['ComicName'].Value)
+            foreach ($columnName in @('Member', 'RootVisible', 'ComicName')) { $memberList.Rows[$index].Cells[$columnName].Value = $memberList.Rows[$index - 1].Cells[$columnName].Value }
+            $memberList.Rows[$index - 1].Cells['Member'].Value = $values[0]
+            $memberList.Rows[$index - 1].Cells['RootVisible'].Value = $values[1]
+            $memberList.Rows[$index - 1].Cells['ComicName'].Value = $values[2]
+            & $syncMemberRow $memberList.Rows[$index]
+            & $syncMemberRow $memberList.Rows[$index - 1]
+        }
+        finally { $memberGridState.Suppress = $false }
+        $memberList.ClearSelection()
+        $memberList.Rows[$index - 1].Selected = $true
+        $memberList.CurrentCell = $memberList.Rows[$index - 1].Cells['ComicName']
     })
     $dialog.Controls.Add($moveUp)
 
@@ -1229,24 +1289,32 @@ function Show-CollectionEditor {
     $moveDown.Size = New-Object System.Drawing.Size(72, 34)
     $moveDown.Anchor = 'Top,Right'
     $moveDown.add_Click({
-        $index = $memberList.SelectedIndex
-        if ($index -lt 0 -or $index -ge $memberList.Items.Count - 1) { return }
-        $text = [string]$memberList.Items[$index]
-        $checked = $memberList.GetItemChecked($index)
-        $memberList.Items.RemoveAt($index)
-        $memberList.Items.Insert($index + 1, $text)
-        $memberList.SetItemChecked($index + 1, $checked)
-        $memberList.SelectedIndex = $index + 1
+        $index = if ($null -ne $memberList.CurrentRow) { $memberList.CurrentRow.Index } else { -1 }
+        if ($index -lt 0 -or $index -ge $memberList.Rows.Count - 1) { return }
+        $memberGridState.Suppress = $true
+        try {
+            $values = @($memberList.Rows[$index].Cells['Member'].Value, $memberList.Rows[$index].Cells['RootVisible'].Value, $memberList.Rows[$index].Cells['ComicName'].Value)
+            foreach ($columnName in @('Member', 'RootVisible', 'ComicName')) { $memberList.Rows[$index].Cells[$columnName].Value = $memberList.Rows[$index + 1].Cells[$columnName].Value }
+            $memberList.Rows[$index + 1].Cells['Member'].Value = $values[0]
+            $memberList.Rows[$index + 1].Cells['RootVisible'].Value = $values[1]
+            $memberList.Rows[$index + 1].Cells['ComicName'].Value = $values[2]
+            & $syncMemberRow $memberList.Rows[$index]
+            & $syncMemberRow $memberList.Rows[$index + 1]
+        }
+        finally { $memberGridState.Suppress = $false }
+        $memberList.ClearSelection()
+        $memberList.Rows[$index + 1].Selected = $true
+        $memberList.CurrentCell = $memberList.Rows[$index + 1].Cells['ComicName']
     })
     $dialog.Controls.Add($moveDown)
 
-    $hideMembers = New-Object System.Windows.Forms.CheckBox
-    $hideMembers.Text = '成员漫画只在合集页显示，不在总书架重复显示'
-    $hideMembers.AutoSize = $true
-    $hideMembers.Checked = [bool]$working.HideMembersOnRoot
-    $hideMembers.Location = New-Object System.Drawing.Point(20, 438)
-    $hideMembers.Anchor = 'Bottom,Left'
-    $dialog.Controls.Add($hideMembers)
+    $rootVisibilityHint = New-Object System.Windows.Forms.Label
+    $rootVisibilityHint.Text = '未勾选“总书架重复显示”的合集成员，只会出现在合集页。'
+    $rootVisibilityHint.AutoSize = $true
+    $rootVisibilityHint.ForeColor = [System.Drawing.Color]::DimGray
+    $rootVisibilityHint.Location = New-Object System.Drawing.Point(20, 438)
+    $rootVisibilityHint.Anchor = 'Bottom,Left'
+    $dialog.Controls.Add($rootVisibilityHint)
 
     $coverLabel = New-Object System.Windows.Forms.Label
     $coverLabel.Text = '合集封面：'
@@ -1314,8 +1382,14 @@ function Show-CollectionEditor {
     $ok.Anchor = 'Bottom,Right'
     $ok.add_Click({
         $members = @()
-        for ($index = 0; $index -lt $memberList.Items.Count; $index++) {
-            if ($memberList.GetItemChecked($index)) { $members += [string]$memberList.Items[$index] }
+        $rootVisibleMembers = @()
+        [void]$memberList.EndEdit()
+        foreach ($row in $memberList.Rows) {
+            if ($row.Cells['Member'].Value -eq $true) {
+                $memberName = [string]$row.Cells['ComicName'].Value
+                $members += $memberName
+                if ($row.Cells['RootVisible'].Value -eq $true) { $rootVisibleMembers += $memberName }
+            }
         }
         if ([string]::IsNullOrWhiteSpace($titleBox.Text)) {
             [System.Windows.Forms.MessageBox]::Show('请填写合集名称。', '合集设置', 'OK', 'Information') | Out-Null
@@ -1337,7 +1411,7 @@ function Show-CollectionEditor {
         $working.Title = $titleBox.Text.Trim()
         $working.Description = $descriptionBox.Text.Trim()
         $working.Members = @($members)
-        $working.HideMembersOnRoot = [bool]$hideMembers.Checked
+        $working.RootVisibleMembers = @($rootVisibleMembers)
         $working.CoverMode = $selectedMode
         $working.CoverComic = if ($selectedMode -eq 'comic') { [string]$coverComic.SelectedItem } else { '' }
         $dialog.Tag = $working
@@ -1400,7 +1474,8 @@ function Show-CollectionManager {
         foreach ($collection in $workingCollections) {
             $item = New-Object System.Windows.Forms.ListViewItem([string]$collection.Title)
             [void]$item.SubItems.Add(('{0} 部' -f @($collection.Members).Count))
-            $displayModeText = if ($collection.HideMembersOnRoot) { '显示合集卡片，隐藏成员卡片' } else { '合集卡片与成员卡片同时显示' }
+            $visibleMemberCount = @($collection.RootVisibleMembers | Where-Object { $collection.Members -contains $_ } | Select-Object -Unique).Count
+            $displayModeText = if ($visibleMemberCount -eq 0) { '成员均只在合集页显示' } else { '{0} 部成员同时在总书架显示' -f $visibleMemberCount }
             [void]$item.SubItems.Add($displayModeText)
             $item.Tag = $collection
             [void]$list.Items.Add($item)
@@ -2465,7 +2540,7 @@ function Show-ComicSelector {
 3. “加入 / 更新本次勾选”只处理本次操作列中的漫画；“全部更新”处理所有已加入书架的漫画。
 4. 章节封面可选“跟随元数据、首图、自选、该话其他图片、隐藏”。执行更新后，非“跟随元数据”的设置也会写入漫画自身的元数据；章节封面只由逐话设置控制，至少一话显示时会自动开启，全部隐藏时自动关闭，不再另设整本开关。“元数据状态”列只显示逐话实际保存的设置，未设置时不会显示运行时回退结果，完整保存路径可悬停查看。
 5. “编辑当前漫画逐话封面”可逐话选择图片：“自选”可复制任意本地图片进漫画阅读器资源，也可选择“插入本地图片为本话首图”，将原数字图片整体顺延并把该话逻辑重设为首图；“该话其他图片”只直接引用本话现有正文，不产生副本。
-6. “管理合集”只改变总书架和合集目录的归类，不会移动或改名原漫画文件夹。
+6. “管理合集”只改变总书架和合集目录的归类，不会移动或改名原漫画文件夹。每个成员都能独立勾选“总书架重复显示”；新加入合集的成员默认不勾选，只在合集页出现。同一漫画属于多个合集时，只要任一合集勾选重复显示，总书架就显示一次。
 7. “重新扫描”会追加新漫画且不重置现有操作；已载入漫画发生变化时会先二次确认，再保留勾选和封面设置重新导入。
 8. 直接装图片的一个文件夹默认是一话。检测到多个文件名前缀时会询问是否按分组拆话，默认不拆。
 9. 图片页码有断号、重复、不是连续数字或无法识别时会显示具体错误；可按当前文件名自然排序继续、只跳过当前漫画，或退出整个本次任务。可勾选对本次任务后续同类情况执行相同操作。空文件等非排序错误仍不会放行。
@@ -4209,6 +4284,7 @@ function Resolve-CollectionDefinitionsForGeneration {
             continue
         }
         $collection.Members = @($members)
+        $collection.RootVisibleMembers = @($collection.RootVisibleMembers | Where-Object { $members -contains $_ } | Select-Object -Unique)
         if ([string]$collection.CoverMode -eq 'custom' -and -not [string]::IsNullOrWhiteSpace([string]$collection.CoverSourcePath)) {
             $sourceCover = [string]$collection.CoverSourcePath
             if (-not (Test-Path -LiteralPath $sourceCover -PathType Leaf)) { throw ('合集自定义封面不存在：' + $sourceCover) }
@@ -4373,16 +4449,20 @@ function New-RootPage {
     $collectionErrors = @(Test-CollectionDefinitions -Collections $Collections -AvailableNames $SelectedNames)
     if ($collectionErrors.Count -gt 0) { throw ('合集配置无效：' + ($collectionErrors -join '；')) }
     $resolvedCollections = @(Resolve-CollectionDefinitionsForGeneration -LibraryRoot $LibraryRoot -Collections $Collections -SelectedNames $SelectedNames -CardsByName $cardsByName)
-    $hiddenNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $collectionMemberNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $rootVisibleMemberNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($resolvedCollection in $resolvedCollections) {
-        if ($resolvedCollection.Definition.HideMembersOnRoot) {
-            foreach ($member in $resolvedCollection.Members) { [void]$hiddenNames.Add([string]$member) }
+        foreach ($member in $resolvedCollection.Members) { [void]$collectionMemberNames.Add([string]$member) }
+        foreach ($member in @($resolvedCollection.Definition.RootVisibleMembers | Where-Object { $resolvedCollection.Members -contains $_ })) {
+            [void]$rootVisibleMemberNames.Add([string]$member)
         }
     }
     $rootCards = New-Object System.Text.StringBuilder
     foreach ($resolvedCollection in $resolvedCollections) { [void]$rootCards.AppendLine((New-CollectionCardHtml -ResolvedCollection $resolvedCollection)) }
     foreach ($name in @($SelectedNames | Sort-Object)) {
-        if (-not $hiddenNames.Contains($name)) { [void]$rootCards.AppendLine(([string]$cardsByName[$name]).TrimEnd()) }
+        if (-not $collectionMemberNames.Contains($name) -or $rootVisibleMemberNames.Contains($name)) {
+            [void]$rootCards.AppendLine(([string]$cardsByName[$name]).TrimEnd())
+        }
     }
     $readerData = Get-ReaderDataFromCards -CardsByName $cardsByName
     $persistedChapterCoverOverrides = [ordered]@{}
@@ -4403,7 +4483,7 @@ function New-RootPage {
         if ($safeChapterMap.Count -gt 0) { $persistedChapterCustomCovers[$name] = $safeChapterMap }
     }
     $embeddedConfig = [ordered]@{
-        schemaVersion = 8
+        schemaVersion = 9
         selected = @($SelectedNames)
         openAfterGenerate = $OpenAfterGenerate
         collections = @($resolvedCollections | ForEach-Object { ConvertTo-PersistedCollection -Collection $_.Definition })
@@ -4413,7 +4493,7 @@ function New-RootPage {
         updatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     }
     $path = Join-Path $LibraryRoot $script:LauncherFileName
-    $subtitle = '共 {0} 部漫画 · {1} 个合集；合集成员默认只在合集页显示。阅读进度只保存在当前浏览器。' -f $SelectedNames.Count, $resolvedCollections.Count
+    $subtitle = '共 {0} 部漫画 · {1} 个合集；合集成员默认只在合集页显示，也可逐部设为同时出现在总书架。阅读进度只保存在当前浏览器。' -f $SelectedNames.Count, $resolvedCollections.Count
     $note = '生成时间：{0}。以后下载新漫画后，双击根目录的“漫画更新器.vbs”即可同步更新。' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     New-CatalogPage -Path $path -Heading '本地漫画阅读器' -Subtitle $subtitle -CardsHtml $rootCards.ToString().TrimEnd() -EmbeddedConfig $embeddedConfig -BackLinkHtml '' -Note $note
 
@@ -4939,13 +5019,18 @@ function Invoke-ComicUpdate {
     $launcherHtml = [System.IO.File]::ReadAllText($launcherPath, [System.Text.Encoding]::UTF8)
     $rootCardCount = ([regex]::Matches($launcherHtml, '<article class="card(?:\s+[^"]+)?"\s')).Count
     $activeCollections = @($Collections | Where-Object { @($_.Members | Where-Object { $persistedSelectedNames -contains $_ }).Count -gt 0 })
-    $hiddenNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $collectionMemberNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $rootVisibleMemberNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($collection in $activeCollections) {
-        if ([bool]$collection.HideMembersOnRoot) {
-            foreach ($member in @($collection.Members | Where-Object { $persistedSelectedNames -contains $_ })) { [void]$hiddenNames.Add([string]$member) }
+        $activeMembers = @($collection.Members | Where-Object { $persistedSelectedNames -contains $_ })
+        foreach ($member in $activeMembers) { [void]$collectionMemberNames.Add([string]$member) }
+        foreach ($member in @($collection.RootVisibleMembers | Where-Object { $activeMembers -contains $_ })) {
+            [void]$rootVisibleMemberNames.Add([string]$member)
         }
     }
-    $expectedRootCardCount = $activeCollections.Count + @($persistedSelectedNames | Where-Object { -not $hiddenNames.Contains([string]$_) }).Count
+    $expectedRootCardCount = $activeCollections.Count + @($persistedSelectedNames | Where-Object {
+        -not $collectionMemberNames.Contains([string]$_) -or $rootVisibleMemberNames.Contains([string]$_)
+    }).Count
     if ($rootCardCount -ne $expectedRootCardCount) { throw "总打开器复核失败：应有 $expectedRootCardCount 个漫画/合集卡片，实际有 $rootCardCount 个。" }
     foreach ($collection in $activeCollections) {
         $collectionPath = Join-Path $LibraryRoot (Get-CollectionPageFileName -Collection $collection)

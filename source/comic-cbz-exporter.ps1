@@ -506,6 +506,63 @@ function Get-WindowsChapterNameMatchKey {
     return $text
 }
 
+function Get-FlexibleChapterLabelPrefixPattern {
+    param([string]$Label)
+    if ([string]::IsNullOrWhiteSpace($Label)) { return '' }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('^')
+    foreach ($character in ([regex]::Replace($Label.Trim(), '\s+', '')).ToCharArray()) {
+        if ($character -eq '话' -or $character -eq '話') {
+            [void]$builder.Append('[话話]')
+        }
+        else {
+            [void]$builder.Append([regex]::Escape([string]$character))
+        }
+        [void]$builder.Append('\s*')
+    }
+    return $builder.ToString()
+}
+
+function Get-ChapterLabelComparisonKey {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return ([regex]::Replace($Value.Trim(), '\s+', '').Replace('話', '话')).ToLowerInvariant()
+}
+
+function Get-CompleteChapterExportLabel {
+    param(
+        [object]$MetadataItem,
+        [string]$Folder,
+        [string]$DisplayLabel
+    )
+    $label = ([string]$DisplayLabel).Trim()
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = ([string]$Folder).Trim() }
+
+    $titleCandidate = ''
+    foreach ($fieldName in @('chapterTitle', 'title', 'chapterName', 'name')) {
+        $value = ([string](Get-ObjectProperty -Object $MetadataItem -Name $fieldName -DefaultValue '')).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $titleCandidate = $value
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($titleCandidate)) { $titleCandidate = ([string]$Folder).Trim() }
+
+    $title = $titleCandidate
+    $prefixPattern = Get-FlexibleChapterLabelPrefixPattern -Label $label
+    if (-not [string]::IsNullOrWhiteSpace($prefixPattern)) {
+        $title = [regex]::Replace($titleCandidate, $prefixPattern, '', [Text.RegularExpressions.RegexOptions]::IgnoreCase).Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($label)) { return $title }
+    if ([string]::IsNullOrWhiteSpace($title)) { return $label }
+    $labelKey = Get-ChapterLabelComparisonKey -Value $label
+    $titleKey = Get-ChapterLabelComparisonKey -Value $titleCandidate
+    if ($labelKey -eq $titleKey -or (-not [string]::IsNullOrWhiteSpace($titleKey) -and $labelKey.EndsWith($titleKey, [StringComparison]::OrdinalIgnoreCase))) {
+        return $label
+    }
+    return ($label + ' ' + $title).Trim()
+}
+
 function Read-ComicMetadata {
     param([string]$ComicPath)
     $result = [ordered]@{
@@ -548,7 +605,8 @@ function Read-ComicMetadata {
             }
             $label = [string](Get-ObjectProperty $item 'displayLabel' '')
             if ([string]::IsNullOrWhiteSpace($label)) { $label = $folder }
-            $infos += [pscustomobject]@{ Folder = $folder; MatchKey = $normalizedFolder; Order = $order; Label = $label }
+            $completeLabel = Get-CompleteChapterExportLabel -MetadataItem $item -Folder $folder -DisplayLabel $label
+            $infos += [pscustomobject]@{ Folder = $folder; MatchKey = $normalizedFolder; Order = $order; Label = $completeLabel; DisplayLabel = $label }
             $usedFolders[$folder] = $true
             $usedNormalizedFolders[$normalizedFolder] = $true
             $usedOrders[$orderKey] = $true
@@ -742,6 +800,16 @@ function ConvertTo-SafeFileName {
         $safe = $safe.Substring(0, [Math]::Max(1, $MaxLength - 10)).TrimEnd() + '~' + $hash
     }
     return $safe
+}
+
+function Get-ChapterExportBaseName {
+    param(
+        [object]$Chapter,
+        [int]$Index,
+        [int]$Width
+    )
+    $label = ConvertTo-SafeFileName -Name ([string]$Chapter.Label) -MaxLength 92
+    return $Index.ToString(('D' + $Width)) + ' - ' + $label
 }
 
 function Test-PathInside {
@@ -1398,8 +1466,7 @@ function Export-ComicPlan {
         $expectedPaths = @{}
         for ($index = 0; $index -lt $Plan.Chapters.Count; $index++) {
             $chapter = $Plan.Chapters[$index]
-            $label = ConvertTo-SafeFileName -Name $chapter.Label -MaxLength 92
-            $baseName = (($index + 1).ToString(('D' + $width))) + ' - ' + $label
+            $baseName = Get-ChapterExportBaseName -Chapter $chapter -Index ($index + 1) -Width $width
             $name = $baseName
             $suffix = 2
             while ($usedNames.ContainsKey($name) -or (Test-Path -LiteralPath (Join-Path $comicOutput ($name + '.pdf')) -PathType Container)) {
@@ -1463,8 +1530,7 @@ function Export-ComicPlan {
     $expectedPaths = @{}
     for ($index = 0; $index -lt $Plan.Chapters.Count; $index++) {
         $chapter = $Plan.Chapters[$index]
-        $label = ConvertTo-SafeFileName -Name $chapter.Label -MaxLength 92
-        $baseName = (($index + 1).ToString(('D' + $width))) + ' - ' + $label
+        $baseName = Get-ChapterExportBaseName -Chapter $chapter -Index ($index + 1) -Width $width
         $name = $baseName
         $suffix = 2
         while ($usedNames.ContainsKey($name) -or (Test-Path -LiteralPath (Join-Path $comicOutput ($name + '.cbz')) -PathType Container)) {
