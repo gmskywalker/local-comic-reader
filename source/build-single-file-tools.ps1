@@ -79,6 +79,22 @@ catch {
     $loader = $loader.Replace('__DISPLAY_NAME__', $DisplayName.Replace("'", "''"))
     $loaderEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loader))
 
+    $settingsLine = "'#==TOOL_SETTINGS==e30="
+    if (Test-Path -LiteralPath $DestinationPath -PathType Leaf) {
+        try {
+            $existingContent = [IO.File]::ReadAllText($DestinationPath, [Text.Encoding]::UTF8)
+            $settingsMatches = [regex]::Matches($existingContent, '(?m)^''#==TOOL_SETTINGS==(?<data>[A-Za-z0-9+/=]*)(?=\r?$)')
+            if ($settingsMatches.Count -eq 1) {
+                $settingsJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($settingsMatches[0].Groups['data'].Value))
+                [void]($settingsJson | ConvertFrom-Json)
+                $settingsLine = $settingsMatches[0].Value
+            }
+        }
+        catch {
+            # 旧文件没有有效嵌入设置时，从空设置开始；程序正文仍照常重新打包。
+        }
+    }
+
     $header = @"
 Option Explicit
 Dim shell, processEnv, selfPath, argumentData, item, commandLine, exitCode
@@ -95,6 +111,7 @@ processEnv("LOCAL_COMIC_TOOL_ARGUMENTS") = argumentData
 commandLine = "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $loaderEncoded"
 exitCode = shell.Run(commandLine, 0, True)
 WScript.Quit exitCode
+$settingsLine
 '#==POWERSHELL_PAYLOAD==
 "@
     $content = $header + ($payloadLines -join "`r`n") + "`r`n"
