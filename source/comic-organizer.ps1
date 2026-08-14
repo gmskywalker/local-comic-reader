@@ -334,8 +334,24 @@ function ConvertTo-ChapterLabelInfo {
             IsNumeric = $true
             Number = $numberInfo.Text
             SortNumber = $numberInfo.Value
+            NumberSuffix = ''
             BaseFolderName = ('第' + $numberInfo.Text + '话')
             DisplayLabel = ('第 ' + $numberInfo.Text + ' 话')
+        }
+    }
+    $numberWithSuffixMatch = [regex]::Match($text, '^(?<number>\d+(?:\.\d+)?)\s+(?<suffix>.+)$')
+    if ($numberWithSuffixMatch.Success) {
+        $prefixNumberInfo = ConvertTo-ChapterNumberInfo -Value $numberWithSuffixMatch.Groups['number'].Value
+        $suffix = $numberWithSuffixMatch.Groups['suffix'].Value.Trim()
+        if ($null -ne $prefixNumberInfo -and (Test-SimpleFolderName -Name $suffix) -and $suffix -notmatch '^\d') {
+            return [pscustomobject]@{
+                IsNumeric = $true
+                Number = $prefixNumberInfo.Text
+                SortNumber = $prefixNumberInfo.Value
+                NumberSuffix = $suffix
+                BaseFolderName = ('第' + $prefixNumberInfo.Text + '话 ' + $suffix)
+                DisplayLabel = ('第 ' + $prefixNumberInfo.Text + ' 话 ' + $suffix)
+            }
         }
     }
     if (-not (Test-SimpleFolderName -Name $text) -or $text -match '^\d') {
@@ -345,6 +361,7 @@ function ConvertTo-ChapterLabelInfo {
         IsNumeric = $false
         Number = ''
         SortNumber = [decimal]0
+        NumberSuffix = ''
         BaseFolderName = $text
         DisplayLabel = $text
     }
@@ -1239,7 +1256,7 @@ function Test-OrganizerPlan {
             $numberValue = Get-ObjectProperty -Object $chapter -Name 'number' -Default 0
             $labelInfo = ConvertTo-ChapterLabelInfo -Value $numberValue
             if ($null -eq $labelInfo) {
-                $errors.Add(('章节话序/特殊标签无效；可填 4.5、特典话、番外篇或插画集：' + [string]$numberValue))
+                $errors.Add(('章节话序/特殊标签无效；可填 4.5、3 前编、特典话、番外篇或插画集：' + [string]$numberValue))
                 continue
             }
             $number = $labelInfo.Number
@@ -1396,6 +1413,7 @@ function Test-OrganizerPlan {
                 IsNumeric = $labelInfo.IsNumeric
                 Number = $number
                 SortNumber = $labelInfo.SortNumber
+                NumberSuffix = [string]$labelInfo.NumberSuffix
                 ReadingOrder = $resolvedChapters.Count + 1
                 DisplayLabel = $chapterLabel
                 FolderName = $folderName
@@ -1445,9 +1463,9 @@ function Test-OrganizerPlan {
         }
     }
 
-    $duplicates = @($resolvedChapters | Where-Object IsNumeric | Group-Object Number | Where-Object Count -gt 1)
+    $duplicates = @($resolvedChapters | Where-Object IsNumeric | Group-Object DisplayLabel | Where-Object Count -gt 1)
     foreach ($duplicate in $duplicates) {
-        $errors.Add(('输出章节编号重复：第 ' + $duplicate.Name + ' 话。'))
+        $errors.Add(('输出章节话序重复：' + $duplicate.Name + '。'))
     }
     $folderDuplicates = @($resolvedChapters | Group-Object FolderName | Where-Object Count -gt 1)
     foreach ($duplicate in $folderDuplicates) {
@@ -3024,12 +3042,12 @@ function Show-OrganizerWindow {
             return
         }
         $anchorLogicalIndex = [array]::IndexOf($logicalRows, $anchorRow)
-        $anchorNumber = ConvertTo-ChapterNumberInfo -Value $anchorRow.Cells['Number'].Value
-        if ($null -eq $anchorNumber) {
-            & $showMessage '作为锚点的最后一行话序无效；请先填写正整数或小数，例如 3 或 4.5。' '无法继续编号' ([System.Windows.Forms.MessageBoxIcon]::Error)
+        $anchorLabel = ConvertTo-ChapterLabelInfo -Value $anchorRow.Cells['Number'].Value
+        if ($null -eq $anchorLabel -or -not [bool]$anchorLabel.IsNumeric) {
+            & $showMessage '作为锚点的最后一行话序无效；请先填写正整数、小数或数字加分段标签，例如 3、4.5 或 3 中编。' '无法继续编号' ([System.Windows.Forms.MessageBoxIcon]::Error)
             return
         }
-        $nextNumber = [int][decimal]::Floor($anchorNumber.Value) + 1
+        $nextNumber = [int][decimal]::Floor($anchorLabel.SortNumber) + 1
         for ($logicalIndex = $anchorLogicalIndex + 1; $logicalIndex -lt $logicalRows.Count; $logicalIndex++) {
             $logicalRows[$logicalIndex].Cells['Number'].Value = $nextNumber
             $nextNumber++
@@ -3937,7 +3955,7 @@ function Show-OrganizerWindow {
 4. 简介默认跟随输出漫画名称所选来源；在简介窗口按“确定”后即固定，不再随名称来源变化。
 5. 来源若有元数据.json 且 chapterInfos 完整有效，会按其中的 order 排列；无配置或无法完整匹配时按名称自然排序并提示原因。
 6. 来源漫画若直接把图片放在根目录，默认只载入为一话；P01_001、P02_001 等前缀不会再自动误拆成多话。需要拆话时可载入后使用“按范围拆分选中行”。
-7. 表格从上到下就是阅读顺序，可修改话序、章节名、范围并上下移动；非数字话序会保留原特殊名称。
+7. 表格从上到下就是阅读顺序，可修改话序、章节名、范围并上下移动；支持 4.5、3 前编、3 中编等数字分段标签，非数字话序也会保留原特殊名称。
 8. 第一列“选择”用于批量操作；封面、复制、删除、上移、下移、移到最上和移到最下等按钮优先处理勾选行，未勾选时处理当前行。
 9. “合并所选为同一话”允许所选行不连续；整理器会把它们聚拢到第一条所选行的位置并按原相对顺序合并。并入行会保留原话序、章节名、章节封面和元数据指向并灰显，便于辨认来源，但这些字段逻辑上不会单独生效或占用章节编号。
 10. “按范围拆分选中行”会检查是否连续完整覆盖；1-3,3-10 这类边界重复可自动修正，其他缺口或重叠必须二次确认。
