@@ -476,6 +476,12 @@ function Get-SourceChapterOrderConfiguration {
             if ($null -ne $chapterInfo.PSObject.Properties['chapterFolder']) { $chapterFolder = [string]$chapterInfo.chapterFolder }
             elseif ($null -ne $chapterInfo.PSObject.Properties['chapterTitle']) { $chapterFolder = [string]$chapterInfo.chapterTitle }
             $normalizedKey = Get-WindowsChapterNameMatchKey -Value $chapterFolder
+            $hasSeparateChapterFields = (
+                $null -ne $chapterInfo.PSObject.Properties['chapterSequence'] -and
+                $null -ne $chapterInfo.PSObject.Properties['chapterName']
+            )
+            $chapterSequence = if ($hasSeparateChapterFields) { [string]$chapterInfo.chapterSequence } else { '' }
+            $chapterName = if ($hasSeparateChapterFields) { [string]$chapterInfo.chapterName } else { '' }
             $hasCoverSetting = $null -ne $chapterInfo.PSObject.Properties['coverMode']
             $rawCoverMode = if ($hasCoverSetting) { ([string]$chapterInfo.coverMode).Trim().ToLowerInvariant() } else { '' }
             $coverModeIsValid = $hasCoverSetting -and $rawCoverMode -in @('first', 'custom', 'chapter', 'none')
@@ -488,6 +494,9 @@ function Get-SourceChapterOrderConfiguration {
                 HasCoverSetting = $hasCoverSetting
                 RawCoverMode = $rawCoverMode
                 CoverModeIsValid = $coverModeIsValid
+                HasSeparateChapterFields = $hasSeparateChapterFields
+                ChapterSequence = $chapterSequence
+                ChapterName = $chapterName
             }
             if (-not [string]::IsNullOrWhiteSpace($chapterFolder) -and -not $coverExactMap.ContainsKey($chapterFolder)) {
                 $coverExactMap[$chapterFolder] = $coverEntry
@@ -524,6 +533,9 @@ function Get-SourceChapterOrderConfiguration {
                 HasCoverSetting = $hasCoverSetting
                 RawCoverMode = $rawCoverMode
                 CoverModeIsValid = $coverModeIsValid
+                HasSeparateChapterFields = $hasSeparateChapterFields
+                ChapterSequence = $chapterSequence
+                ChapterName = $chapterName
             }
             $exactMap[$chapterFolder] = $entry
             $normalizedMap[$normalizedKey] = $entry
@@ -566,6 +578,9 @@ function Set-SourceChapterEntryOrder {
             $entry | Add-Member -NotePropertyName ConfiguredHasCoverSetting -NotePropertyValue ([bool]$configuredCover.HasCoverSetting) -Force
             $entry | Add-Member -NotePropertyName ConfiguredRawCoverMode -NotePropertyValue ([string]$configuredCover.RawCoverMode) -Force
             $entry | Add-Member -NotePropertyName ConfiguredCoverModeIsValid -NotePropertyValue ([bool]$configuredCover.CoverModeIsValid) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredHasSeparateChapterFields -NotePropertyValue ([bool]$configuredCover.HasSeparateChapterFields) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredChapterSequence -NotePropertyValue ([string]$configuredCover.ChapterSequence) -Force
+            $entry | Add-Member -NotePropertyName ConfiguredChapterName -NotePropertyValue ([string]$configuredCover.ChapterName) -Force
             $entry | Add-Member -NotePropertyName ConfiguredShowChapterCovers -NotePropertyValue ([bool]$configuration.ShowChapterCovers) -Force
             $entry | Add-Member -NotePropertyName ConfiguredHasShowChapterCoversSetting -NotePropertyValue ([bool]$configuration.HasShowChapterCoversSetting) -Force
         }
@@ -599,6 +614,9 @@ function Set-SourceChapterEntryOrder {
         $entry | Add-Member -NotePropertyName ConfiguredHasCoverSetting -NotePropertyValue ([bool]$configured.HasCoverSetting) -Force
         $entry | Add-Member -NotePropertyName ConfiguredRawCoverMode -NotePropertyValue ([string]$configured.RawCoverMode) -Force
         $entry | Add-Member -NotePropertyName ConfiguredCoverModeIsValid -NotePropertyValue ([bool]$configured.CoverModeIsValid) -Force
+        $entry | Add-Member -NotePropertyName ConfiguredHasSeparateChapterFields -NotePropertyValue ([bool]$configured.HasSeparateChapterFields) -Force
+        $entry | Add-Member -NotePropertyName ConfiguredChapterSequence -NotePropertyValue ([string]$configured.ChapterSequence) -Force
+        $entry | Add-Member -NotePropertyName ConfiguredChapterName -NotePropertyValue ([string]$configured.ChapterName) -Force
         $entry | Add-Member -NotePropertyName ConfiguredShowChapterCovers -NotePropertyValue ([bool]$configuration.ShowChapterCovers) -Force
         $entry | Add-Member -NotePropertyName ConfiguredHasShowChapterCoversSetting -NotePropertyValue ([bool]$configuration.HasShowChapterCoversSetting) -Force
         $matched += [pscustomobject]@{ Entry = $entry; Order = [int]$configured.Order }
@@ -1238,6 +1256,7 @@ function Test-OrganizerPlan {
         }
         $labelInfo = $null
         $number = ''
+        $chapterSequence = ''
         $chapterLabel = ''
         $title = ''
         $folderName = ''
@@ -1248,6 +1267,7 @@ function Test-OrganizerPlan {
             }
             $targetChapter = $resolvedChapters[-1]
             $number = $targetChapter.Number
+            $chapterSequence = $targetChapter.ChapterSequence
             $chapterLabel = $targetChapter.DisplayLabel
             $title = $targetChapter.Title
             $folderName = $targetChapter.FolderName
@@ -1260,6 +1280,10 @@ function Test-OrganizerPlan {
                 continue
             }
             $number = $labelInfo.Number
+            $chapterSequence = if ($labelInfo.IsNumeric) {
+                $labelInfo.Number + $(if ([string]::IsNullOrWhiteSpace([string]$labelInfo.NumberSuffix)) { '' } else { ' ' + [string]$labelInfo.NumberSuffix })
+            }
+            else { ([string]$numberValue).Trim() }
             $chapterLabel = $labelInfo.DisplayLabel
             $title = [string](Get-ObjectProperty -Object $chapter -Name 'title' -Default '')
             if ($title -match '[<>:"/\\|?*]' -or $title.EndsWith(' ') -or $title.EndsWith('.')) {
@@ -1412,6 +1436,7 @@ function Test-OrganizerPlan {
             $resolvedChapters += [pscustomobject]@{
                 IsNumeric = $labelInfo.IsNumeric
                 Number = $number
+                ChapterSequence = $chapterSequence
                 SortNumber = $labelInfo.SortNumber
                 NumberSuffix = [string]$labelInfo.NumberSuffix
                 ReadingOrder = $resolvedChapters.Count + 1
@@ -1735,6 +1760,8 @@ function New-OutputMetadata {
         [pscustomobject][ordered]@{
             chapterTitle = $_.FolderName
             chapterFolder = $_.FolderName
+            chapterSequence = $_.ChapterSequence
+            chapterName = $_.Title
             displayNumber = $_.Number
             displayLabel = $_.DisplayLabel
             order = $readingOrder
@@ -1743,7 +1770,7 @@ function New-OutputMetadata {
         }
     })
     $organizerInfo = [pscustomobject][ordered]@{
-        schemaVersion = 7
+        schemaVersion = 8
         generatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         sourceFolders = @($Audit.SourceFolders)
         chapterCount = $Audit.ChapterCount
@@ -2331,7 +2358,9 @@ function Show-OrganizerWindow {
     $status.Location = New-Object System.Drawing.Point(18, 666)
     $status.Size = New-Object System.Drawing.Size(1547, 70)
     $status.Anchor = 'Bottom,Left,Right'
-    $status.ForeColor = [System.Drawing.Color]::DimGray
+    $status.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $status.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 0)
+    $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
     $form.Controls.Add($status)
 
     $script:lastDefaultOutput = ''
@@ -3436,6 +3465,15 @@ function Show-OrganizerWindow {
                     if ($imageCount -eq 0) { throw ($name + '\' + $chapterDirectory.Name + '：没有可载入的图片。') }
                     $outputNumber++
                     $initialFields = Get-InitialOrganizerChapterFields -ChapterName $chapterDirectory.Name -IsRootChapter ([bool]$chapterDirectory.IsRootChapter) -DefaultNumber ([string]$outputNumber) -PreserveNumericNumber ($allSourceNames.Count -eq 1)
+                    if ($null -ne $chapterDirectory.PSObject.Properties['ConfiguredHasSeparateChapterFields'] -and
+                        [bool]$chapterDirectory.ConfiguredHasSeparateChapterFields -and
+                        -not [string]::IsNullOrWhiteSpace([string]$chapterDirectory.ConfiguredChapterSequence) -and
+                        $null -ne (ConvertTo-ChapterLabelInfo -Value ([string]$chapterDirectory.ConfiguredChapterSequence))) {
+                        # 新版元数据把“话序/特殊标签”和“章节名”分开保存。重新载入时直接采用，
+                        # 不再尝试从含空格或纯文字的话序中猜测边界。
+                        $initialFields.Number = [string]$chapterDirectory.ConfiguredChapterSequence
+                        $initialFields.Title = [string]$chapterDirectory.ConfiguredChapterName
+                    }
                     $hasConfiguredCover = if ($null -ne $chapterDirectory.PSObject.Properties['ConfiguredHasCoverSetting']) { [bool]$chapterDirectory.ConfiguredHasCoverSetting } else { $null -ne $chapterDirectory.PSObject.Properties['ConfiguredCoverMode'] }
                     $configuredCoverIsValid = if ($null -ne $chapterDirectory.PSObject.Properties['ConfiguredCoverModeIsValid']) { [bool]$chapterDirectory.ConfiguredCoverModeIsValid } else { $true }
                     $chapterHasLegacyGlobalEnabled = (

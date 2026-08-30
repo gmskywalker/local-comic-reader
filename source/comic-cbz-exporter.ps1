@@ -529,12 +529,37 @@ function Get-ChapterLabelComparisonKey {
     return ([regex]::Replace($Value.Trim(), '\s+', '').Replace('話', '话')).ToLowerInvariant()
 }
 
+function Get-ChapterSequenceDisplayText {
+    param([string]$Sequence)
+    $text = ([string]$Sequence).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    $numericMatch = [regex]::Match($text, '^(\d+(?:\.\d+)?)(?:\s+(.+))?$')
+    if (-not $numericMatch.Success) { return $text }
+    $suffix = $numericMatch.Groups[2].Value.Trim()
+    $label = '第 ' + $numericMatch.Groups[1].Value + ' 话'
+    if (-not [string]::IsNullOrWhiteSpace($suffix)) { $label += ' ' + $suffix }
+    return $label
+}
+
 function Get-CompleteChapterExportLabel {
     param(
         [object]$MetadataItem,
         [string]$Folder,
         [string]$DisplayLabel
     )
+    $hasSeparateChapterFields = (
+        $null -ne $MetadataItem.PSObject.Properties['chapterSequence'] -and
+        $null -ne $MetadataItem.PSObject.Properties['chapterName']
+    )
+    if ($hasSeparateChapterFields) {
+        $sequenceLabel = Get-ChapterSequenceDisplayText -Sequence ([string]$MetadataItem.chapterSequence)
+        $chapterName = ([string]$MetadataItem.chapterName).Trim()
+        if ([string]::IsNullOrWhiteSpace($sequenceLabel)) { return $chapterName }
+        if ([string]::IsNullOrWhiteSpace($chapterName)) { return $sequenceLabel }
+        return ($sequenceLabel + ' ' + $chapterName).Trim()
+    }
+
+    # 旧元数据没有独立字段时才保留原先的兼容推断。
     $label = ([string]$DisplayLabel).Trim()
     if ([string]::IsNullOrWhiteSpace($label)) { $label = ([string]$Folder).Trim() }
 
@@ -1612,8 +1637,8 @@ function Show-ExporterWindow {
     $form = New-Object Windows.Forms.Form
     $form.Text = '本地漫画 CBZ / EPUB / PDF 导出器'
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object Drawing.Size(1040, 830)
-    $form.MinimumSize = New-Object Drawing.Size(880, 720)
+    $form.Size = New-Object Drawing.Size(1040, 875)
+    $form.MinimumSize = New-Object Drawing.Size(880, 765)
     $form.Font = New-Object Drawing.Font('Microsoft YaHei UI', 10)
 
     $header = New-Object Windows.Forms.Label
@@ -1750,10 +1775,12 @@ function Show-ExporterWindow {
 
     $status = New-Object Windows.Forms.Label
     $status.Anchor = 'Bottom,Left,Right'
-    $status.AutoEllipsis = $true
+    $status.AutoSize = $false
     $status.Location = New-Object Drawing.Point(28, 756)
-    $status.Size = New-Object Drawing.Size(970, 24)
-    $status.ForeColor = [Drawing.Color]::DimGray
+    $status.Size = New-Object Drawing.Size(970, 64)
+    $status.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
+    $status.Padding = New-Object Windows.Forms.Padding(10, 0, 10, 0)
+    $status.TextAlign = [Drawing.ContentAlignment]::MiddleLeft
 
     foreach ($control in @($header, $sub, $listLabel, $list, $selectAll, $selectNone, $refresh, $help, $modeGroup, $optionsGroup, $outputLabel, $outputBox, $browse, $export, $status)) {
         [void]$form.Controls.Add($control)
