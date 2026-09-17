@@ -28,6 +28,223 @@ $script:DefaultSelected = @(
 )
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:ProgressLabel = $null
+$script:ComicToolUiInitialized = $false
+
+function Initialize-ComicToolUi {
+    $initializedVariable = Get-Variable -Name ComicToolUiInitialized -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $initializedVariable -and [bool]$initializedVariable.Value) { return }
+
+    if ($null -eq ('LocalComicTools.UiNativeMethods' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace LocalComicTools {
+    public static class UiNativeMethods {
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetProcessDPIAware();
+    }
+}
+'@
+    }
+
+    try {
+        # Per-monitor V2 prevents Windows from bitmap-scaling the whole window at 125%/150%.
+        [void][LocalComicTools.UiNativeMethods]::SetProcessDpiAwarenessContext([IntPtr]::new(-4))
+    }
+    catch {
+        try { [void][LocalComicTools.UiNativeMethods]::SetProcessDPIAware() } catch { }
+    }
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
+    $script:ComicToolUiInitialized = $true
+}
+
+function Get-ComicToolUiPalette {
+    return [pscustomobject]@{
+        Canvas = [System.Drawing.Color]::FromArgb(246, 248, 251)
+        Surface = [System.Drawing.Color]::White
+        SurfaceAlt = [System.Drawing.Color]::FromArgb(241, 245, 249)
+        Text = [System.Drawing.Color]::FromArgb(24, 33, 47)
+        Muted = [System.Drawing.Color]::FromArgb(91, 103, 119)
+        Border = [System.Drawing.Color]::FromArgb(203, 213, 225)
+        Accent = [System.Drawing.Color]::FromArgb(15, 108, 189)
+        AccentHover = [System.Drawing.Color]::FromArgb(17, 94, 163)
+        AccentPress = [System.Drawing.Color]::FromArgb(12, 59, 94)
+        AccentSoft = [System.Drawing.Color]::FromArgb(230, 242, 252)
+        Selection = [System.Drawing.Color]::FromArgb(218, 237, 252)
+        SelectionText = [System.Drawing.Color]::FromArgb(18, 49, 75)
+        Danger = [System.Drawing.Color]::FromArgb(164, 38, 44)
+        DangerSoft = [System.Drawing.Color]::FromArgb(255, 239, 239)
+    }
+}
+
+function Get-ComicToolControlTree {
+    param([object]$Root)
+    foreach ($child in @($Root.Controls)) {
+        $child
+        foreach ($descendant in @(Get-ComicToolControlTree -Root $child)) { $descendant }
+    }
+}
+
+function Set-ComicToolButtonVisual {
+    param(
+        [object]$Button,
+        [ValidateSet('Default', 'Primary', 'Accent', 'Danger')][string]$Kind = 'Default'
+    )
+    if ($null -eq $Button) { return }
+    $palette = Get-ComicToolUiPalette
+    $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $Button.FlatAppearance.BorderSize = 1
+    $Button.FlatAppearance.BorderColor = $palette.Border
+    $Button.BackColor = $palette.Surface
+    $Button.ForeColor = $palette.Text
+    $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $Button.UseVisualStyleBackColor = $false
+    $Button.UseCompatibleTextRendering = $false
+    $Button.FlatAppearance.MouseOverBackColor = $palette.SurfaceAlt
+    $Button.FlatAppearance.MouseDownBackColor = $palette.Border
+    if ($Kind -eq 'Primary') {
+        $Button.BackColor = $palette.Accent
+        $Button.ForeColor = [System.Drawing.Color]::White
+        $Button.FlatAppearance.BorderColor = $palette.Accent
+        $Button.FlatAppearance.MouseOverBackColor = $palette.AccentHover
+        $Button.FlatAppearance.MouseDownBackColor = $palette.AccentPress
+    }
+    elseif ($Kind -eq 'Accent') {
+        $Button.BackColor = $palette.AccentSoft
+        $Button.ForeColor = $palette.AccentPress
+        $Button.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(158, 202, 235)
+        $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(210, 233, 250)
+        $Button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(190, 220, 243)
+    }
+    elseif ($Kind -eq 'Danger') {
+        $Button.BackColor = $palette.DangerSoft
+        $Button.ForeColor = $palette.Danger
+        $Button.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(233, 176, 178)
+        $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(252, 221, 222)
+        $Button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(246, 204, 206)
+    }
+}
+
+function Set-ComicToolGridVisual {
+    param([object]$Grid)
+    if ($null -eq $Grid) { return }
+    $palette = Get-ComicToolUiPalette
+    $Grid.EnableHeadersVisualStyles = $false
+    $Grid.BackgroundColor = $palette.Surface
+    $Grid.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $Grid.GridColor = [System.Drawing.Color]::FromArgb(226, 232, 240)
+    $Grid.CellBorderStyle = [System.Windows.Forms.DataGridViewCellBorderStyle]::SingleHorizontal
+    $Grid.ColumnHeadersBorderStyle = [System.Windows.Forms.DataGridViewHeaderBorderStyle]::Single
+    $Grid.ColumnHeadersDefaultCellStyle.BackColor = $palette.SurfaceAlt
+    $Grid.ColumnHeadersDefaultCellStyle.ForeColor = $palette.Text
+    $Grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $palette.SurfaceAlt
+    $Grid.ColumnHeadersDefaultCellStyle.SelectionForeColor = $palette.Text
+    $Grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Point)
+    $Grid.ColumnHeadersHeight = 46
+    $Grid.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::DisableResizing
+    $Grid.DefaultCellStyle.BackColor = $palette.Surface
+    $Grid.DefaultCellStyle.ForeColor = $palette.Text
+    $Grid.DefaultCellStyle.SelectionBackColor = $palette.Selection
+    $Grid.DefaultCellStyle.SelectionForeColor = $palette.SelectionText
+    $Grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(4, 1, 4, 1)
+    $Grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(250, 252, 254)
+    $Grid.AlternatingRowsDefaultCellStyle.ForeColor = $palette.Text
+    $Grid.RowTemplate.Height = 34
+    $Grid.RowHeadersVisible = $false
+}
+
+function Set-ComicToolStatusVisual {
+    param([object]$StatusControl)
+    if ($null -eq $StatusControl) { return }
+    $palette = Get-ComicToolUiPalette
+    $StatusControl.BackColor = $palette.AccentSoft
+    $StatusControl.ForeColor = $palette.SelectionText
+    $StatusControl.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $StatusControl.Padding = New-Object System.Windows.Forms.Padding(12, 4, 12, 4)
+}
+
+function Set-ComicToolWindowVisual {
+    param(
+        [object]$Window,
+        [object[]]$PrimaryButtons = @(),
+        [object[]]$AccentButtons = @(),
+        [object[]]$DangerButtons = @(),
+        [object[]]$StatusControls = @()
+    )
+    if ($null -eq $Window) { return }
+    Initialize-ComicToolUi
+    $palette = Get-ComicToolUiPalette
+    $Window.SuspendLayout()
+    try {
+        $Window.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+        $Window.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
+        $Window.BackColor = $palette.Canvas
+        $Window.ForeColor = $palette.Text
+        $Window.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
+        foreach ($control in @(Get-ComicToolControlTree -Root $Window)) {
+            if ($control -is [System.Windows.Forms.Button]) {
+                Set-ComicToolButtonVisual -Button $control
+            }
+            elseif ($control -is [System.Windows.Forms.DataGridView]) {
+                Set-ComicToolGridVisual -Grid $control
+            }
+            elseif ($control -is [System.Windows.Forms.TextBox]) {
+                $control.BackColor = $palette.Surface
+                $control.ForeColor = $palette.Text
+                $control.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+            }
+            elseif ($control -is [System.Windows.Forms.ComboBox]) {
+                $control.BackColor = $palette.Surface
+                $control.ForeColor = $palette.Text
+                $control.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            }
+            elseif ($control -is [System.Windows.Forms.ListView]) {
+                $control.BackColor = $palette.Surface
+                $control.ForeColor = $palette.Text
+                $control.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+                $control.HideSelection = $false
+                $control.GridLines = $false
+            }
+            elseif ($control -is [System.Windows.Forms.ListBox]) {
+                $control.BackColor = $palette.Surface
+                $control.ForeColor = $palette.Text
+                $control.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+            }
+            elseif ($control -is [System.Windows.Forms.GroupBox]) {
+                $control.BackColor = $palette.Canvas
+                $control.ForeColor = $palette.Text
+            }
+            elseif ($control -is [System.Windows.Forms.Label]) {
+                $control.UseCompatibleTextRendering = $false
+                if ($control.Font.Bold -and $control.Font.Size -ge 13) {
+                    $control.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 16, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Point)
+                    $control.ForeColor = $palette.Text
+                }
+                elseif ($control.ForeColor -eq [System.Drawing.Color]::DimGray) { $control.ForeColor = $palette.Muted }
+            }
+            elseif ($control -is [System.Windows.Forms.CheckBox] -or $control -is [System.Windows.Forms.RadioButton]) {
+                $control.ForeColor = $palette.Text
+                $control.UseCompatibleTextRendering = $false
+            }
+        }
+        foreach ($button in @($AccentButtons)) { Set-ComicToolButtonVisual -Button $button -Kind Accent }
+        foreach ($button in @($DangerButtons)) { Set-ComicToolButtonVisual -Button $button -Kind Danger }
+        foreach ($button in @($PrimaryButtons)) { Set-ComicToolButtonVisual -Button $button -Kind Primary }
+        foreach ($statusControl in @($StatusControls)) { Set-ComicToolStatusVisual -StatusControl $statusControl }
+    }
+    finally {
+        $Window.ResumeLayout($false)
+        $Window.PerformLayout()
+    }
+}
 
 function Write-Info {
     param([string]$Message)
@@ -1540,6 +1757,7 @@ function Show-CollectionEditor {
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
 
+    Set-ComicToolWindowVisual -Window $dialog -PrimaryButtons @($ok) -AccentButtons @($browseCover)
     if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return $dialog.Tag
 }
@@ -1687,6 +1905,7 @@ function Show-CollectionManager {
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
 
+    Set-ComicToolWindowVisual -Window $dialog -PrimaryButtons @($ok) -AccentButtons @($add, $edit) -DangerButtons @($delete)
     if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return $dialog.Tag
 }
@@ -2006,6 +2225,7 @@ function Show-UpdaterCustomCoverEditor {
     $dialog.Controls.Add($cancel)
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
+    Set-ComicToolWindowVisual -Window $dialog -PrimaryButtons @($ok) -AccentButtons @($choose, $insertAsFirst) -DangerButtons @($clearAll)
     if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return $dialog.Tag
 }
@@ -2147,6 +2367,7 @@ function Show-ImageOrderFallbackDialog {
     $dialog.Controls.Add($abortButton)
     $dialog.CancelButton = $abortButton
 
+    Set-ComicToolWindowVisual -Window $dialog -PrimaryButtons @($continueButton) -AccentButtons @($skipButton) -DangerButtons @($abortButton)
     [void]$dialog.ShowDialog($Owner)
     return $decision
 }
@@ -2163,8 +2384,7 @@ function Show-ComicSelector {
         [switch]$SkipOpen,
         [switch]$SmokeTest
     )
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
+    Initialize-ComicToolUi
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '本地漫画网页生成器'
@@ -2903,6 +3123,7 @@ function Show-ComicSelector {
         })
         $form.add_Shown({ $timer.Start() })
     }
+    Set-ComicToolWindowVisual -Window $form -PrimaryButtons @($updateAll) -AccentButtons @($updateSelected, $applyCollectionChanges, $manageCollections) -StatusControls @($status)
     [void]$form.ShowDialog()
     if ($SmokeTest -and $null -ne $catalogSmokeState -and -not [string]::IsNullOrWhiteSpace([string]$catalogSmokeState.Failure)) {
         throw ('右上角“将合集改动写入阅读器”没有完成合集专用更新。' + [string]$catalogSmokeState.Failure)
