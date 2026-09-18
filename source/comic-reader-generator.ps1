@@ -29,6 +29,222 @@ $script:DefaultSelected = @(
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:ProgressLabel = $null
 
+function Initialize-ComicToolSharpText {
+    if ($null -eq ('LocalComicSharpText.NativeMethods' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace LocalComicSharpText {
+    public static class NativeMethods {
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    }
+}
+'@
+    }
+    try {
+        [void][LocalComicSharpText.NativeMethods]::SetProcessDpiAwarenessContext([IntPtr](-4))
+    }
+    catch {
+        # Older Windows versions continue with the original rendering mode.
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    try {
+        [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+    }
+    catch [System.InvalidOperationException] {
+        # A hosting process may already have created a WinForms window.
+    }
+}
+
+function Get-ComicToolVisualControlTree {
+    param([object]$Root)
+
+    foreach ($child in @($Root.Controls)) {
+        $child
+        foreach ($descendant in @(Get-ComicToolVisualControlTree -Root $child)) {
+            $descendant
+        }
+    }
+}
+
+function Set-ComicToolNativeDpiLayout {
+    param([object]$Window)
+
+    if ($null -eq $Window -or $null -ne $Window.PSObject.Properties['ComicToolNativeDpiApplied']) { return }
+    Add-Member -InputObject $Window -MemberType NoteProperty -Name ComicToolNativeDpiApplied -Value $true
+
+    $graphics = $Window.CreateGraphics()
+    try { $scale = [double]$graphics.DpiX / 96.0 }
+    finally { $graphics.Dispose() }
+    if ($scale -le 1.001) { return }
+
+    $grids = @()
+    $lists = @()
+    foreach ($control in @(Get-ComicToolVisualControlTree -Root $Window)) {
+        if ($control -is [System.Windows.Forms.DataGridView]) {
+            $grids += [pscustomobject]@{
+                Control = $control
+                HeaderHeight = [int]$control.ColumnHeadersHeight
+                Columns = @($control.Columns | ForEach-Object {
+                    [pscustomobject]@{ Column = $_; Width = [int]$_.Width; MinimumWidth = [int]$_.MinimumWidth }
+                })
+            }
+        }
+        elseif ($control -is [System.Windows.Forms.ListView]) {
+            $lists += [pscustomobject]@{
+                Control = $control
+                Columns = @($control.Columns | ForEach-Object {
+                    [pscustomobject]@{ Column = $_; Width = [int]$_.Width }
+                })
+            }
+        }
+    }
+
+    $Window.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
+    $Window.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $Window.PerformAutoScale()
+
+    foreach ($gridState in $grids) {
+        $grid = $gridState.Control
+        if ($grid.ColumnHeadersHeightSizeMode -ne [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize) {
+            $grid.ColumnHeadersHeight = [Math]::Max(4, [int][Math]::Round($gridState.HeaderHeight * $scale))
+        }
+        $grid.RowTemplate.Height = [Math]::Max($grid.RowTemplate.MinimumHeight, [int][Math]::Round(23 * $scale))
+        foreach ($row in $grid.Rows) { $row.Height = $grid.RowTemplate.Height }
+        foreach ($columnState in $gridState.Columns) {
+            $columnState.Column.MinimumWidth = [Math]::Max(2, [int][Math]::Round($columnState.MinimumWidth * $scale))
+            $columnState.Column.Width = [Math]::Max($columnState.Column.MinimumWidth, [int][Math]::Round($columnState.Width * $scale))
+        }
+    }
+    foreach ($listState in $lists) {
+        foreach ($columnState in $listState.Columns) {
+            $columnState.Column.Width = [Math]::Max(1, [int][Math]::Round($columnState.Width * $scale))
+        }
+    }
+}
+
+function Set-ComicToolVisualTheme {
+    param([object]$Window)
+
+    if ($null -eq $Window) { return }
+    Set-ComicToolNativeDpiLayout -Window $Window
+
+    $canvas = [System.Drawing.Color]::FromArgb(246, 248, 251)
+    $surface = [System.Drawing.Color]::White
+    $surfaceAlt = [System.Drawing.Color]::FromArgb(241, 245, 249)
+    $text = [System.Drawing.Color]::FromArgb(30, 41, 59)
+    $muted = [System.Drawing.Color]::FromArgb(91, 103, 119)
+    $border = [System.Drawing.Color]::FromArgb(203, 213, 225)
+    $accent = [System.Drawing.Color]::FromArgb(29, 111, 193)
+    $accentHover = [System.Drawing.Color]::FromArgb(23, 92, 161)
+    $accentPressed = [System.Drawing.Color]::FromArgb(18, 72, 126)
+    $accentSoft = [System.Drawing.Color]::FromArgb(232, 243, 252)
+    $selection = [System.Drawing.Color]::FromArgb(219, 237, 252)
+    $selectionText = [System.Drawing.Color]::FromArgb(22, 55, 82)
+    $danger = [System.Drawing.Color]::FromArgb(177, 35, 42)
+    $dangerSoft = [System.Drawing.Color]::FromArgb(255, 239, 240)
+    $gridLine = [System.Drawing.Color]::FromArgb(226, 232, 240)
+    $defaultButtonBack = [System.Drawing.SystemColors]::Control.ToArgb()
+
+    $Window.BackColor = $canvas
+    $Window.ForeColor = $text
+
+    foreach ($control in @(Get-ComicToolVisualControlTree -Root $Window)) {
+        if ($control -is [System.Windows.Forms.Button]) {
+            $wasPrimary = ($control.ForeColor.ToArgb() -eq [System.Drawing.Color]::White.ToArgb() -and $control.BackColor.ToArgb() -ne $defaultButtonBack)
+            $wasTinted = ($control.BackColor.ToArgb() -ne $defaultButtonBack -and $control.BackColor.ToArgb() -ne $canvas.ToArgb())
+            $isDanger = ([string]$control.Text -match '删除|清空|退出本次')
+            $control.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $control.FlatAppearance.BorderSize = 1
+            $control.UseVisualStyleBackColor = $false
+            $control.UseCompatibleTextRendering = $false
+            if ($isDanger) {
+                $control.BackColor = $dangerSoft
+                $control.ForeColor = $danger
+                $control.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(232, 176, 180)
+                $control.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(253, 223, 225)
+                $control.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(248, 207, 210)
+            }
+            elseif ($wasPrimary) {
+                $control.BackColor = $accent
+                $control.ForeColor = [System.Drawing.Color]::White
+                $control.FlatAppearance.BorderColor = $accent
+                $control.FlatAppearance.MouseOverBackColor = $accentHover
+                $control.FlatAppearance.MouseDownBackColor = $accentPressed
+            }
+            elseif ($wasTinted) {
+                $control.BackColor = $accentSoft
+                $control.ForeColor = $accentPressed
+                $control.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(159, 203, 235)
+                $control.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(214, 235, 250)
+                $control.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(196, 224, 244)
+            }
+            else {
+                $control.BackColor = $surface
+                $control.ForeColor = $text
+                $control.FlatAppearance.BorderColor = $border
+                $control.FlatAppearance.MouseOverBackColor = $surfaceAlt
+                $control.FlatAppearance.MouseDownBackColor = $border
+            }
+        }
+        elseif ($control -is [System.Windows.Forms.DataGridView]) {
+            $control.EnableHeadersVisualStyles = $false
+            $control.BackgroundColor = $surface
+            $control.GridColor = $gridLine
+            $control.ColumnHeadersDefaultCellStyle.BackColor = $surfaceAlt
+            $control.ColumnHeadersDefaultCellStyle.ForeColor = $text
+            $control.ColumnHeadersDefaultCellStyle.SelectionBackColor = $surfaceAlt
+            $control.ColumnHeadersDefaultCellStyle.SelectionForeColor = $text
+            $control.DefaultCellStyle.BackColor = $surface
+            $control.DefaultCellStyle.ForeColor = $text
+            $control.DefaultCellStyle.SelectionBackColor = $selection
+            $control.DefaultCellStyle.SelectionForeColor = $selectionText
+            $control.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(250, 252, 254)
+            $control.AlternatingRowsDefaultCellStyle.ForeColor = $text
+        }
+        elseif ($control -is [System.Windows.Forms.TextBox]) {
+            $control.BackColor = if ($control.ReadOnly) { $surfaceAlt } else { $surface }
+            $control.ForeColor = $text
+        }
+        elseif ($control -is [System.Windows.Forms.ComboBox]) {
+            $control.BackColor = $surface
+            $control.ForeColor = $text
+            $control.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        }
+        elseif ($control -is [System.Windows.Forms.ListView] -or
+                $control -is [System.Windows.Forms.ListBox] -or
+                $control -is [System.Windows.Forms.CheckedListBox]) {
+            $control.BackColor = $surface
+            $control.ForeColor = $text
+        }
+        elseif ($control -is [System.Windows.Forms.GroupBox]) {
+            $control.BackColor = $canvas
+            $control.ForeColor = $text
+        }
+        elseif ($control -is [System.Windows.Forms.Panel]) {
+            $control.BackColor = $canvas
+        }
+        elseif ($control -is [System.Windows.Forms.Label]) {
+            if ($control.BorderStyle -ne [System.Windows.Forms.BorderStyle]::None) {
+                $control.BackColor = $accentSoft
+                $control.ForeColor = $selectionText
+            }
+            elseif ($control.ForeColor.ToArgb() -eq [System.Drawing.Color]::DimGray.ToArgb()) {
+                $control.ForeColor = $muted
+            }
+            else {
+                $control.ForeColor = $text
+            }
+        }
+        elseif ($control -is [System.Windows.Forms.CheckBox] -or $control -is [System.Windows.Forms.RadioButton]) {
+            $control.ForeColor = $text
+        }
+    }
+}
+
 function Write-Info {
     param([string]$Message)
     Write-Host ('[信息] ' + $Message) -ForegroundColor Cyan
@@ -1540,6 +1756,7 @@ function Show-CollectionEditor {
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
 
+    Set-ComicToolVisualTheme -Window $dialog
     if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return $dialog.Tag
 }
@@ -1687,6 +1904,7 @@ function Show-CollectionManager {
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
 
+    Set-ComicToolVisualTheme -Window $dialog
     if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return $dialog.Tag
 }
@@ -2006,6 +2224,7 @@ function Show-UpdaterCustomCoverEditor {
     $dialog.Controls.Add($cancel)
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
+    Set-ComicToolVisualTheme -Window $dialog
     if ($dialog.ShowDialog($Owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return $dialog.Tag
 }
@@ -2147,6 +2366,7 @@ function Show-ImageOrderFallbackDialog {
     $dialog.Controls.Add($abortButton)
     $dialog.CancelButton = $abortButton
 
+    Set-ComicToolVisualTheme -Window $dialog
     [void]$dialog.ShowDialog($Owner)
     return $decision
 }
@@ -2163,6 +2383,7 @@ function Show-ComicSelector {
         [switch]$SkipOpen,
         [switch]$SmokeTest
     )
+    Initialize-ComicToolSharpText
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
@@ -2846,6 +3067,7 @@ function Show-ComicSelector {
         }
     })
 
+    Set-ComicToolVisualTheme -Window $form
     $catalogSmokeState = $null
     if ($SmokeTest) {
         $catalogSmokeState = [pscustomobject]@{ Pending = $false; Failure = '' }
